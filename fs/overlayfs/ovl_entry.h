@@ -90,6 +90,9 @@ struct ovl_fs {
 	bool no_shared_whiteout;
 	/* r/o snapshot of upperdir sb's only taken on volatile mounts */
 	errseq_t errseq;
+	/* DeltaFS v1 runtime state (P1: ABI validation only). */
+	u64 delta_generation;
+	struct mutex delta_ioctl_lock;
 };
 
 /* Number of lower layers, not including data-only layers */

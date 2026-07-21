@@ -719,6 +719,7 @@ static inline int ovl_verify_upper(struct ovl_fs *ofs, struct dentry *index,
 
 /* readdir.c */
 extern const struct file_operations ovl_dir_operations;
+long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 struct file *ovl_dir_real_file(const struct file *file, bool want_upper);
 int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list);
 void ovl_cleanup_whiteouts(struct ovl_fs *ofs, struct dentry *upper,

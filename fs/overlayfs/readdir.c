@@ -976,6 +976,8 @@ const struct file_operations ovl_dir_operations = {
 	.llseek		= ovl_dir_llseek,
 	.fsync		= ovl_dir_fsync,
 	.release	= ovl_dir_release,
+	.unlocked_ioctl	= ovl_deltafs_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
 };
 
 int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list)
