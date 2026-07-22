@@ -719,6 +719,10 @@ int ovl_init_fs_context(struct fs_context *fc)
 	if (!ofs)
 		goto out_err;
 
+	ofs->delta_generation = 1;
+	mutex_init(&ofs->delta_lock);
+	INIT_LIST_HEAD(&ofs->delta_retired);
+
 	ofs->config.redirect_mode	= ovl_redirect_mode_def();
 	ofs->config.index		= ovl_index_def;
 	ofs->config.uuid		= ovl_uuid_def();
@@ -741,6 +745,8 @@ void ovl_free_fs(struct ovl_fs *ofs)
 {
 	struct vfsmount **mounts;
 	unsigned i;
+
+	ovl_deltafs_cleanup(ofs);
 
 	iput(ofs->workbasedir_trap);
 	iput(ofs->workdir_trap);

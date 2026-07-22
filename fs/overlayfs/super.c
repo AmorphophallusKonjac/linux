@@ -1352,8 +1352,6 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_stack_depth = 0;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	atomic_long_set(&ofs->last_ino, 1);
-	ofs->delta_generation = 1;
-	mutex_init(&ofs->delta_ioctl_lock);
 	/* Assume underlying fs uses 32bit inodes unless proven otherwise */
 	if (ofs->config.xino != OVL_XINO_OFF) {
 		ofs->xino_mode = BITS_PER_LONG - 32;
@@ -1380,6 +1378,7 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
 			goto out_err;
 
 		upper_sb = ovl_upper_mnt(ofs)->mnt_sb;
+		ofs->delta_backing_sb = upper_sb;
 		if (!ovl_should_sync(ofs)) {
 			ofs->errseq = errseq_sample(&upper_sb->s_wb_err);
 			if (errseq_check(&upper_sb->s_wb_err, ofs->errseq)) {

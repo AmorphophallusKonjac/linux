@@ -1,6 +1,6 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，待实现
+> 状态：设计定稿，分阶段实现中（P1、P2 代码已完成；P2 运行时验收待用户手动执行）
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -315,7 +315,9 @@ INIT_LIST_HEAD(&ofs->delta_retired);
 ofs->delta_backing_sb = ovl_upper_mnt(ofs)->mnt_sb;
 ```
 
-lower-only mount 保持 `delta_backing_sb == NULL`。
+lower-only mount 保持 `delta_backing_sb == NULL`。Linux 6.8 基线拒绝没有
+upperdir 且只有一个 lowerdir 的配置，因此生命周期测试使用两个 lowerdir
+建立 lower-only OverlayFS。
 
 ### 7.2 `struct ovl_inode` 扩展
 
@@ -821,7 +823,8 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 ### 16.1 基础和回归
 
 - 未调用 DeltaFS ioctl 时运行现有 OverlayFS selftests。
-- lower-only mount 可正常读，DeltaFS ioctl 返回 `-EROFS`。
+- 至少包含两个 lowerdir 的 lower-only mount 可正常读，DeltaFS ioctl 返回
+  `-EROFS`。
 - 不支持 feature 的普通 OverlayFS 仍可使用，但 ioctl 返回 `-EOPNOTSUPP`。
 - 32 位 compat 用户程序使用相同固定结构调用 ioctl。
 

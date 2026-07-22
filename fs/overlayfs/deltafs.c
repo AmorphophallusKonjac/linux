@@ -2,8 +2,8 @@
 /*
  * DeltaFS v1 ioctl ABI front-end.
  *
- * P1 deliberately stops after validating the control fd and the fixed-size
- * request. State construction and commit are added in later phases.
+ * P2 adds the passive lifetime state used by later state construction and
+ * commit phases. Valid requests still stop after fixed-size ABI validation.
  */
 
 #include <uapi/linux/deltafs.h>
@@ -90,11 +90,17 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
 
-	mutex_lock(&ofs->delta_ioctl_lock);
+	mutex_lock(&ofs->delta_lock);
 	err = ovl_deltafs_validate_request(ofs, &req);
-	mutex_unlock(&ofs->delta_ioctl_lock);
+	mutex_unlock(&ofs->delta_lock);
 	if (err)
 		return err;
 
 	return -EOPNOTSUPP;
+}
+
+void ovl_deltafs_cleanup(struct ovl_fs *ofs)
+{
+	WARN_ON_ONCE(!list_empty(&ofs->delta_retired));
+	mutex_destroy(&ofs->delta_lock);
 }
