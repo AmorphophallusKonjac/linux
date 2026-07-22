@@ -175,7 +175,14 @@ void ovl_dentry_update_reval(struct dentry *dentry, struct dentry *realdentry)
 void ovl_dentry_init_reval(struct dentry *dentry, struct dentry *upperdentry,
 			   struct ovl_entry *oe)
 {
-	return ovl_dentry_init_flags(dentry, upperdentry, oe, OVL_D_REVALIDATE);
+	ovl_dentry_init_flags(dentry, upperdentry, oe, OVL_D_REVALIDATE);
+
+	/* Positive dentries must always participate in generation checks. */
+	if (upperdentry || oe) {
+		spin_lock(&dentry->d_lock);
+		dentry->d_flags |= DCACHE_OP_REVALIDATE;
+		spin_unlock(&dentry->d_lock);
+	}
 }
 
 void ovl_dentry_init_flags(struct dentry *dentry, struct dentry *upperdentry,
@@ -604,7 +611,14 @@ static void ovl_dir_version_inc(struct dentry *dentry, bool impurity)
 	 * changes to impure entries.
 	 */
 	if (!ovl_dir_is_real(inode) || impurity)
-		OVL_I(inode)->version++;
+		ovl_inode_version_inc(inode);
+}
+
+void ovl_inode_version_inc(struct inode *inode)
+{
+	WARN_ON(!inode_is_locked(inode));
+	WARN_ON(!S_ISDIR(inode->i_mode));
+	OVL_I(inode)->version++;
 }
 
 void ovl_dir_modified(struct dentry *dentry, bool impurity)

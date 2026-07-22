@@ -1350,7 +1350,10 @@ struct dentry *ovl_lookup(struct inode *dir, struct dentry *dentry,
 	dput(index);
 	ovl_stack_free(stack, ctr);
 	kfree(d.redirect);
-	return d_splice_alias(inode, dentry);
+	this = d_splice_alias(inode, dentry);
+	if (!inode)
+		d_drop(dentry);
+	return this;
 
 out_free_oe:
 	ovl_free_entry(oe);

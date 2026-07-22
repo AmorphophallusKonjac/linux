@@ -884,6 +884,12 @@ static void ovl_map_ino(struct inode *inode, unsigned long ino, int fsid)
 	}
 }
 
+static u64 ovl_current_generation(struct super_block *sb)
+{
+	/* Pairs with the final release-store in a future DeltaFS commit. */
+	return smp_load_acquire(&OVL_FS(sb)->delta_generation);
+}
+
 void ovl_inode_init(struct inode *inode, struct ovl_inode_params *oip,
 		    unsigned long ino, int fsid)
 {
@@ -894,6 +900,9 @@ void ovl_inode_init(struct inode *inode, struct ovl_inode_params *oip,
 	oi->oe = oip->oe;
 	oi->redirect = oip->redirect;
 	oi->lowerdata_redirect = oip->lowerdata_redirect;
+	if (!READ_ONCE(oi->delta_generation))
+		WRITE_ONCE(oi->delta_generation,
+			   ovl_current_generation(inode->i_sb));
 
 	realinode = ovl_inode_real(inode);
 	ovl_copyattr(inode);
@@ -1046,15 +1055,43 @@ struct inode *ovl_new_inode(struct super_block *sb, umode_t mode, dev_t rdev)
 	return inode;
 }
 
-static int ovl_inode_test(struct inode *inode, void *data)
+struct ovl_inode_cache_key {
+	struct inode *realinode;
+	u64 generation;
+};
+
+static int ovl_inode_real_test(struct inode *inode, void *data)
 {
 	return inode->i_private == data;
 }
 
-static int ovl_inode_set(struct inode *inode, void *data)
+static int ovl_inode_real_set(struct inode *inode, void *data)
 {
 	inode->i_private = data;
 	return 0;
+}
+
+static int ovl_inode_cache_test(struct inode *inode, void *data)
+{
+	struct ovl_inode_cache_key *key = data;
+
+	return inode->i_private == key->realinode &&
+	       READ_ONCE(OVL_I(inode)->delta_generation) == key->generation;
+}
+
+static int ovl_inode_cache_set(struct inode *inode, void *data)
+{
+	struct ovl_inode_cache_key *key = data;
+
+	inode->i_private = key->realinode;
+	WRITE_ONCE(OVL_I(inode)->delta_generation, key->generation);
+	return 0;
+}
+
+static int ovl_trap_inode_test(struct inode *inode, void *data)
+{
+	return ovl_inode_real_test(inode, data) && IS_DEADDIR(inode) &&
+	       !ovl_inode_upper(inode) && !ovl_inode_lower(inode);
 }
 
 static bool ovl_verify_inode(struct inode *inode, struct dentry *lowerdentry,
@@ -1098,9 +1135,18 @@ static bool ovl_verify_inode(struct inode *inode, struct dentry *lowerdentry,
 struct inode *ovl_lookup_inode(struct super_block *sb, struct dentry *real,
 			       bool is_upper)
 {
-	struct inode *inode, *key = d_inode(real);
+	struct ovl_inode_cache_key key = {
+		.realinode = d_inode(real),
+		.generation = ovl_current_generation(sb),
+	};
+	struct inode *inode;
 
-	inode = ilookup5(sb, (unsigned long) key, ovl_inode_test, key);
+	/* A trap remains an error even though it is outside the generation key. */
+	if (d_is_dir(real) && ovl_lookup_trap_inode(sb, real))
+		return ERR_PTR(-ESTALE);
+
+	inode = ilookup5(sb, (unsigned long)key.realinode,
+			 ovl_inode_cache_test, &key);
 	if (!inode)
 		return NULL;
 
@@ -1117,17 +1163,13 @@ bool ovl_lookup_trap_inode(struct super_block *sb, struct dentry *dir)
 {
 	struct inode *key = d_inode(dir);
 	struct inode *trap;
-	bool res;
 
-	trap = ilookup5(sb, (unsigned long) key, ovl_inode_test, key);
+	trap = ilookup5(sb, (unsigned long)key, ovl_trap_inode_test, key);
 	if (!trap)
 		return false;
 
-	res = IS_DEADDIR(trap) && !ovl_inode_upper(trap) &&
-				  !ovl_inode_lower(trap);
-
 	iput(trap);
-	return res;
+	return true;
 }
 
 /*
@@ -1143,8 +1185,8 @@ struct inode *ovl_get_trap_inode(struct super_block *sb, struct dentry *dir)
 	if (!d_is_dir(dir))
 		return ERR_PTR(-ENOTDIR);
 
-	trap = iget5_locked(sb, (unsigned long) key, ovl_inode_test,
-			    ovl_inode_set, key);
+	trap = iget5_locked(sb, (unsigned long)key, ovl_inode_real_test,
+			    ovl_inode_real_set, key);
 	if (!trap)
 		return ERR_PTR(-ENOMEM);
 
@@ -1195,18 +1237,25 @@ static bool ovl_hash_bylower(struct super_block *sb, struct dentry *upper,
 }
 
 static struct inode *ovl_iget5(struct super_block *sb, struct inode *newinode,
-			       struct inode *key)
+			       struct inode *realinode, u64 generation)
 {
-	return newinode ? inode_insert5(newinode, (unsigned long) key,
-					 ovl_inode_test, ovl_inode_set, key) :
-			  iget5_locked(sb, (unsigned long) key,
-				       ovl_inode_test, ovl_inode_set, key);
+	struct ovl_inode_cache_key key = {
+		.realinode = realinode,
+		.generation = generation,
+	};
+
+	return newinode ?
+		inode_insert5(newinode, (unsigned long)realinode,
+			      ovl_inode_cache_test, ovl_inode_cache_set, &key) :
+		iget5_locked(sb, (unsigned long)realinode,
+			     ovl_inode_cache_test, ovl_inode_cache_set, &key);
 }
 
 struct inode *ovl_get_inode(struct super_block *sb,
 			    struct ovl_inode_params *oip)
 {
 	struct ovl_fs *ofs = OVL_FS(sb);
+	u64 generation = ovl_current_generation(sb);
 	struct dentry *upperdentry = oip->upperdentry;
 	struct ovl_path *lowerpath = ovl_lowerpath(oip->oe);
 	struct inode *realinode = upperdentry ? d_inode(upperdentry) : NULL;
@@ -1236,7 +1285,7 @@ struct inode *ovl_get_inode(struct super_block *sb,
 						      upperdentry);
 		unsigned int nlink = is_dir ? 1 : realinode->i_nlink;
 
-		inode = ovl_iget5(sb, oip->newinode, key);
+		inode = ovl_iget5(sb, oip->newinode, key, generation);
 		if (!inode)
 			goto out_err;
 		if (!(inode->i_state & I_NEW)) {

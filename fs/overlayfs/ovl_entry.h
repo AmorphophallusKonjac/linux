@@ -172,6 +172,7 @@ struct ovl_inode {
 	};
 	const char *redirect;
 	u64 version;
+	u64 delta_generation;
 	unsigned long flags;
 	struct inode vfs_inode;
 	struct dentry *__upperdentry;

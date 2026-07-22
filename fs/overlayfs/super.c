@@ -112,16 +112,29 @@ static int ovl_revalidate_real(struct dentry *d, unsigned int flags, bool weak)
 static int ovl_dentry_revalidate_common(struct dentry *dentry,
 					unsigned int flags, bool weak)
 {
+	struct ovl_fs *ofs = OVL_FS(dentry->d_sb);
 	struct ovl_entry *oe;
 	struct ovl_path *lowerstack;
 	struct inode *inode = d_inode_rcu(dentry);
 	struct dentry *upper;
+	u64 inode_generation;
+	u64 fs_generation;
 	unsigned int i;
 	int ret = 1;
 
 	/* Careful in RCU mode */
 	if (!inode)
 		return -ECHILD;
+
+	/*
+	 * A stale inode may still reference a retired layer array.  Check the
+	 * generation before dereferencing any OverlayFS backing state.
+	 */
+	inode_generation = READ_ONCE(OVL_I(inode)->delta_generation);
+	/* Pairs with the final release-store in a future DeltaFS commit. */
+	fs_generation = smp_load_acquire(&ofs->delta_generation);
+	if (inode_generation != fs_generation)
+		return flags & LOOKUP_RCU ? -ECHILD : 0;
 
 	oe = OVL_I_E(inode);
 	lowerstack = ovl_lowerstack(oe);
@@ -163,6 +176,7 @@ static struct inode *ovl_alloc_inode(struct super_block *sb)
 	oi->cache = NULL;
 	oi->redirect = NULL;
 	oi->version = 0;
+	oi->delta_generation = 0;
 	oi->flags = 0;
 	oi->__upperdentry = NULL;
 	oi->lowerdata_redirect = NULL;

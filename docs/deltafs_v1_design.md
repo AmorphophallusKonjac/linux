@@ -1,6 +1,6 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，分阶段实现中（P1、P2 代码已完成；P2 运行时验收待用户手动执行）
+> 状态：设计定稿，分阶段实现中（P1、P2、P3 代码已完成；P3 运行时验收待用户手动执行）
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -329,7 +329,7 @@ u64 delta_generation;
 
 不能复用 `ovl_inode.version`，后者已经用于 merge-directory readdir cache。
 
-普通 overlay inode 必须在加入 inode cache 前记录 generation：generation-aware `iget5` set callback 同时设置 `i_private` 和 `delta_generation`。对不经过 `iget5` 的 unhashed/root inode，`ovl_inode_init()` 再记录 acquire-load 的当前 generation。`ovl_inode_init()` 不得覆盖一个已经由 cache key 确定的 generation。Trap inode不代表可见 overlay dentry，不参与 generation revalidation。
+普通 overlay inode 必须在加入 inode cache 前记录 generation：generation-aware `iget5` set callback 同时设置 `i_private` 和 `delta_generation`。对不经过 `iget5` 的 unhashed/root inode，`ovl_inode_init()` 再记录 acquire-load 的当前 generation。`ovl_inode_init()` 不得覆盖一个已经由 cache key 确定的 generation。Trap inode不代表可见 overlay dentry，不参与 generation revalidation。Trap 创建和 layer-root 冲突检测继续使用只比较 real inode 的 identity test/set；trap 查询使用额外检查 trap 状态的专用 test，避免同一 real inode 的多个普通 generation cache entry 遮蔽真正的 trap。
 
 ### 7.3 Build/retired state
 
@@ -575,18 +575,20 @@ Commit 是一个不返回错误的内部函数，按以下顺序移动所有权�
 1. 将当前 `ofs->layers/numlayer` 移入预分配 old state。
 2. 将当前 workbasedir、workdir、whiteout、traps 和 in-use lock 状态移入 old state。
 3. 将当前 `config.upperdir/workdir/lowerdirs` 移入 old state。
-4. 获取 root `ovl_inode.lock`。
+4. 先获取 root inode `i_rwsem`，再获取 root `ovl_inode.lock`。
 5. 将 root inode 的旧 `__upperdentry` 和旧 `oe` 移入 old state。
 6. 把 new state 的 layer/work/config 字段安装到 `ovl_fs`。
 7. 把 new root upper 和 `ovl_entry` 安装到 root `ovl_inode`。
 8. 依据新 root backing 更新 root inode attributes 和 state-derived flags。
 9. 递增 root inode 的 readdir `version`，使 root directory cache 失效。
 10. 设置 root inode `delta_generation = new_generation`。
-11. 释放 root inode lock。
+11. 先释放 root `ovl_inode.lock`，再释放 root inode `i_rwsem`。
 12. 将 old state 加入 `delta_retired`。
 13. 用 `smp_store_release()` 最后发布 `ofs->delta_generation`。
 
 全局 generation 最后发布，保证后续 acquire-load 观察到新 generation 时，也能观察到完整的新 layer 和 root binding。
+
+root readdir `version` 和目录 cache 由 inode `i_rwsem` 保护；仅持有 `ovl_inode.lock` 不足以与目录迭代同步。锁顺序固定为 `delta_lock -> root inode i_rwsem -> root ovl_inode.lock`。
 
 ### 10.3 Root flags
 
@@ -659,11 +661,13 @@ inode->i_private = key.realinode
 OVL_I(inode)->delta_generation = key.generation
 ```
 
-`ovl_alloc_inode()` 先把 `delta_generation` 初始化为 0；cache set callback 或 unhashed/root inode 的 `ovl_inode_init()` 再赋予有效值。这样同一 backing inode 在多个 generation 中可以对应多个 overlay inode，也不会出现 inode 已进入 hash、generation 仍为 0 的窗口。Trap inode继续使用原有 test/set helper，避免把 generation 逻辑混入 layer-root trap。
+`ovl_alloc_inode()` 先把 `delta_generation` 初始化为 0；cache set callback 或 unhashed/root inode 的 `ovl_inode_init()` 再赋予有效值。这样同一 backing inode 在多个 generation 中可以对应多个 overlay inode，也不会出现 inode 已进入 hash、generation 仍为 0 的窗口。
+
+Trap inode 保持 generation 为 0。Trap 创建仍使用原有 identity-only test/set，使任何同 real inode 的普通 inode 都能触发 layer-root 冲突；`ovl_lookup_trap_inode()` 则使用 trap-only test，使 hash bucket 中先出现的普通旧代 inode不会造成假阴性。普通 `ovl_lookup_inode()` 在进行 generation-aware lookup 前必须单独检查并拒绝 trap，以保留 export/decode 路径对 layer root 返回 `-ESTALE` 的原生语义。
 
 ### 11.4 负 dentry
 
-Negative dentry 没有 inode，无法读取 inode generation。v1 不为 `d_fsdata` 引入新的分配对象，而是在 `ovl_lookup()` 得到 negative 结果时调用 `d_drop()`。
+Negative dentry 没有 inode，无法读取 inode generation。v1 不为 `d_fsdata` 引入新的分配对象，而是在 `ovl_lookup()` 得到 negative 结果、由 `d_splice_alias(NULL, dentry)` 完成 lookup 后调用 `d_drop()`。不能在 `d_splice_alias()` 前 drop，否则该 helper 会重新将 negative dentry 加入 hash。
 
 结果是：
 
@@ -674,6 +678,8 @@ Negative dentry 没有 inode，无法读取 inode generation。v1 不为 `d_fsda
 ### 11.5 Root inode 例外
 
 `sb->s_root` 不能像普通 dentry 一样丢弃重建，因此 root inode 在 commit 中原地更新并直接设置新 generation。Control fd 虽然跨越 commit，但只执行当前 ioctl，返回后立即关闭。
+
+root readdir cache 复用 `ovl_inode.version` 协议。P3 只抽取要求持有 inode `i_rwsem` 的 version increment helper，不发生额外递增；真正的 view commit 调用该 helper使旧 root cache 失效。
 
 ## 12. Retired state 生命周期
 
