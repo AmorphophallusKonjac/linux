@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
@@ -74,6 +75,109 @@ static void init_request(struct deltafs_ioc_switch_v1 *req, int upper_fd,
 		req->lower_fds[i] = -1;
 	for (i = 0; i < nr_lower && i < DELTAFS_V1_MAX_LOWERS; i++)
 		req->lower_fds[i] = lower_fds[i];
+}
+
+/*
+ * A controller always supplies a fresh, empty branch per build request.  A
+ * successful P4 restore builds the overlay internal "work/" directory inside the
+ * work base and leaves it behind after the state is freed; reusing that work
+ * base for the next request would trip validate_empty (-ENOTEMPTY).  This helper
+ * creates a unique empty upper/work/lower subtree next to @sibling and returns
+ * its open O_PATH fds.  The caller owns the allocated fd array.
+ */
+static int make_open_dir(int parent, const char *name)
+{
+	if (mkdirat(parent, name, 0700))
+		return -errno;
+	return openat(parent, name, O_PATH | O_DIRECTORY | O_CLOEXEC);
+}
+
+/* Create a unique empty branch under the parent of @sibling.  Returns 0 on
+ * success and fills *sub (the branch dir), *upper, *work and lower[i].  The
+ * caller frees the lower array and closes every fd. */
+static int fresh_branch(int sibling, int nr_lower, int *sub, int *upper,
+			int *work, int **lower_out)
+{
+	int parent, subfd = -1, up = -1, wd = -1, *lowers = NULL;
+	char name[48];
+	unsigned int seq = (unsigned int)getpid();
+	int i, err = 0;
+
+	*sub = *upper = *work = -1;
+	*lower_out = NULL;
+
+	parent = openat(sibling, "..", O_PATH | O_DIRECTORY | O_CLOEXEC);
+	if (parent < 0)
+		return -errno;
+
+	for (;;) {
+		snprintf(name, sizeof(name), "p1-branch-%u-%u",
+			 seq, (unsigned)time(NULL));
+		if (mkdirat(parent, name, 0700) == 0)
+			break;
+		if (errno != EEXIST) {
+			err = -errno;
+			close(parent);
+			return err;
+		}
+		seq++;
+	}
+
+	subfd = openat(parent, name, O_PATH | O_DIRECTORY | O_CLOEXEC);
+	close(parent);
+	if (subfd < 0) {
+		err = subfd;
+		goto fail;
+	}
+	up = make_open_dir(subfd, "upper");
+	if (up < 0) {
+		err = up;
+		goto fail;
+	}
+	wd = make_open_dir(subfd, "work");
+	if (wd < 0) {
+		err = wd;
+		goto fail;
+	}
+
+	lowers = calloc(nr_lower, sizeof(*lowers));
+	if (!lowers) {
+		err = -ENOMEM;
+		goto fail;
+	}
+	for (i = 0; i < nr_lower; i++) {
+		char lname[24];
+
+		snprintf(lname, sizeof(lname), "lower%d", i);
+		lowers[i] = make_open_dir(subfd, lname);
+		if (lowers[i] < 0) {
+			err = lowers[i];
+			goto fail;
+		}
+	}
+
+	*sub = subfd;
+	*upper = up;
+	*work = wd;
+	*lower_out = lowers;
+	return 0;
+
+fail:
+	if (lowers) {
+		int j;
+
+		for (j = 0; j < nr_lower; j++)
+			if (lowers[j] >= 0)
+				close(lowers[j]);
+		free(lowers);
+	}
+	if (wd >= 0)
+		close(wd);
+	if (up >= 0)
+		close(up);
+	if (subfd >= 0)
+		close(subfd);
+	return err;
 }
 
 static int open_directory(const char *path)
@@ -163,12 +267,57 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	/* These two requests are valid in P1, whose deliberate terminal result is
-	 * -EOPNOTSUPP until state construction and commit are implemented. */
-	expect_ioctl("valid checkpoint", root_fd, DELTAFS_IOC_CHECKPOINT, &req,
-		     EOPNOTSUPP);
-	expect_ioctl("valid restore", root_fd, DELTAFS_IOC_RESTORE, &req,
-		     EOPNOTSUPP);
+	/* A restore whose upper/work/lower are fresh empty backing directories is
+	 * a valid P4 build: it constructs a complete state, frees it, and returns
+	 * -EOPNOTSUPP.  A successful build leaves the overlay internal "work/"
+	 * inside the work base, so the next build-validating request must use its
+	 * own fresh branch, or validate_empty would see -ENOTEMPTY. */
+	{
+		int sub = -1, up = -1, wd = -1, *lowers = NULL;
+
+		if (fresh_branch(work_fd, nr_lower, &sub, &up, &wd, &lowers)) {
+			fail("could not create a fresh restore branch");
+		} else {
+			init_request(&req, up, wd, nr_lower, lowers);
+			expect_ioctl("valid restore", root_fd, DELTAFS_IOC_RESTORE,
+				     &req, EOPNOTSUPP);
+			for (i = 0; i < nr_lower; i++)
+				if (lowers[i] >= 0)
+					close(lowers[i]);
+			free(lowers);
+			if (wd >= 0)
+				close(wd);
+			if (up >= 0)
+				close(up);
+			if (sub >= 0)
+				close(sub);
+		}
+	}
+
+	/* The same request shape under CHECKPOINT fails command validation:
+	 * checkpoint requires the lowers to match the active overlay layers, which
+	 * these fresh directories do not, so it returns -EINVAL. */
+	{
+		int sub = -1, up = -1, wd = -1, *lowers = NULL;
+
+		if (fresh_branch(work_fd, nr_lower, &sub, &up, &wd, &lowers)) {
+			fail("could not create a fresh checkpoint branch");
+		} else {
+			init_request(&req, up, wd, nr_lower, lowers);
+			expect_ioctl("checkpoint with non-matching lowers", root_fd,
+				     DELTAFS_IOC_CHECKPOINT, &req, EINVAL);
+			for (i = 0; i < nr_lower; i++)
+				if (lowers[i] >= 0)
+					close(lowers[i]);
+			free(lowers);
+			if (wd >= 0)
+				close(wd);
+			if (up >= 0)
+				close(up);
+			if (sub >= 0)
+				close(sub);
+		}
+	}
 	/* ovl_deltafs_ioctl() returns -ENOIOCTLCMD internally.  vfs_ioctl()
 	 * translates that internal "not handled" sentinel to ENOTTY before the
 	 * ioctl(2) caller can observe it. */

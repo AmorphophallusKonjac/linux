@@ -722,6 +722,10 @@ static inline int ovl_verify_upper(struct ovl_fs *ofs, struct dentry *index,
 long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 void ovl_deltafs_cleanup(struct ovl_fs *ofs);
 
+/* super.c target-view helper used by the DeltaFS builder */
+int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
+			 const struct path *workpath, bool strict);
+
 /* readdir.c */
 extern const struct file_operations ovl_dir_operations;
 struct file *ovl_dir_real_file(const struct file *file, bool want_upper);

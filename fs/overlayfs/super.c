@@ -301,7 +301,8 @@ static const struct super_operations ovl_super_operations = {
 #define OVL_INDEXDIR_NAME "index"
 
 static struct dentry *ovl_workdir_create(struct ovl_fs *ofs,
-					 const char *name, bool persist)
+					 const char *name, bool persist,
+					 bool strict, int *create_err)
 {
 	struct inode *dir =  ofs->workbasedir->d_inode;
 	struct vfsmount *mnt = ovl_upper_mnt(ofs);
@@ -320,7 +321,9 @@ retry:
 		};
 
 		if (work->d_inode) {
-			err = -EEXIST;
+			err = strict ? -ENOTEMPTY : -EEXIST;
+			if (strict)
+				goto out_dput;
 			if (retried)
 				goto out_dput;
 
@@ -378,14 +381,22 @@ retry:
 		goto out_err;
 	}
 out_unlock:
+	if (create_err && !IS_ERR_OR_NULL(work))
+		*create_err = 0;
 	inode_unlock(dir);
 	return work;
 
 out_dput:
 	dput(work);
 out_err:
-	pr_warn("failed to create directory %s/%s (errno: %i); mounting read-only\n",
-		ofs->config.workdir, name, -err);
+	if (create_err)
+		*create_err = err;
+	if (strict)
+		pr_warn("failed to create DeltaFS directory %s/%s (errno: %i)\n",
+			ofs->config.workdir, name, -err);
+	else
+		pr_warn("failed to create directory %s/%s (errno: %i); mounting read-only\n",
+			ofs->config.workdir, name, -err);
 	work = NULL;
 	goto out_unlock;
 }
@@ -660,8 +671,8 @@ static int ovl_create_volatile_dirty(struct ovl_fs *ofs)
 	return 0;
 }
 
-static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
-			    const struct path *workpath)
+int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
+			 const struct path *workpath, bool strict)
 {
 	struct vfsmount *mnt = ovl_upper_mnt(ofs);
 	struct dentry *workdir;
@@ -669,16 +680,21 @@ static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	bool rename_whiteout;
 	bool d_type;
 	int fh_type;
+	int create_err = 0;
 	int err;
 
 	err = mnt_want_write(mnt);
 	if (err)
 		return err;
 
-	workdir = ovl_workdir_create(ofs, OVL_WORKDIR_NAME, false);
+	workdir = ovl_workdir_create(ofs, OVL_WORKDIR_NAME, false, strict,
+				     &create_err);
 	err = PTR_ERR(workdir);
-	if (IS_ERR_OR_NULL(workdir))
+	if (IS_ERR_OR_NULL(workdir)) {
+		if (!workdir && strict)
+			err = create_err ?: -EINVAL;
 		goto out;
+	}
 
 	ofs->workdir = workdir;
 
@@ -833,7 +849,7 @@ static int ovl_get_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	if (err)
 		return err;
 
-	return ovl_make_workdir(sb, ofs, workpath);
+	return ovl_make_workdir(sb, ofs, workpath, false);
 }
 
 static int ovl_get_indexdir(struct super_block *sb, struct ovl_fs *ofs,
@@ -865,7 +881,7 @@ static int ovl_get_indexdir(struct super_block *sb, struct ovl_fs *ofs,
 	ofs->workdir_trap = NULL;
 	dput(ofs->workdir);
 	ofs->workdir = NULL;
-	indexdir = ovl_workdir_create(ofs, OVL_INDEXDIR_NAME, true);
+	indexdir = ovl_workdir_create(ofs, OVL_INDEXDIR_NAME, true, false, NULL);
 	if (IS_ERR(indexdir)) {
 		err = PTR_ERR(indexdir);
 	} else if (indexdir) {

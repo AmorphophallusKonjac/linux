@@ -54,6 +54,42 @@ struct ovl_entry {
 	struct ovl_path __lowerstack[];
 };
 
+/*
+ * A completely owned DeltaFS view.  During build every non-NULL field belongs
+ * to this object.  After commit the same shape owns a retired view until
+ * unmount, so partial-build and retired teardown share one release path.
+ *
+ * ofs->fs and its anonymous devices are deliberately not represented here:
+ * DeltaFS v1 only accepts layers from the active backing superblock and those
+ * objects remain owned by the overlay superblock.
+ */
+struct ovl_delta_state {
+	struct list_head node;
+	u64 generation;
+
+	unsigned int numlayer;
+	struct ovl_layer *layers;
+
+	struct dentry *workbasedir;
+	struct dentry *workdir;
+	struct dentry *whiteout;
+	struct inode *workbasedir_trap;
+	struct inode *workdir_trap;
+
+	bool upperdir_locked;
+	bool workdir_locked;
+	bool no_shared_whiteout;
+
+	char *upperdir_name;
+	char *workdir_name;
+	char **lowerdir_names;
+
+	struct dentry *root_upperdentry;
+	struct ovl_entry *root_oe;
+	bool root_impure;
+	bool root_xwhiteouts;
+};
+
 /* private information held for overlayfs's superblock */
 struct ovl_fs {
 	unsigned int numlayer;

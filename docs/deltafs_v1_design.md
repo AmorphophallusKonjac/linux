@@ -1,6 +1,6 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，分阶段实现中（P1、P2、P3 代码已完成；P3 运行时验收待用户手动执行）
+> 状态：设计定稿，分阶段实现中（P1、P2、P3、P4 代码与运行时验收已完成）
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -405,10 +405,14 @@ idx = layer 在新数组中的索引
 
 对 upper/work/lower fd：
 
-1. `fdget()` 取得 file；
-2. 检查 `S_ISDIR(file_inode(file)->i_mode)`；
+1. `fget_raw()` 取得 file；用 `fget_raw()` 而非 `fdget_raw()`，因为后者是
+   `static inline`，会展开为未导出给模块的 `__fdget_raw()`，而 DeltaFS 构建在
+   `CONFIG_OVERLAY_FS=m` 的可加载模块中；`fget_raw()` 经 `EXPORT_SYMBOL`
+   导出，同样接受 `O_PATH` fd（不过滤 `FMODE_PATH`）；
+2. 检查 file 设置了 `FMODE_PATH`，且
+   `S_ISDIR(file_inode(file)->i_mode)`；
 3. 复制 `file->f_path` 并 `path_get()`；
-4. `fdput()`；
+4. `fput()`；
 5. 构建结束后统一 `path_put()`。
 
 关闭用户 fd 不影响内核构建，因为 builder 已持有 path 引用。
@@ -420,16 +424,25 @@ idx = layer 在新数组中的索引
 - `nr_lower` 在 `[1, 64]`；
 - upper/work 不是只读 mount；
 - upper/work 位于同一个 `vfsmount`，避免 idmap 和 mount identity 不一致；
+- 所有输入 mount 都不是 idmapped mount；
 - 所有 backing `mnt_sb == ofs->delta_backing_sb`；
-- 任一路径不是当前 OverlayFS superblock；
+- 任一路径不位于当前或其他 OverlayFS superblock；
 - 路径没有重复；
 - upper、work、各 lower 两两不为祖先/后代；
-- upper/work 不等于 active 或 retired state 中仍持有的 root；
+- upper/work 与 active 或 retired state 中仍持有的 layer root、work base
+  和内部 workdir 均不相等、也不构成祖先/后代关系；
 - lower 不等于此次 fresh upper/work；
 - restore 的 lower 不等于当前 active upper；
 - layer 数未超过 OverlayFS 和 DeltaFS 双重上限。
 
 Fresh upper 和 work base 由 controller 通过唯一名称和 `mkdirat()` 创建。内核额外用 directory iteration 验证两者在构建开始时为空；work helper 创建内部目录后不再要求 work base 为空。
+
+Active upper/work 必须已经持有 OverlayFS in-use lock；new upper/work 也必须
+成功获取各自的 in-use lock，否则返回 `-EBUSY`。DeltaFS 不沿用 stock
+OverlayFS 在 `index=off` 时对共享 upper/work 只警告后继续的兼容行为。
+
+所有读取或修改 backing 对象的 VFS 操作使用 `ofs->creator_cred`。fd/path
+获取和 `d_path()` 显示字符串仍基于调用 controller 的 fd 与 mount namespace。
 
 ### 8.4 Feature 验证
 
@@ -475,6 +488,10 @@ ofs->xino_mode == 0
 
 每个 state 使用独立 private mount clone，不共享 kern mount 所有权，简化 teardown。
 
+对 active/retired state 的 root 比较和 trap 复用在 `ofs->delta_lock` 下进行；
+builder 获得自己的 trap 引用后即可在锁外继续构建。另一个 commit 只会把旧
+active state 移入 retired list，不会使 builder 持有的引用失效。
+
 ### 8.6 Root binding
 
 构建阶段分配新的 root `ovl_entry`：
@@ -491,7 +508,11 @@ root_oe->__lowerstack[i].dentry = dget(new_layers[i + 1].mnt->mnt_root)
 root_upperdentry = dget(new_layers[0].mnt->mnt_root)
 ```
 
-Builder 复用 `ovl_get_root()` 的 whiteout/xwhiteout 检查逻辑计算新 root 所需 flags，但不创建新的 overlay root inode。
+Builder 复用 `ovl_get_root()` 的 whiteout/xwhiteout 检查逻辑计算新 root 所需
+flags，但不创建新的 overlay root inode。至少预先记录 new upper 的 impure
+状态、各 lower 的 `has_xwhiteouts` 和 root xwhiteout 汇总状态；real-dentry
+revalidation flags 可以在 commit 中从已经持有引用的 root binding 无失败地
+重新汇总。
 
 ### 8.7 配置显示字符串
 
@@ -517,6 +538,16 @@ lowerdirs[1..nr_lower] = 每个 lower 的路径字符串
 - root flags 更新描述。
 
 此后不得再发生可能失败的分配或路径解析。
+
+P4 只验证 builder：完整 target state 构建成功后立即调用与 retired state
+共用的 free helper，且 ioctl 仍返回 `-EOPNOTSUPP`。P4 不安装 target state、
+不增加 generation、也不向 retired list 加入节点。P5 才在最终重检成功后
+调用无失败 commit。
+
+“完整释放”指 mount、trap、dentry、in-use lock、root binding 和配置字符串
+的内核所有权全部平衡。严格 work helper 已经在 fresh work base 中创建的内部
+`work` 目录不由 free helper 删除；ioctl 失败后 controller 删除整个 fresh
+branch。
 
 ## 9. Checkpoint 与 restore 专用校验
 
@@ -790,6 +821,8 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 | `-EINVAL` | ABI、reserved、fd 顺序、重复/重叠路径或 checkpoint chain 错误 | 否 |
 | `-EBADF` | 任一 fd 无效 | 否 |
 | `-ENOTDIR` | 任一 fd 不是目录 | 否 |
+| `-ENOTEMPTY` | fresh upper 或 fresh work base 在构建开始时非空 | 否 |
+| `-EBUSY` | active 或 new upper/work 未能持有独占 in-use lock | 否 |
 | `-EROFS` | OverlayFS 无 writable upper/work 或 superblock 只读 | 否 |
 | `-EOPNOTSUPP` | feature、idmap、嵌套布局或其他 v1 不支持条件 | 否 |
 | `-EXDEV` | backing path 不在 `delta_backing_sb` | 否 |
@@ -797,6 +830,10 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 | `-ESTALE` | expected generation 不匹配 | 否 |
 | `-EOVERFLOW` | generation 已为 `U64_MAX` | 否 |
 | `-ENOMEM` | build/preallocation 失败 | 否 |
+
+Backing VFS 操作产生的 `-EACCES`、`-ENOSPC`、`-ENAMETOOLONG` 等错误可以
+原样返回。可归因于重复、重叠或已有普通 overlay inode 的 trap 冲突统一映射
+为 `-EINVAL`，不把内部 `-ELOOP` 作为 DeltaFS 路径验证 ABI 暴露。
 
 一旦 commit 开始，内部函数没有失败返回。ioctl 返回 0 时 active view 已完整切换。
 
@@ -839,7 +876,7 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 - bad size/version/flags/reserved；
 - 非 root control fd；
 - 无权限调用；
-- 关闭、非目录和跨 mount namespace fd；
+- 关闭、非 `O_PATH`、非目录和跨 mount namespace fd；
 - upper/work/lower 重复或重叠；
 - 不同 backing superblock；
 - stale expected generation；
@@ -847,6 +884,10 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 - restore 包含 current upper；
 - 0、64、65 个 lower；
 - 对每个 build allocation/clone/trap/workdir 步骤注入失败。
+
+P4 中，builder 成功后的阶段性终值仍为 `-EOPNOTSUPP`；测试必须同时确认
+state 已完整释放且 active generation 仍接受原 `expected_generation`。故障注入
+使用仅在内核 fault-injection 配置下生效的内部 build checkpoint，不扩展 UAPI。
 
 所有失败用例必须断言：
 
