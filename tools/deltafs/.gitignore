@@ -3,3 +3,6 @@ p3_cache_test
 p4_state_test
 p5_commit_test
 p5_checkpoint_test
+p6_generation_test
+deltafsctl
+deltafsctl_test

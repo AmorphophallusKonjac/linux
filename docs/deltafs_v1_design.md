@@ -1,7 +1,6 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，分阶段实现中（P1、P2、P3、P4 代码与运行时验收已完成；
-> P5 first-commit 与 kmemleak 验收已通过，checkpoint/multi-commit 验收待执行）
+> 状态：设计定稿，P1--P6 代码与 QEMU/KVM 运行时验收已完成
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -265,7 +264,19 @@ new_generation = expected_generation + 1
   "format": 1,
   "kernel_generation": 3,
   "active_branch": "g3",
+  "active_lowers": [
+    "layers/cp-000002",
+    "layers/cp-000001",
+    "base"
+  ],
+  "retired_branches": ["g1", "g2"],
   "snapshots": {
+    "cp-000001": {
+      "lowers": [
+        "layers/cp-000001",
+        "base"
+      ]
+    },
     "cp-000002": {
       "lowers": [
         "layers/cp-000002",
@@ -281,9 +292,31 @@ new_generation = expected_generation + 1
 
 - 所有路径相对 `<sandbox-root>` 保存，controller 打开后转成 directory fd；
 - checkpoint 保存 immutable lower chain，不保存一个未来可写的 checkpoint upper；
-- active branch 只表示当前临时 RW upper/work；
+- `active_branch` 只表示当前临时 RW upper/work，且固定使用当前 runtime
+  generation 对应的 `gN`；
+- `active_lowers` 显式保存当前完整 lower chain，使 restore 后的下一次
+  checkpoint 不依赖猜测或 snapshot ID 反推；
+- 每次成功切换都把旧 active branch 加入 `retired_branches`，v1 在线期间不删除；
+- snapshot 的第一层必须是自己的 `layers/<checkpoint-id>`，其余部分必须完整
+  等于父 snapshot chain，最后一层必须为 `base`；
+- 每个 snapshot 的 parent 必须在 metadata 中先出现，禁止循环或前向 parent 引用；
 - generation 是 runtime CAS 值，不是 snapshot ID；
 - controller 使用 `controller.lock` 保证单实例操作。
+
+Controller 只接受无转义的 printable-ASCII checkpoint ID 和相对路径组件，拒绝
+未知/重复 JSON 字段、重复 lower、断裂的 parent chain、generation/branch
+不一致以及超过上限的 metadata。该限制让高权限 controller 不需要通用 JSON
+扩展语义，也不会通过 manifest 路径越出 sandbox root。
+
+P6 controller 的两个运行时命令为：
+
+```text
+deltafsctl --assume-quiesced checkpoint <sandbox-root> <checkpoint-id>
+deltafsctl --assume-quiesced restore    <sandbox-root> <checkpoint-id>
+```
+
+Sandbox provisioning 负责创建初始 `g1` branch、`base`、`merged` mount 和上面的
+generation-1 metadata；controller 不创建 mount，也不尝试探测或停止 workload。
 
 ## 7. 内核数据模型
 
@@ -773,9 +806,14 @@ v1 的内核内存和 private mount 数量随切换次数与 layer depth 增长�
 3. 确认目标 workload 已满足静止条件；
 4. 打开 merged root control fd；
 5. 调用 `syncfs(merged_fd)`；
-6. 使用唯一 generation/UUID 名称创建 fresh branch；
-7. 以 `O_PATH|O_DIRECTORY` 打开 backing directories；
-8. 填充全部未使用 fd 槽为 `-1`。
+6. 计算完整 target chain、`gN+1` 和提交后的 `state.json`，完成所有用户态
+   内存预分配；
+7. 用临时文件、file `fsync()`、`rename()` 和 meta directory `fsync()` 先持久化
+   `transaction.json`；
+8. transaction durable 后才允许创建 fresh branch 或执行其他 backing-tree
+   修改；
+9. 以 `O_PATH|O_DIRECTORY` 打开 backing directories；
+10. 填充全部未使用 fd 槽为 `-1`。
 
 Controller 以 C 实现 ioctl、rename、fd 和 fsync 的核心路径；测试编排可以使用 shell 或 Python。
 
@@ -784,40 +822,44 @@ Controller 以 C 实现 ioctl、rename、fd 和 fsync 的核心路径；测试�
 假设当前 active branch 是 `gN`：
 
 1. 验证 checkpoint ID 不存在。
-2. 创建 `branches/gN+1/upper` 和 `branches/gN+1/work`。
-3. 写入 `transaction.json`，状态为 `preparing-checkpoint`。
-4. 将 `branches/gN/upper` rename 为 `layers/<checkpoint-id>`。
-5. fsync `branches/gN`、`layers` 及其父目录。
-6. 组成 target lower chain：`[new frozen layer] + old lower chain`。
+2. 组成 target lower chain：`[new frozen layer] + active_lowers`。
+3. 写入 `transaction.json`，状态为 `prepared`。
+4. 创建并 fsync `branches/gN+1/upper` 和 `branches/gN+1/work`。
+5. 将 `branches/gN/upper` rename 为 `layers/<checkpoint-id>`。
+6. fsync `branches/gN` 和 `layers`。
 7. 调用 `DELTAFS_IOC_CHECKPOINT(expected_generation=N)`。
-8. 成功后将新 snapshot、active branch 和 `kernel_generation=N+1` 写入临时 state 文件。
+8. 成功后将新 snapshot、`active_lowers`、active/retired branch 和
+   `kernel_generation=N+1` 写入临时 state 文件。
 9. fsync 临时文件，rename 覆盖 `state.json`，再 fsync `meta`。
-10. 删除 `transaction.json`，释放 controller lock。
+10. 删除 `transaction.json` 并 fsync `meta`，释放 controller lock。
 
 ioctl 失败时：
 
 - 当前内核 view 保持不变；
 - 将 frozen layer rename 回 `branches/gN/upper`；
 - 删除 fresh branch；
-- 删除 transaction 文件；
+- fsync 补偿后的目录；全部补偿成功后才删除并 fsync transaction 文件；
 - 返回原始 errno。
 
 ### 13.3 Restore
 
 1. 查找目标 checkpoint 的 immutable lower chain。
-2. 创建全新的 `branches/gN+1/upper` 和 `work`。
-3. 写入 `transaction.json`，状态为 `preparing-restore`。
-4. 打开目标 lower chain 的 directory fds。
+2. 写入 `transaction.json`，状态为 `prepared`。
+3. 创建并 fsync 全新的 `branches/gN+1/upper` 和 `work`。
+4. 打开目标完整 lower chain 的 directory fds。
 5. 调用 `DELTAFS_IOC_RESTORE(expected_generation=N)`。
-6. 成功后更新 active branch 和 `kernel_generation=N+1`。
+6. 成功后更新 active branch、`active_lowers` 和 `kernel_generation=N+1`。
 7. 原 active branch 标记为 retired，但不删除。
 8. 原子替换 `state.json`，删除 transaction 文件。
 
-ioctl 失败时只删除 fresh branch，当前 active branch 与 manifest 不变。
+ioctl 失败时删除 fresh branch并 fsync `branches`；补偿成功后删除 transaction，
+当前 active branch 与 manifest 不变。
 
 ### 13.4 Controller 崩溃边界
 
-v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已返回成功，但 controller 在提交 `state.json` 前失败：
+v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。`transaction.json`、
+`.transaction.json.tmp` 或 `.state.json.tmp` 任一存在时，后续命令都必须
+fail-stop。尤其是 ioctl 已返回成功、但 controller 在提交 `state.json` 前失败时：
 
 - `transaction.json` 必须保留；
 - 后续命令必须拒绝继续操作；
@@ -825,6 +867,10 @@ v1 不提供 `GET_STATE` ioctl，也不承诺掉电事务恢复。若 ioctl 已�
 - 工具不得猜测 ioctl 是否提交，也不得自动删除任何相关目录。
 
 这保证故障可见，但不属于自动恢复。
+
+ioctl 返回成功是用户态事务的不可回滚点。其后的 state write、file/directory
+fsync 或 transaction unlink 失败时，controller 不得把 layer rename 回去、不得
+删除 fresh branch，只能保留可见故障并要求管理员明确恢复。
 
 ## 14. 错误语义
 
@@ -863,6 +909,20 @@ Backing VFS 操作产生的 `-EACCES`、`-ENOSPC`、`-ENAMETOOLONG` 等错误可
 - OverlayFS 的 super/inode/namei/readdir 集成点：初始化、root 更新、generation-aware inode lookup、dentry revalidation 和 directory ioctl hook；
 - 用户态工具目录：controller、manifest 和 CLI；
 - OverlayFS selftests：ABI 负向测试、cache、checkpoint/restore 和 teardown。
+
+P6 的具体用户态产物：
+
+- `tools/deltafs/deltafsctl.c`：仅包含 `checkpoint` 和 `restore` 两种运行时操作；
+- `tools/deltafs/deltafsctl_test`：只供 harness 使用的 controller failpoint build；
+- `tools/deltafs/p6_controller_unit_test.sh`：不挂载文件系统的 parser/补偿测试；
+- `tools/deltafs/p6_controller_test.sh`：QEMU/KVM 双操作、分支和崩溃边界验收；
+- `tools/deltafs/p6_generation_test.c`：利用 errno 顺序确认精确 runtime generation。
+
+宿主机可运行 `make -C tools/deltafs test-p6-controller`；它使用非 OverlayFS
+目录让 ioctl 返回 `ENOTTY`，并验证同步失败的 rename/branch/transaction
+补偿、未知 restore、遗留 transaction、缺失 frozen target 和循环 manifest
+均在任何内核切换前 fail closed。完整功能验收只能执行
+`p6_controller_test.sh --backing-root PATH`，该脚本明确限制在项目 QEMU/KVM guest。
 
 关键代码锚点：
 
@@ -944,6 +1004,24 @@ generation 2 的分支写入被丢弃且历史 checkpoint 保持不变；第二�
 验证 layer depth 再次增长时的 active trap 复用。最终必须同时核验当前 upper、
 两个 frozen checkpoint、retired generation-2 upper 和原始 lower 的物理内容与
 mtime/size/inode，并用 errno 顺序证明 global generation 恰好为 4。
+
+P6 在 controller 路径上固定执行：
+
+```text
+generation 1 --checkpoint A--> generation 2
+generation 2 --checkpoint B--> generation 3
+generation 3 --checkpoint C--> generation 4
+generation 4 ----restore A----> generation 5 / fresh A′
+```
+
+测试在每个 layer 冻结后记录内容 hash、inode、size 与 mtime；restore 后向
+`g5/upper` 写入 A′，并再次确认 A、B、C 以及 base 均未变化，merged view 恢复
+A 且不包含 B/C 的分支内容。另有两个 controller 边界：
+
+- ioctl 前注入失败必须把 layer rename、fresh branch、state 与 transaction
+  全部补偿回 generation 1；
+- ioctl 成功后立即终止 controller 必须保留 transaction，维持旧 state.json，
+  且拒绝任何后续 checkpoint/restore，直到管理员人工恢复。
 
 ### 16.4 Cache
 
