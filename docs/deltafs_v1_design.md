@@ -1,6 +1,7 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，分阶段实现中（P1、P2、P3、P4 代码与运行时验收已完成）
+> 状态：设计定稿，分阶段实现中（P1、P2、P3、P4 代码与运行时验收已完成；
+> P5 first-commit 与 kmemleak 验收已通过，checkpoint/multi-commit 验收待执行）
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -603,10 +604,12 @@ Restore 额外拒绝：
 
 Commit 是一个不返回错误的内部函数，按以下顺序移动所有权：
 
-1. 将当前 `ofs->layers/numlayer` 移入预分配 old state。
-2. 将当前 workbasedir、workdir、whiteout、traps 和 in-use lock 状态移入 old state。
-3. 将当前 `config.upperdir/workdir/lowerdirs` 移入 old state。
-4. 先获取 root inode `i_rwsem`，再获取 root `ovl_inode.lock`。
+1. 在仍持有 `delta_lock` 时，先获取 root inode `i_rwsem`，再获取 root
+   `ovl_inode.lock`。在三把锁全部持有前不得移动任何 active 所有权。
+2. 将当前 `ofs->layers/numlayer` 移入预分配 old state。
+3. 将当前 workbasedir、workdir、whiteout、traps 和 in-use lock 状态移入
+   old state。
+4. 将当前 `config.upperdir/workdir/lowerdirs` 移入 old state。
 5. 将 root inode 的旧 `__upperdentry` 和旧 `oe` 移入 old state。
 6. 把 new state 的 layer/work/config 字段安装到 `ovl_fs`。
 7. 把 new root upper 和 `ovl_entry` 安装到 root `ovl_inode`。
@@ -617,7 +620,16 @@ Commit 是一个不返回错误的内部函数，按以下顺序移动所有权�
 12. 将 old state 加入 `delta_retired`。
 13. 用 `smp_store_release()` 最后发布 `ofs->delta_generation`。
 
+步骤 2--7 只记录旧 owner 并用新 owner 覆盖对应字段，不得先把 active 字段
+清成 `NULL`。每个从 new state 移出的指针和 lock ownership 都必须在 source 中
+清零；提交完成后 new state 容器为空，可以直接释放容器，不能再调用会释放已
+转移资源的完整 state teardown。
+
 全局 generation 最后发布，保证后续 acquire-load 观察到新 generation 时，也能观察到完整的新 layer 和 root binding。
+
+该 release/acquire 关系只提供“观察到新 generation 必然观察到完整新 view”的
+单向发布保证，不是并发 reader 的 seqlock。一个在提交前已经读到旧 generation
+的并发路径操作不在此协议保护范围内；v1 仍要求提交期间 workload 完全静止。
 
 root readdir `version` 和目录 cache 由 inode `i_rwsem` 保护；仅持有 `ovl_inode.lock` 不足以与目录迭代同步。锁顺序固定为 `delta_lock -> root inode i_rwsem -> root ovl_inode.lock`。
 
@@ -630,9 +642,13 @@ Root 不重新创建 inode。更新 helper 应镜像 `ovl_get_root()` 中与 bac
 - 根据新 upper 更新 impure 状态；
 - 根据 lower roots 更新 xwhiteout 标志；
 - 调用 `ovl_copyattr()` 从新 real inode更新可见 attributes；
+- 调用 `ovl_copyflags()` 更新允许从 real inode 复制的 VFS inode flags；
 - 重新初始化 real-dentry revalidation flags。
 
-不得清除与动态 view 无关的通用 inode 状态。
+强制的 `DCACHE_OP_REVALIDATE` 必须保留，只按新 root backing 重算 weak
+revalidation flags。Root VFS inode 对象及其 `i_ino` 保持稳定；same-fs v1 配置
+下的用户可见 `stat(2)` inode number 仍由新的 real root 提供。不得清除与动态
+view 无关的通用 inode 状态。
 
 ## 11. Generation 缓存协议
 
@@ -915,14 +931,40 @@ merged 内容未变
 
 每个用例同时验证 merged view 和物理 frozen layer。Frozen layer 的内容 hash、mtime、inode 和文件大小在后续写入后必须保持不变。
 
+P5 的 checkpoint/multi-commit 验收在同一 mount 上固定执行以下序列：
+
+```text
+generation 1 --checkpoint--> generation 2
+generation 2 ----restore---> generation 3
+generation 3 --checkpoint--> generation 4
+```
+
+第一次 checkpoint 验证 active upper 成为第一层 frozen lower；restore 验证
+generation 2 的分支写入被丢弃且历史 checkpoint 保持不变；第二次 checkpoint
+验证 layer depth 再次增长时的 active trap 复用。最终必须同时核验当前 upper、
+两个 frozen checkpoint、retired generation-2 upper 和原始 lower 的物理内容与
+mtime/size/inode，并用 errno 顺序证明 global generation 恰好为 4。
+
 ### 16.4 Cache
 
-切换前预热并关闭所有 fd：
+切换前预热并关闭所有普通 fd：
 
 - 对存在文件反复 `stat/open/close`；
 - 对不存在文件反复查询 ENOENT；
-- 对目录执行 readdir 后关闭目录 fd；
+- 对目录执行 readdir 后关闭目录 fd，验证契约内的重新打开结果；
 - 对多层目录逐级 lookup。
+
+关闭最后一个 OverlayFS 目录 fd 会释放该 fd 持有的 readdir cache，因此上述
+契约内用例只能验证切换后重新打开目录得到新 view，不能单独证明 root
+`version` 失效路径。另设一个仅用于内核机制验收的测试：在唯一 control fd 上
+预热 root readdir cache，`lseek(fd, 0, SEEK_SET)` 后执行 ioctl，再在同一 fd 上
+readdir，确认 version mismatch 丢弃旧 cache 并重建。该白盒用例是对“不跨切换
+使用目录 fd”前置条件的明确测试例外，不扩展 v1 用户可见语义。
+
+P5 的第一次可观察切换优先使用 restore：初始 view 与目标 lower chain 使用不同
+内容，使正路径变化、正路径消失、负路径变为存在以及 root readdir 集合变化都
+可直接断言。第一次 checkpoint 在 fresh upper 为空时应保持逻辑内容不变，不适合
+单独证明 cache 已经换代。
 
 切换后验证：
 
@@ -940,6 +982,10 @@ merged 内容未变
 - module unload；
 - KASAN、KFENCE、UBSAN、lockdep、RCU debug、kmemleak；
 - 检查 private mount、trap、dentry 和 config string 的引用平衡。
+
+`p5_checkpoint_test.sh` 在三次提交后卸载同一 OverlayFS、卸载 overlay module，
+等待 kmemleak minimum age 后连续扫描两次；报告必须为空，marker 窗口内也不得
+出现 sanitizer、refcount、lockdep 或 RCU 诊断。
 
 ### 16.6 不验收场景
 

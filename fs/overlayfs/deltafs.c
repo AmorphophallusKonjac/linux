@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * DeltaFS v1 ioctl front-end and target state builder.
+ * DeltaFS v1 ioctl front-end, target state builder, and view commit.
  *
- * P4 deliberately stops before commit.  A valid request is fully built into
- * an independently owned state, revalidated, released, and then returns
- * -EOPNOTSUPP.  This makes every ownership and unwind path testable without
- * changing the active OverlayFS view.
+ * A target view is fully built outside the active ovl_fs.  Commit then moves
+ * every dynamic owner under a fixed lock order, retires the old view, and
+ * publishes the new generation only after the new root binding is complete.
  */
 
 #include <uapi/linux/deltafs.h>
@@ -814,11 +813,136 @@ static int ovl_deltafs_final_revalidate_locked(
 	return ovl_deltafs_validate_command_locked(ofs, cmd, req, paths);
 }
 
+static void ovl_deltafs_update_root_locked(struct super_block *sb,
+					   struct ovl_delta_state *state,
+					   u64 generation)
+{
+	struct ovl_fs *ofs = OVL_FS(sb);
+	struct dentry *root = sb->s_root;
+	struct inode *inode = d_inode(root);
+	struct ovl_inode *oi = OVL_I(inode);
+
+	lockdep_assert_held_write(&inode->i_rwsem);
+	lockdep_assert_held(&oi->lock);
+
+	if (state->root_impure)
+		ovl_set_flag(OVL_IMPURE, inode);
+	else
+		ovl_clear_flag(OVL_IMPURE, inode);
+
+	if (state->root_xwhiteouts)
+		ovl_dentry_set_xwhiteouts(root);
+	else
+		ovl_dentry_clear_flag(OVL_E_XWHITEOUTS, root);
+
+	/* These are invariant for a writable DeltaFS root. */
+	ovl_dentry_set_flag(OVL_E_CONNECTED, root);
+	ovl_dentry_set_upper_alias(root);
+	ovl_set_flag(OVL_WHITEOUTS, inode);
+	ovl_set_upperdata(inode);
+
+	ovl_copyattr(inode);
+	ovl_copyflags(d_inode(oi->__upperdentry), inode);
+	ovl_dentry_init_flags(root, oi->__upperdentry, oi->oe,
+			      DCACHE_OP_WEAK_REVALIDATE);
+	ovl_inode_version_inc(inode);
+	WRITE_ONCE(oi->delta_generation, generation);
+
+	/* The root real path used above must resolve through the new layer set. */
+	WARN_ON_ONCE(ovl_upper_mnt(ofs)->mnt_root != oi->__upperdentry);
+}
+
+/*
+ * Consume every owner in @state, install it as the active view, and turn
+ * @old into a completely owned retired view.  The caller has performed the
+ * final revalidation and holds ofs->delta_lock.  This function cannot fail.
+ */
+static void ovl_deltafs_commit_locked(struct super_block *sb,
+				      struct ovl_delta_state *state,
+				      struct ovl_delta_state *old)
+{
+	struct ovl_fs *ofs = OVL_FS(sb);
+	struct inode *root_inode = d_inode(sb->s_root);
+	struct ovl_inode *root_oi = OVL_I(root_inode);
+	u64 old_generation = READ_ONCE(ofs->delta_generation);
+	u64 new_generation = state->generation;
+
+	lockdep_assert_held(&ofs->delta_lock);
+	WARN_ON_ONCE(new_generation != old_generation + 1);
+
+	/* Fixed order: delta_lock -> root i_rwsem -> root ovl_inode.lock. */
+	inode_lock(root_inode);
+	ovl_inode_lock(root_inode);
+
+	old->generation = old_generation;
+	old->numlayer = ofs->numlayer;
+	old->layers = ofs->layers;
+	old->workbasedir = ofs->workbasedir;
+	old->workdir = ofs->workdir;
+	old->whiteout = ofs->whiteout;
+	old->workbasedir_trap = ofs->workbasedir_trap;
+	old->workdir_trap = ofs->workdir_trap;
+	old->upperdir_locked = ofs->upperdir_locked;
+	old->workdir_locked = ofs->workdir_locked;
+	old->no_shared_whiteout = ofs->no_shared_whiteout;
+	old->upperdir_name = ofs->config.upperdir;
+	old->workdir_name = ofs->config.workdir;
+	old->lowerdir_names = ofs->config.lowerdirs;
+	old->root_upperdentry = ovl_upperdentry_dereference(root_oi);
+	old->root_oe = READ_ONCE(root_oi->oe);
+	old->root_impure = ovl_test_flag(OVL_IMPURE, root_inode);
+	old->root_xwhiteouts =
+		ovl_dentry_has_xwhiteouts(sb->s_root);
+
+	ofs->numlayer = state->numlayer;
+	ofs->layers = state->layers;
+	ofs->workbasedir = state->workbasedir;
+	ofs->workdir = state->workdir;
+	ofs->whiteout = state->whiteout;
+	ofs->workbasedir_trap = state->workbasedir_trap;
+	ofs->workdir_trap = state->workdir_trap;
+	ofs->upperdir_locked = state->upperdir_locked;
+	ofs->workdir_locked = state->workdir_locked;
+	ofs->no_shared_whiteout = state->no_shared_whiteout;
+	ofs->config.upperdir = state->upperdir_name;
+	ofs->config.workdir = state->workdir_name;
+	ofs->config.lowerdirs = state->lowerdir_names;
+	WRITE_ONCE(root_oi->__upperdentry, state->root_upperdentry);
+	WRITE_ONCE(root_oi->oe, state->root_oe);
+
+	/* The target container no longer owns any resource installed above. */
+	state->numlayer = 0;
+	state->layers = NULL;
+	state->workbasedir = NULL;
+	state->workdir = NULL;
+	state->whiteout = NULL;
+	state->workbasedir_trap = NULL;
+	state->workdir_trap = NULL;
+	state->upperdir_locked = false;
+	state->workdir_locked = false;
+	state->no_shared_whiteout = false;
+	state->upperdir_name = NULL;
+	state->workdir_name = NULL;
+	state->lowerdir_names = NULL;
+	state->root_upperdentry = NULL;
+	state->root_oe = NULL;
+
+	ovl_deltafs_update_root_locked(sb, state, new_generation);
+
+	ovl_inode_unlock(root_inode);
+	inode_unlock(root_inode);
+
+	list_add_tail(&old->node, &ofs->delta_retired);
+	/* Pairs with generation acquire-loads in lookup and revalidation. */
+	smp_store_release(&ofs->delta_generation, new_generation);
+}
+
 long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct deltafs_ioc_switch_v1 *req;
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct ovl_delta_state *state = NULL;
+	struct ovl_delta_state *old = NULL;
 	struct ovl_delta_paths *paths;
 	struct ovl_fs *ofs = OVL_FS(sb);
 	int err;
@@ -880,12 +1004,30 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (err)
 		goto out_paths;
 
+	old = kzalloc(sizeof(*old), GFP_KERNEL);
+	if (!old) {
+		err = -ENOMEM;
+		goto out_state;
+	}
+	INIT_LIST_HEAD(&old->node);
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		goto out_state;
+
 	mutex_lock(&ofs->delta_lock);
 	err = ovl_deltafs_final_revalidate_locked(file, cmd, req, paths);
-	mutex_unlock(&ofs->delta_lock);
 	if (!err)
-		err = -EOPNOTSUPP;
+		ovl_deltafs_commit_locked(sb, state, old);
+	mutex_unlock(&ofs->delta_lock);
+	if (!err) {
+		/* Commit consumed all target owners and linked old into retired. */
+		kfree(state);
+		state = NULL;
+		old = NULL;
+	}
 
+out_state:
+	ovl_deltafs_free_state(old);
 	ovl_deltafs_free_state(state);
 out_paths:
 	ovl_deltafs_put_paths(paths);
@@ -896,6 +1038,11 @@ out_req:
 
 void ovl_deltafs_cleanup(struct ovl_fs *ofs)
 {
-	WARN_ON_ONCE(!list_empty(&ofs->delta_retired));
+	struct ovl_delta_state *state, *next;
+
+	list_for_each_entry_safe(state, next, &ofs->delta_retired, node) {
+		list_del_init(&state->node);
+		ovl_deltafs_free_state(state);
+	}
 	mutex_destroy(&ofs->delta_lock);
 }
