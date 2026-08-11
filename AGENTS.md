@@ -1,0 +1,23 @@
+# AGENTS.md — deltafs
+
+This file supplements the repo-root `AGENTS.md`. Both apply when working in
+`fs/deltafs`.
+
+## Testing
+
+- After development, perform **static testing only** in this environment:
+  build the kernel module / userspace tools, run static analyzers, and check
+  that code compiles and links cleanly. Do not attempt to run the deltafs
+  kernel module here — this environment cannot boot the custom kernel.
+- **Functional testing is done by the user in a QEMU virtual machine.** The
+  agent does not have a VM and must not assume any in-kernel behavior has been
+  verified by running it.
+- Therefore, every deliverable must include a **complete test handoff** the
+  user can follow inside QEMU:
+  - how to build the kernel and the userspace test tools (`tools/deltafs/`);
+  - how to boot the QEMU VM with the built kernel and disk image;
+  - how to mount deltafs and run each test (`p1` … `p7`, acceptance, etc.),
+    with exact commands and expected output;
+  - how to collect logs / dmesg / failure diagnostics.
+  Keep this in sync under `docs/` (e.g. the reproduction / test guide) whenever
+  tests or interfaces change.
