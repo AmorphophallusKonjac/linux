@@ -3,10 +3,12 @@
 CC ?= gcc
 CFLAGS ?= -O2 -g -Wall -Wextra -Werror
 UAPI_HEADERS ?= ../../usr/include
+KERNEL_DELTAFS_OBJ ?= ../../fs/overlayfs/deltafs.o
+KERNEL_DELTAFS_SRC ?= ../../fs/overlayfs/deltafs.c
 CPPFLAGS += -I$(UAPI_HEADERS)
 
 all: p1_ioctl_test p3_cache_test p4_state_test p5_commit_test \
-	p5_checkpoint_test p6_generation_test deltafsctl deltafsctl_test
+	p5_checkpoint_test p6_generation_test p7_ioctl_test deltafsctl deltafsctl_test
 
 p1_ioctl_test: p1_ioctl_test.c $(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
@@ -26,6 +28,9 @@ p5_checkpoint_test: p5_checkpoint_test.c $(UAPI_HEADERS)/linux/deltafs.h
 p6_generation_test: p6_generation_test.c $(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
+p7_ioctl_test: p7_ioctl_test.c $(UAPI_HEADERS)/linux/deltafs.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
+
 deltafsctl: deltafsctl.c $(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
@@ -37,9 +42,25 @@ $(UAPI_HEADERS)/linux/deltafs.h:
 
 clean:
 	$(RM) p1_ioctl_test p3_cache_test p4_state_test p5_commit_test \
-		p5_checkpoint_test p6_generation_test deltafsctl deltafsctl_test
+		p5_checkpoint_test p6_generation_test p7_ioctl_test \
+		deltafsctl deltafsctl_test
 
 test-p6-controller: deltafsctl
 	./p6_controller_unit_test.sh
 
-.PHONY: all clean test-p6-controller
+p7-tools: p5_commit_test p5_checkpoint_test p6_generation_test \
+	p7_ioctl_test deltafsctl deltafsctl_test
+
+check-p7-checkpoints:
+	./p7_checkpoint_callsite_test.sh "$(KERNEL_DELTAFS_OBJ)" \
+		"$(KERNEL_DELTAFS_SRC)"
+
+test-p7: p7-tools
+	@test -n "$(BACKING_ROOT)" || \
+		{ echo "BACKING_ROOT is required" >&2; exit 2; }
+	@test -n "$(EXTRA_BACKING_ROOT)" || \
+		{ echo "EXTRA_BACKING_ROOT is required" >&2; exit 2; }
+	./p7_acceptance_test.sh --backing-root "$(BACKING_ROOT)" \
+		--extra-backing-root "$(EXTRA_BACKING_ROOT)"
+
+.PHONY: all clean test-p6-controller p7-tools check-p7-checkpoints test-p7

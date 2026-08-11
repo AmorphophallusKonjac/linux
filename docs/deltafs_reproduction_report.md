@@ -605,7 +605,74 @@ index=off,nfs_export=off,metacopy=off,xino=off,redirect_dir=nofollow \
 
 验收：故障点重启后只出现 old 或 new committed view，不出现混合层栈；GC 不删除在用 layer；1000+ switch 和 fsstress 后无泄漏/UAF/deadlock。
 
-### P7：性能复现
+### P7：v1 最终验收与 QEMU/KVM 交接
+
+宿主机在仓库根目录完成静态构建和注入点检查：
+
+```bash
+make -j"$(nproc)" bzImage modules
+make -C tools/deltafs p7-tools
+make -C tools/deltafs check-p7-checkpoints
+```
+
+最后一条必须报告 `deltafs.o` 中的调用 relocation 数与源码静态调用点数相同
+（当前均为 18；其中循环调用点会按 layer 数动态执行）。数量不相等时，即使运行时
+harness 返回 0，也不能认定故障 unwind 覆盖成立。构建环境不加载模块，也不执行
+P7 功能测试。
+
+使用项目现有的 x86_64 rootfs 和两个已格式化的独立数据盘启动 debug guest；以下
+变量替换为本机镜像绝对路径：
+
+```bash
+KERNEL="$PWD/arch/x86/boot/bzImage"
+ROOTFS=/absolute/path/to/rootfs.qcow2
+DATA1=/absolute/path/to/p7-disk1.raw
+DATA2=/absolute/path/to/p7-disk2.raw
+
+qemu-system-x86_64 \
+    -enable-kvm -cpu host -smp 4 -m 4096 -nographic \
+    -kernel "$KERNEL" \
+    -append 'root=/dev/vda1 rw console=ttyS0 nokaslr' \
+    -drive if=virtio,format=qcow2,file="$ROOTFS" \
+    -drive if=virtio,format=raw,file="$DATA1" \
+    -drive if=virtio,format=raw,file="$DATA2" \
+    -virtfs local,path="$PWD",mount_tag=host,security_model=none
+```
+
+若项目 rootfs 的根分区不是 `/dev/vda1`，只替换 `root=`；不得复用同一 backing
+superblock 充当两个 P7 数据盘。进入 guest 后安装本次构建的模块、挂载共享目录和
+两个数据盘：
+
+```bash
+mkdir -p /mnt/host /mnt/deltafs-test/p7/disk1 /mnt/deltafs-test/p7/disk2
+mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
+mount /dev/vdb /mnt/deltafs-test/p7/disk1
+mount /dev/vdc /mnt/deltafs-test/p7/disk2
+install -D -m 0644 /mnt/host/fs/overlayfs/overlay.ko \
+    "/lib/modules/$(uname -r)/kernel/fs/overlayfs/overlay.ko"
+depmod -a
+cd /mnt/host
+make -C tools/deltafs p7-tools
+tools/deltafs/p7_acceptance_test.sh \
+    --backing-root /mnt/deltafs-test/p7/disk1 \
+    --extra-backing-root /mnt/deltafs-test/p7/disk2
+```
+
+成功标志必须同时包含 `All P7 DeltaFS v1 acceptance checks passed`、第 17 节八条
+`PASS`，并且 `deep fault injection exhausted after N injected checkpoints` 中
+`N >= 64`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。失败时收集：
+
+```bash
+R=/mnt/deltafs-test/p7/disk1/deltafs-p7-results-YYYYMMDDTHHMMSSZ-PID
+cp -a "$R" /mnt/host/
+dmesg -T > /mnt/host/p7-dmesg-full.log
+findmnt -t overlay > /mnt/host/p7-overlay-mounts.log
+```
+
+失败退出会在卸载 OverlayFS 后保留 `.deltafs-p7-run.*` 和另一数据盘上的
+`.deltafs-p7-extra.*`，终端会打印两个路径；连同结果目录一起保留后再分析。
+
+### P8：性能复现（P7 v1 验收后）
 
 工作：
 

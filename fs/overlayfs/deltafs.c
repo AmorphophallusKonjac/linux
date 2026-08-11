@@ -9,6 +9,7 @@
 
 #include <uapi/linux/deltafs.h>
 #include <linux/capability.h>
+#include <linux/compiler.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/error-injection.h>
@@ -38,12 +39,16 @@ struct ovl_delta_empty_ctx {
 
 /*
  * One injectable checkpoint is called after every successful ownership
- * acquisition.  fail_function can select the Nth call with its generic
- * interval controls, without adding test flags to the DeltaFS UAPI.
+ * acquisition.  fail_function can select the Nth call by resetting its space
+ * control, without adding test flags to the DeltaFS UAPI.  The compiler
+ * barrier is an intentional observable compiler side effect: noinline alone
+ * still lets GCC prove that this function always returns zero and delete most
+ * callers during IPA.
  */
 noinline int ovl_deltafs_build_checkpoint(void);
 noinline int ovl_deltafs_build_checkpoint(void)
 {
+	barrier();
 	return 0;
 }
 ALLOW_ERROR_INJECTION(ovl_deltafs_build_checkpoint, ERRNO);

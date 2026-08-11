@@ -1,6 +1,7 @@
 # DeltaFS v1 详细设计
 
-> 状态：设计定稿，P1--P6 代码与 QEMU/KVM 运行时验收已完成
+> 状态：设计定稿，P1--P6 代码与 QEMU/KVM 运行时验收已完成；P7 验收
+> harness 已实现，运行结论必须由 QEMU/KVM debug guest 产生
 >
 > 基线：Linux 6.8.0，OverlayFS 代码位于 `fs/overlayfs/`
 > 范围：单线程、单 OverlayFS、无跨切换打开文件的最小可用版本
@@ -222,7 +223,8 @@ new_generation = expected_generation + 1
 
 ### 5.3 ioctl 入口
 
-`ovl_dir_operations` 增加 `unlocked_ioctl` 和等价 compat 入口。Dispatcher 的顺序是：
+`ovl_dir_operations` 增加 `unlocked_ioctl`；现有的 generic compat hook 可以保留，
+但 v1 原型不承诺或验收 32 位用户程序。Dispatcher 的顺序是：
 
 1. 未识别命令返回 `-ENOIOCTLCMD`；
 2. control fd 的 dentry 不是 `sb->s_root` 时返回 `-ENOTTY`；
@@ -924,6 +926,27 @@ P6 的具体用户态产物：
 均在任何内核切换前 fail closed。完整功能验收只能执行
 `p6_controller_test.sh --backing-root PATH`，该脚本明确限制在项目 QEMU/KVM guest。
 
+P7 的验收产物：
+
+- `tools/deltafs/p7_acceptance_test.sh`：唯一的 guest-only v1 验收入口，串联
+  具备最终提交语义的 P5/P6 运行时证据和 P7 深层压力矩阵；
+- `tools/deltafs/p7_ioctl_test.c`：native ABI 负向矩阵，逐例确认 failure atomicity；
+- `tools/deltafs/p7_checkpoint_callsite_test.sh`：构建后静态检查，确认编译器至少保留
+  源码中的全部 `ovl_deltafs_build_checkpoint()` 静态调用点（当前 18 个，其中循环
+  调用点会按 layer 数动态执行），防止恒零 helper 被 IPA 优化后产生故障覆盖
+  假阳性；
+- `make -C tools/deltafs p7-tools`：构建 P7 所需 native helper；
+- `make -C tools/deltafs test-p7 BACKING_ROOT=... EXTRA_BACKING_ROOT=...`：仅供
+  已启动的项目 QEMU/KVM debug guest 执行。
+
+固定请求结构没有用户指针，因此本原型不需要维护 compat 指针转换；32 位用户程序
+不属于 v1 的支持或 P7 验收范围，也不以缺少 multilib/toolchain 作为失败条件。
+
+P1--P4 的合法 build 测试属于阶段性证据：在 P5 引入原子 commit 前，它们刻意要求
+完整构建后以 `-EOPNOTSUPP` 结束且 generation 不变。最终内核对相同合法请求必须
+成功提交，因此 P7 不直接重跑这些互斥的旧终态断言；其 ABI/路径负向覆盖和 builder
+unwind 分别由 P7 native matrix 与 64 层动态故障注入重新验证。
+
 关键代码锚点：
 
 | 目标 | Linux 6.8 现有符号 |
@@ -945,7 +968,7 @@ P6 的具体用户态产物：
 - 至少包含两个 lowerdir 的 lower-only mount 可正常读，DeltaFS ioctl 返回
   `-EROFS`。
 - 不支持 feature 的普通 OverlayFS 仍可使用，但 ioctl 返回 `-EOPNOTSUPP`。
-- 32 位 compat 用户程序使用相同固定结构调用 ioctl。
+- 固定结构不含用户指针；32 位用户程序不属于本原型的支持或验收范围。
 
 ### 16.2 ABI 和失败原子性
 
@@ -1065,7 +1088,51 @@ P5 的第一次可观察切换优先使用 restore：初始 view 与目标 lower
 等待 kmemleak minimum age 后连续扫描两次；报告必须为空，marker 窗口内也不得
 出现 sanitizer、refcount、lockdep 或 RCU 诊断。
 
-### 16.6 不验收场景
+### 16.6 P7 v1 总验收入口
+
+P7 不增加 UAPI 或新的运行时语义，而是把第 17 节的完成判定转成一个可留档的
+QEMU/KVM guest 运行。入口为：
+
+```text
+make -C tools/deltafs p7-tools
+tools/deltafs/p7_acceptance_test.sh \
+    --backing-root PATH --extra-backing-root OTHER_PATH
+```
+
+它拒绝非 QEMU/KVM 环境、已有 OverlayFS mount、非模块化 overlay，以及缺少
+`CONFIG_FUNCTION_ERROR_INJECTION`、KASAN、KFENCE、UBSAN、lockdep/PROVE_RCU、
+kmemleak 的内核。它会保存内核 config、每个阶段日志、
+dmesg marker window、kmemleak 双扫描结果和 `section-17.tsv`；任何前置条件不满足
+都是失败，不是 skip。
+
+P7 先重跑具备最终提交语义的 P5 cache/multi-commit 和 P6 controller 验证；P4
+阶段的 build/free 故障覆盖由下述最终语义下的深层动态故障注入取代。随后：
+
+- 在同一 controller sandbox 完成 63 次 checkpoint，得到 `base + 63 snapshot`
+  的 64-lower chain；随后 restore 该 chain，并确认 controller 的第 65 次
+  checkpoint 在任何树变更前拒绝。native ABI helper 另行发送 `nr_lower=65`，
+  确认内核返回 `-E2BIG`；
+- 每个 frozen layer 的两个物理文件均记录 hash、inode、size、mode 与 mtime，
+  每次后续 switch/失败注入后重新校验；
+- 在 64-lower restore 上用 `ovl_deltafs_build_checkpoint()` 的第 N 次动态失败
+  注入驱动所有实际 ownership checkpoint。`fail_function` 的全局 `count` 无法通过
+  debugfs 重置，因此每轮固定 `interval=1` 并重置 `space=N`；该注入点的 size 为
+  1，故能精确命中本轮第 N 次调用。连续 `-ENOMEM` 必须保留 generation、state、
+  transaction、fresh branch 和所有 frozen fingerprint；第一个未命中 N 必须成功
+  提交，因此计数不会依赖易失的硬编码值。注入 helper 本体必须包含 compiler
+  barrier，阻止 GCC 在 `-O2` 下跨过程证明其恒为 0 并删除调用；构建后的
+  `deltafs.o` 还必须通过“调用 relocation 数等于源码调用点数”的静态检查；运行时
+  实际注入次数必须至少为 64，以证明按 layer 执行的循环调用点也已覆盖；
+- 以该成功 restore 作为第 64 次成功切换，再做 36 次历史 restore，使总数恰为
+  100，最终 generation 为 101；每次 restore 后的写入必须进入其 `gN/upper`；
+- 在独立 sandbox 中至少十次 checkpoint → umount → `modprobe -r overlay`，并在
+  最后 module unload 后执行 kmemleak 双扫描和整个 P7 marker window 的 sanitizer
+  检查。
+
+P7 脚本实现完成不等于 P7 已通过。只有用户在符合上述配置的 guest 中实际执行并
+保存结果目录后，才可以将第 17 节的八项改标为已满足。
+
+### 16.7 不验收场景
 
 以下测试即使偶然通过也不能声明受支持：
 
@@ -1092,6 +1159,6 @@ P5 的第一次可观察切换优先使用 restore：初始 view 与目标 lower
 
 ## 18. 最终产出
 
-本阶段的最终产出仅为本设计文档：`docs/deltafs_v1_design.md`。
-
-本文档包含 DeltaFS v1 的功能边界、UAPI、状态模型、数据结构、layer 构建、原子提交、generation 慢路径、retired 生命周期、controller 流程、errno 语义以及验收测试。本文档定稿不代表已经实现内核补丁、用户态 controller 或测试代码；这些内容应在后续实现任务中依据本文逐项完成。
+DeltaFS v1 的实现产物包括 OverlayFS 内核补丁、UAPI、controller、P1--P7 测试
+helper 和本设计文档。P7 结果目录是完成判定的运行时证据；在它由目标 QEMU/KVM
+debug guest 生成前，本文档不能宣称 v1 已完成。
