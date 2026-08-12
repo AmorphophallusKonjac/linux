@@ -612,13 +612,31 @@ index=off,nfs_export=off,metacopy=off,xino=off,redirect_dir=nofollow \
 ```bash
 make -j"$(nproc)" bzImage modules
 make -C tools/deltafs p7-tools
-make -C tools/deltafs check-p7-checkpoints
+make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=enabled
 ```
 
 最后一条必须报告 `deltafs.o` 中的调用 relocation 数与源码静态调用点数相同
 （当前均为 18；其中循环调用点会按 layer 数动态执行）。数量不相等时，即使运行时
 harness 返回 0，也不能认定故障 unwind 覆盖成立。构建环境不加载模块，也不执行
-P7 功能测试。
+P7 功能测试。production 配置关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 时，helper
+退化为恒零内联函数；对该配置构建的对象应执行同一目标并传入
+`CHECKPOINT_MODE=disabled`，期望报告 0 个调用 relocation。
+
+```bash
+make -C tools/deltafs check-p7-checkpoints \
+    KERNEL_DELTAFS_OBJ=/absolute/production/build/fs/overlayfs/deltafs.o \
+    CHECKPOINT_MODE=disabled
+# 期望：PASS: ... removes all 18 source ... call sites
+```
+
+production 配置（关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 等）下也可运行 P7 总入口：
+基础前置（QEMU/KVM guest、无既有 overlay mount、模块化 overlay、overlay/module-unload
+/debugfs 配置、可写 `/dev/kmsg` 等）不满足时仍 fail closed；但缺少故障注入
+（`CONFIG_FUNCTION_ERROR_INJECTION` 或 `/sys/kernel/debug/fail_function`）、kmemleak
+或 sanitizer/lockdep/PROVE_RCU 时，harness 跳过依赖该能力的阶段（深层故障注入循环改用
+一次非注入 restore 顶替 switch 64、kmemleak 扫描跳过、sanitizer dmesg 覆盖减弱），
+非注入部分（P5/P6、native ABI 矩阵、100 次 switch、unload 循环、documented limits）仍
+运行，并以 SKIP（退出码 4）结束。完整 unwind 证据仍需同源码的 debug guest P7 结果。
 
 使用项目现有的 x86_64 rootfs 和两个已格式化的独立数据盘启动 debug guest；以下
 变量替换为本机镜像绝对路径：
@@ -660,7 +678,15 @@ tools/deltafs/p7_acceptance_test.sh \
 
 成功标志必须同时包含 `All P7 DeltaFS v1 acceptance checks passed`、第 17 节八条
 `PASS`，并且 `deep fault injection exhausted after N injected checkpoints` 中
-`N >= 64`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。失败时收集：
+`N >= 64`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。
+
+若 guest 缺少故障注入、kmemleak 或 sanitizer/lockdep/PROVE_RCU 能力，harness 改为以
+SKIP 结束：退出码为 4，终端打印若干 `SKIP:` 行，`section-17.tsv` 中条件 7 记为 `SKIP`
+（其余条件仍为 `PASS`），并打印
+`P7 DeltaFS v1 acceptance completed with skipped capability-dependent phases`，
+此时不会出现 `All P7 DeltaFS v1 acceptance checks passed` 与
+`deep fault injection exhausted after N injected checkpoints` 两行。能力齐全的 debug
+guest 才能取得上述完整成功标志。失败时收集：
 
 ```bash
 R=/mnt/deltafs-test/p7/disk1/deltafs-p7-results-YYYYMMDDTHHMMSSZ-PID
@@ -668,6 +694,10 @@ cp -a "$R" /mnt/host/
 dmesg -T > /mnt/host/p7-dmesg-full.log
 findmnt -t overlay > /mnt/host/p7-overlay-mounts.log
 ```
+
+2026-08-11 用户确认目标 QEMU/KVM guest 已满足上述成功条件；原始结果目录未导入
+当前源码工作区，因此后续重构验收仍需重新执行并归档，而不能从该确认推导具体 N
+或日志内容。
 
 失败退出会在卸载 OverlayFS 后保留 `.deltafs-p7-run.*` 和另一数据盘上的
 `.deltafs-p7-extra.*`，终端会打印两个路径；连同结果目录一起保留后再分析。

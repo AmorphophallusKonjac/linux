@@ -575,10 +575,12 @@ lowerdirs[1..nr_lower] = 每个 lower 的路径字符串
 
 此后不得再发生可能失败的分配或路径解析。
 
-P4 只验证 builder：完整 target state 构建成功后立即调用与 retired state
-共用的 free helper，且 ioctl 仍返回 `-EOPNOTSUPP`。P4 不安装 target state、
+P4 阶段只验证 builder：完整 target state 构建成功后立即调用与 retired state
+共用的 free helper，且当时的 ioctl 仍返回 `-EOPNOTSUPP`。P4 不安装 target state、
 不增加 generation、也不向 retired list 加入节点。P5 才在最终重检成功后
-调用无失败 commit。
+调用无失败 commit。最终源码不再保留 P4 helper：阶段性历史测试已在 P7 接管
+builder unwind 覆盖后清理（P1–P4 同理）；最终提交语义下的 builder unwind 统一
+由 P7 覆盖。
 
 “完整释放”指 mount、trap、dentry、in-use lock、root binding 和配置字符串
 的内核所有权全部平衡。严格 work helper 已经在 fresh work base 中创建的内部
@@ -931,10 +933,11 @@ P7 的验收产物：
 - `tools/deltafs/p7_acceptance_test.sh`：唯一的 guest-only v1 验收入口，串联
   具备最终提交语义的 P5/P6 运行时证据和 P7 深层压力矩阵；
 - `tools/deltafs/p7_ioctl_test.c`：native ABI 负向矩阵，逐例确认 failure atomicity；
-- `tools/deltafs/p7_checkpoint_callsite_test.sh`：构建后静态检查，确认编译器至少保留
-  源码中的全部 `ovl_deltafs_build_checkpoint()` 静态调用点（当前 18 个，其中循环
-  调用点会按 layer 数动态执行），防止恒零 helper 被 IPA 优化后产生故障覆盖
-  假阳性；
+- `tools/deltafs/p7_checkpoint_callsite_test.sh`：构建后静态检查。对启用
+  `CONFIG_FUNCTION_ERROR_INJECTION` 的 debug 内核，确认编译器保留源码中的全部
+  `ovl_deltafs_build_checkpoint()` 静态调用点（当前 18 个，其中循环调用点会按
+  layer 数动态执行）；对关闭该配置的 production 内核，确认调用 relocation 为
+  0，防止测试构建出现覆盖假阳性，也防止生产构建残留注入开销；
 - `make -C tools/deltafs p7-tools`：构建 P7 所需 native helper；
 - `make -C tools/deltafs test-p7 BACKING_ROOT=... EXTRA_BACKING_ROOT=...`：仅供
   已启动的项目 QEMU/KVM debug guest 执行。
@@ -984,9 +987,11 @@ unwind 分别由 P7 native matrix 与 64 层动态故障注入重新验证。
 - 0、64、65 个 lower；
 - 对每个 build allocation/clone/trap/workdir 步骤注入失败。
 
-P4 中，builder 成功后的阶段性终值仍为 `-EOPNOTSUPP`；测试必须同时确认
-state 已完整释放且 active generation 仍接受原 `expected_generation`。故障注入
-使用仅在内核 fault-injection 配置下生效的内部 build checkpoint，不扩展 UAPI。
+P4 中“builder 成功后返回 `-EOPNOTSUPP`”是 P5 提交前的阶段性终值，不是最终
+HEAD 的运行时断言。最终源码不再从 P4 harness 驱动故障注入；P7 使用只在
+`CONFIG_FUNCTION_ERROR_INJECTION=y` 时生成的内部 build checkpoint 覆盖同一组
+ownership unwind，且不扩展 UAPI。关闭该配置时 checkpoint 是恒零内联函数，
+编译器必须移除所有调用及其错误分支。
 
 所有失败用例必须断言：
 
@@ -1100,10 +1105,14 @@ tools/deltafs/p7_acceptance_test.sh \
 ```
 
 它拒绝非 QEMU/KVM 环境、已有 OverlayFS mount、非模块化 overlay，以及缺少
-`CONFIG_FUNCTION_ERROR_INJECTION`、KASAN、KFENCE、UBSAN、lockdep/PROVE_RCU、
-kmemleak 的内核。它会保存内核 config、每个阶段日志、
-dmesg marker window、kmemleak 双扫描结果和 `section-17.tsv`；任何前置条件不满足
-都是失败，不是 skip。
+`CONFIG_OVERLAY_FS`、模块卸载、debugfs 等*基础*前置条件的内核——这些不满足仍
+是失败。另一方面，故障注入（`CONFIG_FUNCTION_ERROR_INJECTION` 与
+`/sys/kernel/debug/fail_function`）、kmemleak（`CONFIG_DEBUG_KMEMLEAK`）、
+KASAN/KFENCE/UBSAN/lockdep/PROVE_RCU 等*能力型*调试选项改为探测：缺失时跳过依赖
+该能力的阶段（深层故障注入循环、kmemleak 扫描、sanitizer dmesg 覆盖），非注入部分
+（P5/P6、native ABI 矩阵、100 次 switch、unload 循环、documented limits）仍照常
+运行，最后以 SKIP（退出码 4）结束；能力齐全时才以 0 退出。它会保存内核 config、
+每个阶段日志、dmesg marker window、kmemleak 双扫描结果和 `section-17.tsv`。
 
 P7 先重跑具备最终提交语义的 P5 cache/multi-commit 和 P6 controller 验证；P4
 阶段的 build/free 故障覆盖由下述最终语义下的深层动态故障注入取代。随后：
@@ -1120,17 +1129,22 @@ P7 先重跑具备最终提交语义的 P5 cache/multi-commit 和 P6 controller 
   1，故能精确命中本轮第 N 次调用。连续 `-ENOMEM` 必须保留 generation、state、
   transaction、fresh branch 和所有 frozen fingerprint；第一个未命中 N 必须成功
   提交，因此计数不会依赖易失的硬编码值。注入 helper 本体必须包含 compiler
-  barrier，阻止 GCC 在 `-O2` 下跨过程证明其恒为 0 并删除调用；构建后的
+  barrier，阻止 GCC 在 `-O2` 下跨过程证明其恒为 0 并删除调用；debug 构建后的
   `deltafs.o` 还必须通过“调用 relocation 数等于源码调用点数”的静态检查；运行时
-  实际注入次数必须至少为 64，以证明按 layer 执行的循环调用点也已覆盖；
+  实际注入次数必须至少为 64，以证明按 layer 执行的循环调用点也已覆盖。production
+  构建关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 后，同一静态检查以 `disabled` 模式
+  断言 relocation 数为 0；
 - 以该成功 restore 作为第 64 次成功切换，再做 36 次历史 restore，使总数恰为
   100，最终 generation 为 101；每次 restore 后的写入必须进入其 `gN/upper`；
 - 在独立 sandbox 中至少十次 checkpoint → umount → `modprobe -r overlay`，并在
   最后 module unload 后执行 kmemleak 双扫描和整个 P7 marker window 的 sanitizer
   检查。
 
-P7 脚本实现完成不等于 P7 已通过。只有用户在符合上述配置的 guest 中实际执行并
-保存结果目录后，才可以将第 17 节的八项改标为已满足。
+P7 脚本实现完成本身不等于 P7 已通过。2026-08-11 用户确认已在符合上述配置的
+QEMU/KVM guest 中执行 P7，终端成功标志和第 17 节八项均通过；该结果目录尚未导入
+当前源码工作区，因此本文记录为“用户确认通过”，不虚构具体目录名、checkpoint
+计数或日志内容。该确认对应本次编译隔离重构前的基线；重构后的 debug build 仍须
+按本节重新执行 P7。发布或交接时应归档新的完整结果目录。
 
 ### 16.7 不验收场景
 
@@ -1146,7 +1160,10 @@ P7 脚本实现完成不等于 P7 已通过。只有用户在符合上述配置�
 
 ## 17. v1 完成判定
 
-只有同时满足以下条件，才能称为 DeltaFS v1：
+只有同时满足以下条件，才能称为 DeltaFS v1。2026-08-11 用户确认目标 guest 的
+`section-17.tsv` 中以下八项均为 `PASS`；当前工作区未包含该结果目录，后续交付需
+保留原始运行证据。此次故障注入编译隔离重构完成后，还需用 debug build 重新生成
+一份结果目录：
 
 1. 两个 ioctl 在声明边界内完成 checkpoint 和任意历史 restore。
 2. 成功切换 generation 恰好加一，失败不改变 active view。
@@ -1160,5 +1177,6 @@ P7 脚本实现完成不等于 P7 已通过。只有用户在符合上述配置�
 ## 18. 最终产出
 
 DeltaFS v1 的实现产物包括 OverlayFS 内核补丁、UAPI、controller、P1--P7 测试
-helper 和本设计文档。P7 结果目录是完成判定的运行时证据；在它由目标 QEMU/KVM
-debug guest 生成前，本文档不能宣称 v1 已完成。
+helper 和本设计文档。P7 结果目录是完成判定的运行时证据；用户已确认目标
+QEMU/KVM debug guest 运行通过，但结果目录未随源码导入，不能用本文档替代原始
+`section-17.tsv`、dmesg 和 kmemleak 日志。

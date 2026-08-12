@@ -49,6 +49,15 @@ marker_finished=0
 fault_injection_registered=0
 frozen_ledger=
 
+# Debug-guest capability flags.  Each gates one capability-dependent phase
+# (deep fault injection, kmemleak scan, sanitizer/lockdep dmesg coverage).  A
+# missing capability downgrades its phase to a logged SKIP (exit 4) rather than
+# failing the harness, so a guest without fail_function can still run the
+# non-injection matrices.  See docs/deltafs_v1_design.md section 16.6.
+have_injection=0
+have_kmemleak=0
+have_sanitizers=0
+
 usage()
 {
 	cat <<'EOF'
@@ -92,6 +101,13 @@ die()
 {
 	log "FAIL: $*"
 	exit 1
+}
+
+# Record a capability-dependent skip without aborting the harness.  The
+# capability-dependent phase is omitted and the final exit code becomes 4.
+note_skip()
+{
+	log "SKIP: $*"
 }
 
 require_command()
@@ -169,6 +185,19 @@ require_kernel_config()
 	actual=$(config_get "$key")
 	[[ "$actual" == "${key}=${value}" ]] ||
 		die "requires ${key}=${value}; running config has '${actual:-unset}'"
+}
+
+# Non-fatal variant of require_kernel_config.  Returns 0 when the running
+# kernel config matches key=value, 1 otherwise; never dies.  Used to probe
+# capability-dependent debug options that may legitimately be absent.
+probe_kernel_config()
+{
+	local key=$1
+	local value=$2
+	local actual
+
+	actual=$(config_get "$key")
+	[[ "$actual" == "${key}=${value}" ]]
 }
 
 overlay_mount_count()
@@ -257,7 +286,10 @@ cleanup()
 		fi
 	fi
 	finish_marker
-	if ((status == 0)); then
+	# Treat SKIP (4) like PASS for scratch cleanup: the run itself was healthy,
+	# only capability-dependent phases were omitted.  FAIL (1/2/...) preserves
+	# the scratch tree for diagnosis.
+	if ((status == 0 || status == 4)); then
 		if [[ -n "$run_dir" && -d "$run_dir" ]]; then
 			if ! rm -rf -- "$run_dir"; then
 				log "FAIL: cleanup could not remove $run_dir"
@@ -301,6 +333,18 @@ record_gate()
 
 	printf '%s\tPASS\t%s\n' "$number" "$evidence" >> "$results_dir/section-17.tsv"
 	pass "section 17 condition $number: $evidence"
+}
+
+# Record a section-17 condition as SKIP.  Used when a capability-dependent
+# phase (deep fault injection, kmemleak, sanitizer coverage) was skipped
+# because the running kernel lacks the corresponding debug option.
+record_gate_skip()
+{
+	local number=$1
+	local evidence=$2
+
+	printf '%s\tSKIP\t%s\n' "$number" "$evidence" >> "$results_dir/section-17.tsv"
+	note_skip "section 17 condition $number: $evidence"
 }
 
 mount_raw_sandbox()
@@ -638,7 +682,15 @@ run_deep_switch_and_fault_matrix()
 	pass '64-lower controller boundary rejects a 65th checkpoint without mutation'
 
 	# The first non-injected restore is successful switch 64.
-	run_deep_fault_injection "$root" 64
+	if ((have_injection)); then
+		run_deep_fault_injection "$root" 64
+	else
+		note_skip 'deep fault injection unavailable; non-injected restore to s63 substitutes switch 64'
+		LC_ALL=C "$controller" --assume-quiesced restore "$root" s63 \
+			>> "$results_dir/deep-restores.log" 2>&1 ||
+			die 'non-injected deep restore to s63 failed'
+		printf 'skipped\n' > "$results_dir/deep-fault-checkpoints.txt"
+	fi
 	expect_contents "$root/merged/p7-frozen" s63 'deep restore after fault injection'
 	printf 'fault-success\n' > "$root/merged/p7-fault-success"
 	expect_contents "$root/branches/g65/upper/p7-fault-success" fault-success \
@@ -707,6 +759,13 @@ scan_kmemleak()
 {
 	local report="$results_dir/kmemleak.log"
 
+	# kmemleak is a capability-dependent check; skip cleanly when the running
+	# kernel lacks it (have_kmemleak is probed in the precondition block).
+	if ((have_kmemleak != 1)); then
+		note_skip 'kmemleak scan skipped (CONFIG_DEBUG_KMEMLEAK or debugfs file unavailable)'
+		return 0
+	fi
+
 	log "Waiting ${KMEMLEAK_MIN_AGE_SECONDS}s for kmemleak object age"
 	sleep "$KMEMLEAK_MIN_AGE_SECONDS"
 	printf 'scan\n' > "$KMEMLEAK_PATH"
@@ -725,6 +784,13 @@ scan_kernel_window()
 {
 	local diagnostics
 	local window="$results_dir/dmesg-window.log"
+
+	# The dmesg scan always runs (it catches BUG/Oops/GPF regardless of debug
+	# configs), but sanitizer/lockdep/RCU coverage is only meaningful when the
+	# corresponding debug options are compiled in.
+	if ((have_sanitizers != 1)); then
+		note_skip 'sanitizer/lockdep/RCU coverage unavailable; dmesg window scan limited to generic diagnostics'
+	fi
 
 	diagnostics='BUG:|WARNING:|Oops:|KASAN:|KFENCE:|UBSAN:|use-after-free'
 	diagnostics+='|double[- ]free|refcount_t:|refcount[^[:cntrl:]]*(underflow|saturat)'
@@ -856,25 +922,44 @@ require_kernel_config CONFIG_OVERLAY_FS m
 require_kernel_config CONFIG_MODULE_UNLOAD y
 require_kernel_config CONFIG_DEBUG_KERNEL y
 require_kernel_config CONFIG_DEBUG_FS y
-require_kernel_config CONFIG_DEBUG_KMEMLEAK y
-require_kernel_config CONFIG_FUNCTION_ERROR_INJECTION y
-require_kernel_config CONFIG_KASAN y
-require_kernel_config CONFIG_KFENCE y
-require_kernel_config CONFIG_UBSAN y
-require_kernel_config CONFIG_PROVE_LOCKING y
-require_kernel_config CONFIG_PROVE_RCU y
 
 module_path=$(modinfo -F filename "$OVERLAY_MODULE" 2>/dev/null) ||
 	die "cannot locate $OVERLAY_MODULE"
 [[ -n "$module_path" && "$module_path" != '(builtin)' && -f "$module_path" ]] ||
 	die "$OVERLAY_MODULE must be a loadable module"
-[[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]] ||
-	die "$KMEMLEAK_PATH must be readable and writable"
-[[ -d "$FAIL_FUNCTION_DIR" ]] ||
-	die "$FAIL_FUNCTION_DIR is required for P7 fault injection"
 [[ -w /dev/kmsg ]] || die '/dev/kmsg must be writable'
 dmesg >/dev/null 2>&1 || die 'kernel log is not readable through dmesg'
 require_no_overlay_mounts
+
+# Capability-dependent debug options.  These are probed, not required: a guest
+# without fail_function (or kmemleak/sanitizers) still runs the non-injection
+# matrices and skips only the dependent phase, exiting with SKIP (4).
+if probe_kernel_config CONFIG_FUNCTION_ERROR_INJECTION y &&
+   [[ -d "$FAIL_FUNCTION_DIR" ]]; then
+	have_injection=1
+	pass "fault-injection capability available ($FAIL_FUNCTION_DIR)"
+else
+	note_skip 'CONFIG_FUNCTION_ERROR_INJECTION or the fail_function debugfs dir is unavailable; deep fault injection will be skipped'
+fi
+
+if probe_kernel_config CONFIG_DEBUG_KMEMLEAK y &&
+   [[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]]; then
+	have_kmemleak=1
+	pass "kmemleak capability available ($KMEMLEAK_PATH)"
+else
+	note_skip 'CONFIG_DEBUG_KMEMLEAK or the kmemleak debugfs file is unavailable; kmemleak scan will be skipped'
+fi
+
+if probe_kernel_config CONFIG_KASAN y &&
+   probe_kernel_config CONFIG_KFENCE y &&
+   probe_kernel_config CONFIG_UBSAN y &&
+   probe_kernel_config CONFIG_PROVE_LOCKING y &&
+   probe_kernel_config CONFIG_PROVE_RCU y; then
+	have_sanitizers=1
+	pass 'sanitizer/lockdep/RCU dmesg coverage available'
+else
+	note_skip 'one or more of KASAN/KFENCE/UBSAN/PROVE_LOCKING/PROVE_RCU is unavailable; sanitizer dmesg coverage is reduced'
+fi
 
 if [[ -z "$results_dir" ]]; then
 	results_dir="$backing_root/deltafs-p7-results-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -914,9 +999,13 @@ ensure_overlay_unloaded
 run_phase p6-controller "$p6_harness" --backing-root "$backing_root"
 ensure_overlay_unloaded
 
-# The P7-specific half starts with a fresh kmemleak baseline.
-printf 'clear\n' > "$KMEMLEAK_PATH"
-pass 'kmemleak state cleared before P7-specific matrices'
+# The P7-specific half starts with a fresh kmemleak baseline (when available).
+if ((have_kmemleak)); then
+	printf 'clear\n' > "$KMEMLEAK_PATH"
+	pass 'kmemleak state cleared before P7-specific matrices'
+else
+	note_skip 'kmemleak baseline clear skipped (CONFIG_DEBUG_KMEMLEAK unavailable)'
+fi
 run_native_abi_matrix
 run_deep_switch_and_fault_matrix
 run_unload_cycles
@@ -932,8 +1021,17 @@ record_gate 3 'P5 real-switch positive/negative cache and root readdir coverage'
 record_gate 4 'physical fingerprints of every frozen P7 layer after every operation'
 record_gate 5 'fresh-upper writes after deep restore and every later restore'
 record_gate 6 '64 lower restore, controller preflight, and raw 65-lower E2BIG'
-record_gate 7 'deep fault unwind, 100 switches, repeated unload, sanitizers, kmemleak'
+if ((have_injection && have_kmemleak && have_sanitizers)); then
+	record_gate 7 'deep fault unwind, 100 switches, repeated unload, sanitizers, kmemleak'
+else
+	record_gate_skip 7 'deep fault unwind, 100 switches, repeated unload, sanitizers, kmemleak (capability-dependent phases skipped)'
+fi
 record_gate 8 'documented old-fd/mmap/concurrency/GC/crash-recovery limits'
 
 log "P7 acceptance results: $results_dir"
-log 'All P7 DeltaFS v1 acceptance checks passed'
+if ((have_injection && have_kmemleak && have_sanitizers)); then
+	log 'All P7 DeltaFS v1 acceptance checks passed'
+	exit 0
+fi
+log 'P7 DeltaFS v1 acceptance completed with skipped capability-dependent phases (see SKIP lines)'
+exit 4

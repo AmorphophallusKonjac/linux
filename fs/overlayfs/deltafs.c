@@ -38,13 +38,17 @@ struct ovl_delta_empty_ctx {
 };
 
 /*
- * One injectable checkpoint is called after every successful ownership
- * acquisition.  fail_function can select the Nth call by resetting its space
- * control, without adding test flags to the DeltaFS UAPI.  The compiler
- * barrier is an intentional observable compiler side effect: noinline alone
- * still lets GCC prove that this function always returns zero and delete most
- * callers during IPA.
+ * Debug kernels keep one injectable checkpoint after every successful
+ * ownership acquisition.  fail_function can select the Nth call by resetting
+ * its space control, without adding test flags to the DeltaFS UAPI.  The
+ * compiler barrier is an intentional observable compiler side effect:
+ * noinline alone still lets GCC prove that this function always returns zero
+ * and delete most callers during IPA.
+ *
+ * Production kernels compile the inline stub and all checkpoint branches
+ * away when function error injection is disabled.
  */
+#ifdef CONFIG_FUNCTION_ERROR_INJECTION
 noinline int ovl_deltafs_build_checkpoint(void);
 noinline int ovl_deltafs_build_checkpoint(void)
 {
@@ -52,6 +56,12 @@ noinline int ovl_deltafs_build_checkpoint(void)
 	return 0;
 }
 ALLOW_ERROR_INJECTION(ovl_deltafs_build_checkpoint, ERRNO);
+#else
+static __always_inline int ovl_deltafs_build_checkpoint(void)
+{
+	return 0;
+}
+#endif
 
 static int ovl_deltafs_validate_abi(const struct deltafs_ioc_switch_v1 *req)
 {
