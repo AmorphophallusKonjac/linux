@@ -28,6 +28,9 @@ module_loaded=0
 marker_started=0
 marker_finished=0
 marker="deltafs-p6-controller[$$]"
+# kmemleak is an optional leak check, not a functional prerequisite.  When the
+# running kernel lacks it the scan is skipped and the harness exits SKIP (4).
+have_kmemleak=0
 
 usage()
 {
@@ -50,6 +53,11 @@ die()
 pass()
 {
 	printf 'PASS: %s\n' "$*"
+}
+
+note_skip()
+{
+	printf 'SKIP: %s\n' "$*"
 }
 
 require_command()
@@ -137,6 +145,11 @@ cleanup()
 scan_kmemleak()
 {
 	local report="$run_dir/kmemleak.log"
+
+	if ((have_kmemleak != 1)); then
+		note_skip "kmemleak scan skipped ($KMEMLEAK_PATH unavailable)"
+		return
+	fi
 
 	printf 'Waiting %ss for kmemleak minimum object age\n' \
 		"$KMEMLEAK_MIN_AGE_SECONDS"
@@ -456,8 +469,11 @@ module_path=$(modinfo -F filename "$OVERLAY_MODULE" 2>/dev/null) ||
 [[ -n "$module_path" && "$module_path" != '(builtin)' &&
    -f "$module_path" ]] ||
 	die "$OVERLAY_MODULE must be a loadable module"
-[[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]] ||
-	die "$KMEMLEAK_PATH must be readable and writable"
+if [[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]]; then
+	have_kmemleak=1
+else
+	note_skip "$KMEMLEAK_PATH is unavailable; kmemleak scan will be skipped"
+fi
 [[ -w /dev/kmsg ]] ||
 	die '/dev/kmsg must be writable for an isolated log window'
 dmesg >/dev/null 2>&1 ||
@@ -475,8 +491,12 @@ if [[ -d /sys/module/$OVERLAY_MODULE ]]; then
 fi
 printf '%s BEGIN\n' "$marker" > /dev/kmsg
 marker_started=1
-printf 'clear\n' > "$KMEMLEAK_PATH"
-pass 'kmemleak state cleared before P6 testing'
+if ((have_kmemleak)); then
+	printf 'clear\n' > "$KMEMLEAK_PATH"
+	pass 'kmemleak state cleared before P6 testing'
+else
+	note_skip 'kmemleak baseline clear skipped (kmemleak unavailable)'
+fi
 modprobe "$OVERLAY_MODULE"
 module_loaded=1
 
@@ -491,4 +511,9 @@ scan_kernel_window
 
 rm -rf -- "$run_dir"
 run_dir=
-printf 'All P6 checkpoint/restore controller tests passed\n'
+if ((have_kmemleak)); then
+	printf 'All P6 checkpoint/restore controller tests passed\n'
+	exit 0
+fi
+printf 'P6 controller tests completed; kmemleak scan skipped (exit SKIP)\n'
+exit 4

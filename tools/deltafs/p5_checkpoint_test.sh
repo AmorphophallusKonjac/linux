@@ -28,6 +28,9 @@ marker_started=0
 marker_finished=0
 marker="deltafs-p5-checkpoint[$$]"
 mount_options=
+# kmemleak is an optional leak check, not a functional prerequisite.  When the
+# running kernel lacks it the scan is skipped and the harness exits SKIP (4).
+have_kmemleak=0
 
 usage()
 {
@@ -45,6 +48,11 @@ die()
 {
 	printf 'FAIL: %s\n' "$*" >&2
 	exit 1
+}
+
+note_skip()
+{
+	printf 'SKIP: %s\n' "$*"
 }
 
 require_command()
@@ -130,6 +138,11 @@ cleanup()
 scan_kmemleak()
 {
 	local report="$run_dir/kmemleak.log"
+
+	if ((have_kmemleak != 1)); then
+		note_skip "kmemleak scan skipped ($KMEMLEAK_PATH unavailable)"
+		return
+	fi
 
 	printf 'Waiting %ss for kmemleak minimum object age\n' \
 		"$KMEMLEAK_MIN_AGE_SECONDS"
@@ -237,8 +250,11 @@ module_path=$(modinfo -F filename "$OVERLAY_MODULE" 2>/dev/null) || \
 	die "cannot locate the $OVERLAY_MODULE module"
 [[ -n "$module_path" && "$module_path" != '(builtin)' && -f "$module_path" ]] || \
 	die "$OVERLAY_MODULE must be provided as a loadable module"
-[[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]] || \
-	die "$KMEMLEAK_PATH must be readable and writable"
+if [[ -r "$KMEMLEAK_PATH" && -w "$KMEMLEAK_PATH" ]]; then
+	have_kmemleak=1
+else
+	note_skip "$KMEMLEAK_PATH is unavailable; kmemleak scan will be skipped"
+fi
 [[ -w /dev/kmsg ]] || die '/dev/kmsg must be writable for an isolated log window'
 dmesg >/dev/null 2>&1 || die 'kernel log is not readable through dmesg'
 
@@ -264,8 +280,12 @@ if [[ -d /sys/module/$OVERLAY_MODULE ]]; then
 fi
 printf '%s BEGIN\n' "$marker" > /dev/kmsg
 marker_started=1
-printf 'clear\n' > "$KMEMLEAK_PATH"
-printf 'PASS: kmemleak state cleared before checkpoint testing\n'
+if ((have_kmemleak)); then
+	printf 'clear\n' > "$KMEMLEAK_PATH"
+	printf 'PASS: kmemleak state cleared before checkpoint testing\n'
+else
+	note_skip 'kmemleak baseline clear skipped (kmemleak unavailable)'
+fi
 modprobe "$OVERLAY_MODULE"
 module_loaded=1
 
@@ -290,4 +310,9 @@ scan_kernel_window
 
 rm -rf -- "$run_dir"
 run_dir=
-printf 'All P5 checkpoint/multi-commit QEMU tests passed\n'
+if ((have_kmemleak)); then
+	printf 'All P5 checkpoint/multi-commit QEMU tests passed\n'
+	exit 0
+fi
+printf 'P5 checkpoint/multi-commit tests completed; kmemleak scan skipped (exit SKIP)\n'
+exit 4

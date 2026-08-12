@@ -315,11 +315,17 @@ run_phase()
 {
 	local name=$1
 	local phase_log="$results_dir/${name}.log"
+	local rc=0
 
 	shift
 	log "Running phase: $name"
-	if "$@" > "$phase_log" 2>&1; then
+	"$@" > "$phase_log" 2>&1 || rc=$?
+	if ((rc == 0)); then
 		pass "$name completed (log: $phase_log)"
+	elif ((rc == 4)); then
+		# Sub-phase exited SKIP (4): its core ran but a capability-dependent
+		# check (e.g. kmemleak) was unavailable.  Not a failure.
+		note_skip "$name completed with skipped capability-dependent checks (log: $phase_log)"
 	else
 		sed -n '1,240p' "$phase_log" >&2 || true
 		die "$name failed (log: $phase_log)"
