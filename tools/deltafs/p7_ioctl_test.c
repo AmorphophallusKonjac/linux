@@ -32,7 +32,7 @@
 #define P7_BASELINE_PAYLOAD	"p7-abi-baseline\n"
 
 /* Keep an explicit assertion for the fixed native ABI layout. */
-_Static_assert(sizeof(struct deltafs_ioc_switch_v1) == 328,
+_Static_assert(sizeof(struct deltafs_ioc_switch_v1) == 584,
 	       "DeltaFS v1 ioctl request layout changed");
 
 static int failf(const char *fmt, ...)
@@ -394,8 +394,8 @@ static int run_negative(const char *merged, const char *case_root,
 	char nonpath_path[PATH_MAX];
 	char regular_path[PATH_MAX];
 	char cross_ns_path[PATH_MAX];
-	char lower64_path[PATH_MAX];
-	int lower64[DELTAFS_V1_MAX_LOWERS];
+	char max_lower_path[PATH_MAX];
+	int max_lowers[DELTAFS_V1_MAX_LOWERS];
 	int duplicate[2];
 	int reversed[2];
 	int current_upper[1];
@@ -416,7 +416,7 @@ static int run_negative(const char *merged, const char *case_root,
 	int ret = EXIT_FAILURE;
 
 	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
-		lower64[i] = -1;
+		max_lowers[i] = -1;
 	if (create_dir(case_root, "upper", upper_path, sizeof(upper_path)) ||
 	    create_dir(case_root, "work", work_path, sizeof(work_path)) ||
 	    create_dir(case_root, "lower", lower_path, sizeof(lower_path)) ||
@@ -434,11 +434,11 @@ static int run_negative(const char *merged, const char *case_root,
 			failf("internal lower name overflow");
 			goto out;
 		}
-		if (create_dir(case_root, name, lower64_path,
-			       sizeof(lower64_path)))
+		if (create_dir(case_root, name, max_lower_path,
+			       sizeof(max_lower_path)))
 			goto out;
-		lower64[i] = open_opath_dir(lower64_path);
-		if (lower64[i] < 0)
+		max_lowers[i] = open_opath_dir(max_lower_path);
+		if (max_lowers[i] < 0)
 			goto out;
 	}
 
@@ -507,7 +507,7 @@ static int run_negative(const char *merged, const char *case_root,
 		goto out;
 	init_request(&request, generation, upper_fd, work_fd,
 		     DELTAFS_V1_MAX_LOWERS + 1, NULL);
-	if (expect_unchanged("65 lowers", root_fd, root_fd,
+	if (expect_unchanged("129 lowers", root_fd, root_fd,
 			     DELTAFS_IOC_RESTORE, &request, E2BIG, generation))
 		goto out;
 	init_request(&request, generation, upper_fd, work_fd, 1, normal_lower);
@@ -564,8 +564,8 @@ static int run_negative(const char *merged, const char *case_root,
 			     DELTAFS_IOC_CHECKPOINT, &request, EINVAL, generation))
 		goto out;
 	init_request(&request, generation, upper_fd, work_fd,
-		     DELTAFS_V1_MAX_LOWERS, lower64);
-	if (expect_unchanged("exactly 64 lowers", root_fd, root_fd,
+		     DELTAFS_V1_MAX_LOWERS, max_lowers);
+	if (expect_unchanged("exactly 128 lowers", root_fd, root_fd,
 			     DELTAFS_IOC_CHECKPOINT, &request, EINVAL, generation))
 		goto out;
 
@@ -622,8 +622,8 @@ out:
 	if (root_fd >= 0)
 		close(root_fd);
 	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
-		if (lower64[i] >= 0)
-			close(lower64[i]);
+		if (max_lowers[i] >= 0)
+			close(max_lowers[i]);
 	return ret;
 }
 

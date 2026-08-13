@@ -975,7 +975,7 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
-	/* The request struct is ~320 bytes; keep it off the ioctl stack frame. */
+	/* The request struct is ~600 bytes; keep it off the ioctl stack frame. */
 	req = kzalloc(sizeof(*req), GFP_KERNEL);
 	if (!req)
 		return -ENOMEM;

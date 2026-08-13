@@ -22,7 +22,8 @@ generation 严格加一，失败时保持原 active view 不变。
 
 需要明确区分验证来源：本开发环境只做静态构建，不加载自定义内核模块；用户已于
 2026-08-11 确认在目标 QEMU/KVM debug guest 中运行
-`p7_acceptance_test.sh` 通过，包含 in-kernel 功能、内存安全和 100 次切换验收。
+`p7_acceptance_test.sh` 通过，包含 in-kernel 功能、内存安全和 100 次切换验收；
+该结果属于本次扩展前的 64-lower 基线。当前 128-lower、164-switch 版本必须重跑。
 原始 P7 结果目录尚未导入当前源码工作区，后续汇报仍应附带原始日志，而不是用本
 文档替代运行证据。
 
@@ -35,7 +36,7 @@ DeltaFS 不是新的磁盘文件系统，而是 OverlayFS 的运行时重配置�
 clean-room 复现，不声称与原作者的私有 ABI 或内部数据结构逐行一致。
 
 v1 采用“工作负载静止（quiesced）”模型，支持单 OverlayFS、单 backing
-superblock 和最多 64 个 lower。以下场景明确不属于 v1 保证范围：跨切换继续使用
+superblock 和最多 128 个 lower。以下场景明确不属于 v1 保证范围：跨切换继续使用
 普通文件/目录 fd、merged mount 内的 cwd/root、writable `MAP_SHARED`、并发
 switch/copy-up、异步 I/O、在线回收 retired layer，以及 controller 崩溃后的自动
 事务恢复。
@@ -83,13 +84,13 @@ ioctl 成功后进程崩溃，transaction 会保留并阻止后续操作，要�
 
 | 项目 | v1 定义 |
 | --- | --- |
-| ABI | `DELTAFS_ABI_VERSION = 1`，固定请求结构 328 bytes |
+| ABI | `DELTAFS_ABI_VERSION = 1`，固定请求结构 584 bytes |
 | 命令 | `DELTAFS_IOC_CHECKPOINT`、`DELTAFS_IOC_RESTORE` |
 | 控制 fd | 已挂载 OverlayFS 的 merged root directory fd |
 | 参数 fd | upper/work/lower 均为 `O_PATH|O_DIRECTORY|O_CLOEXEC` |
 | 权限 | 目标 user namespace 中需要 `CAP_SYS_ADMIN` |
 | generation | `expected_generation` 精确匹配；成功后加 1，失配返回 `-ESTALE` |
-| lower 上限 | 1--64；超过上限返回 `-E2BIG` |
+| lower 上限 | 1--128；超过上限返回 `-E2BIG` |
 | 失败语义 | commit 开始前任意错误均不改变 active view |
 
 v1 推荐的 OverlayFS mount 约束为：
@@ -114,7 +115,7 @@ uuid=off,redirect_dir=nofollow,volatile=off,numdatalayer=0
 | P4 | target state builder、private mount/trap/workdir 构建和完整 unwind | 已完成 |
 | P5 | 原子 view commit、checkpoint/restore、多次切换和 retired state | 已完成 |
 | P6 | `deltafsctl`、manifest、transaction、分支和崩溃边界 | 已完成 |
-| P7 | 深层 layer、动态故障注入、ABI matrix、100 次切换和 module unload harness | 用户确认 QEMU/KVM 通过 |
+| P7 | 深层 layer、动态故障注入、ABI matrix、164 次切换和 module unload harness | 旧 64 层基线通过；当前 128 层版本待重跑 |
 
 代码主要集中在 `fs/overlayfs/deltafs.c`，并接入
 `ovl_entry.h`、`params.c`、`super.c`、`inode.c`、`namei.c`、`util.c` 和
@@ -133,6 +134,7 @@ make C=2 CHECK=sparse M=fs/overlayfs
 make -C tools/deltafs clean all
 make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=enabled
 make -C tools/deltafs test-p6-controller
+make -C tools/deltafs test-p7-schedule
 for f in tools/deltafs/*.sh; do bash -n "$f"; done
 shellcheck tools/deltafs/p7_checkpoint_callsite_test.sh
 ```
@@ -159,12 +161,22 @@ shellcheck tools/deltafs/p7_checkpoint_callsite_test.sh
 ### 6.2 QEMU/KVM 验收状态
 
 当前开发环境不能启动目标 Linux 6.8 内核，也不加载生成的 `overlay.ko`。用户已
-确认目标 QEMU/KVM debug guest 中的 P7 总验收通过，包括真实
+确认目标 QEMU/KVM debug guest 中的旧 64-lower P7 总验收通过，包括真实
 checkpoint/restore、cache 失效、retired state 生命周期、
 KASAN/KFENCE/UBSAN/lockdep/kmemleak 和第 17 节八项判定。由于
 `section-17.tsv`、`dmesg-window.log`、`kmemleak.log` 及结果目录未导入当前工作区，
 这里不记录无法核实的具体 checkpoint 数或日志路径；该确认对应编译隔离重构前的
-基线，重构后的 debug build 需按第 7.5 节重跑，交付时应补充新的原始目录。
+基线；当前 128-lower 固定 UAPI 和深层矩阵需按第 7.5 节重跑，交付时应补充新的
+原始目录。
+
+2026-08-13 用户在缺少故障注入、kmemleak 和 sanitizer 全能力的 QEMU/KVM guest
+中运行当前 128 层 P7：P5 cache、P5 checkpoint、P6 controller、native ABI matrix、
+128-lower chain 以及第 129 次 checkpoint 的无变更拒绝均执行到预期结果。随后旧
+harness 的 36 次历史 restore 调度最终落到 `s01`（合法深度 2），却固定断言深度
+128，因此以 `active lower depth is 2, expected 128` 失败。该问题属于 P7 harness，
+不是内核或 controller 丢层；调度现已改为循环 8/32/64/128 层并最终停在 `s127`，
+同时新增 host-safe `test-p7-schedule`。修复后的完整 P7 仍须重新运行，不能把上述
+部分结果视为第 17 节最终通过证据。
 
 ## 七、QEMU/KVM 测试交接
 
@@ -216,7 +228,7 @@ P7 深层注入只能使用前述 debug 配置；production guest 可重跑 P5 �
 功能。`p7_acceptance_test.sh` 现在对能力型调试选项做探测：缺少故障注入
 （`CONFIG_FUNCTION_ERROR_INJECTION` 或 `/sys/kernel/debug/fail_function`）、
 kmemleak 或 sanitizer/lockdep/PROVE_RCU 时，跳过依赖该能力的阶段（深层故障注入
-循环改用一次非注入 restore 顶替 switch 64、kmemleak 扫描跳过、sanitizer dmesg
+循环改用一次非注入 restore 顶替 switch 128、kmemleak 扫描跳过、sanitizer dmesg
 覆盖减弱），非注入部分仍运行，并以 SKIP（退出码 4）结束；能力齐全时才以 0 退出。
 基础前置（QEMU/KVM guest、无既有 overlay mount、模块化 overlay、overlay/module-unload
 /debugfs 配置、可写 `/dev/kmsg` 等）不满足仍是失败。
@@ -265,7 +277,9 @@ make -C tools/deltafs p7-tools
 ```
 
 确认 `uname -r` 对应本次 kernel、`findmnt -t overlay` 没有测试外的挂载，并以
-root 身份执行后续命令。
+root 身份执行后续命令。128-lower native/controller 矩阵需要至少 160 个可用文件
+描述符；若 guest 的软限制更低，先执行 `ulimit -n 160`（或在 QEMU rootfs 的
+limits 配置中提高硬限制）。
 
 为各阶段脚本准备目录（普通测试使用第一块数据盘，跨 superblock 用例使用第二块）：
 
@@ -279,7 +293,7 @@ mkdir -p /mnt/deltafs-test/p7/disk2/p4-extra
 > P1–P4 是 P5 原子 commit 引入前的阶段性回归：合法 build 刻意以 `-EOPNOTSUPP`
 > 结束且 generation 不变。最终 HEAD 对相同合法请求必须成功提交，P7 不重跑这些
 > 互斥的旧终态断言；其 ABI/路径负向覆盖与 builder unwind 已分别由 P7 native
-> matrix 与 64 层动态故障注入接管，对应 `p1`–`p4` 测试文件已作为过时阶段性
+> matrix 与 128 层动态故障注入接管，对应 `p1`–`p4` 测试文件已作为过时阶段性
 > 证据清理。本节仅保留 P5/P6 阶段脚本（P7 总入口也会重跑它们）。
 
 脚本会自动拒绝非 QEMU/KVM guest、已有 OverlayFS mount、非模块化 overlay 或缺少
@@ -316,18 +330,20 @@ tools/deltafs/p7_acceptance_test.sh \
   --extra-backing-root /mnt/deltafs-test/p7/disk2
 ```
 
-P7 会串联 P5/P6 场景，并额外覆盖：64-lower restore、65-lower `-E2BIG`、ABI
-failure-atomicity、动态 `-ENOMEM` 故障注入、总计 100 次成功切换、反复
+P7 会串联 P5/P6 场景，并额外覆盖：128-lower restore、129-lower `-E2BIG`、ABI
+failure-atomicity、动态 `-ENOMEM` 故障注入、8/32/64/128 层历史 restore、总计
+164 次成功切换、反复
 umount/module unload、sanitizer 和 kmemleak。通过标准是同时看到：
 
 ```text
 All P7 DeltaFS v1 acceptance checks passed
 section-17.tsv 中 1--8 条均为 PASS
-deep fault injection exhausted after N injected checkpoints（N >= 64）
+deep fault injection exhausted after N injected checkpoints（N >= 128）
 ```
 
-2026-08-11 用户确认上述三项通过；重构后仍必须在 debug guest 重新运行本节命令，
-因为 production 构建关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 时不会生成注入 helper。
+2026-08-11 用户确认的是旧 64-lower、100-switch 基线。上述 128-lower 三项尚待在
+debug guest 重新运行本节命令；production 构建关闭
+`CONFIG_FUNCTION_ERROR_INJECTION` 时不会生成注入 helper。
 
 ### 7.6 日志和失败诊断
 

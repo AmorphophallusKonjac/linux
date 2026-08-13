@@ -133,13 +133,13 @@ v1 拒绝 idmapped backing mount 和嵌套 OverlayFS backing path。
 
 ### 4.2 层数限制
 
-v1 最多接受 64 个 lower：
+v1 最多接受 128 个 lower：
 
 ```text
-1 upper + 1..64 lower
+1 upper + 1..128 lower
 ```
 
-`nr_lower == 0` 返回 `-EINVAL`，`nr_lower > 64` 返回 `-E2BIG`。该上限是 v1 UAPI 的一部分，低于 OverlayFS 内部的 `OVL_MAX_STACK`。
+`nr_lower == 0` 返回 `-EINVAL`，`nr_lower > 128` 返回 `-E2BIG`。该上限是 v1 UAPI 的一部分，低于 OverlayFS 内部的 `OVL_MAX_STACK`。
 
 ### 4.3 静止条件
 
@@ -168,7 +168,7 @@ v1 最多接受 64 个 lower：
 #include <linux/types.h>
 
 #define DELTAFS_ABI_VERSION       1
-#define DELTAFS_V1_MAX_LOWERS     64
+#define DELTAFS_V1_MAX_LOWERS     128
 #define DELTAFS_IOC_MAGIC         0xdf
 
 struct deltafs_ioc_switch_v1 {
@@ -205,7 +205,7 @@ struct deltafs_ioc_switch_v1 {
 - 设置 `size = sizeof(struct deltafs_ioc_switch_v1)`；
 - 设置 `version = DELTAFS_ABI_VERSION`；
 - 设置 `flags = 0`、`reserved0 = 0`、`reserved[] = 0`；
-- 将 `lower_fds[nr_lower..63]` 全部设置为 `-1`；
+- 将 `lower_fds[nr_lower..127]` 全部设置为 `-1`；
 - 提供精确的 `expected_generation`。
 
 固定 fd 数组避免：
@@ -457,7 +457,7 @@ idx = layer 在新数组中的索引
 
 验证必须在 clone mount 前完成可提前完成的部分：
 
-- `nr_lower` 在 `[1, 64]`；
+- `nr_lower` 在 `[1, 128]`；
 - upper/work 不是只读 mount；
 - upper/work 位于同一个 `vfsmount`，避免 idmap 和 mount identity 不一致；
 - 所有输入 mount 都不是 idmapped mount；
@@ -892,7 +892,7 @@ fsync 或 transaction unlink 失败时，controller 不得把 layer rename 回�
 | `-EROFS` | OverlayFS 无 writable upper/work 或 superblock 只读 | 否 |
 | `-EOPNOTSUPP` | feature、idmap、嵌套布局或其他 v1 不支持条件 | 否 |
 | `-EXDEV` | backing path 不在 `delta_backing_sb` | 否 |
-| `-E2BIG` | lower 超过 64 | 否 |
+| `-E2BIG` | lower 超过 128 | 否 |
 | `-ESTALE` | expected generation 不匹配 | 否 |
 | `-EOVERFLOW` | generation 已为 `U64_MAX` | 否 |
 | `-ENOMEM` | build/preallocation 失败 | 否 |
@@ -948,7 +948,7 @@ P7 的验收产物：
 P1--P4 的合法 build 测试属于阶段性证据：在 P5 引入原子 commit 前，它们刻意要求
 完整构建后以 `-EOPNOTSUPP` 结束且 generation 不变。最终内核对相同合法请求必须
 成功提交，因此 P7 不直接重跑这些互斥的旧终态断言；其 ABI/路径负向覆盖和 builder
-unwind 分别由 P7 native matrix 与 64 层动态故障注入重新验证。
+unwind 分别由 P7 native matrix 与 128 层动态故障注入重新验证。
 
 关键代码锚点：
 
@@ -984,7 +984,7 @@ unwind 分别由 P7 native matrix 与 64 层动态故障注入重新验证。
 - stale expected generation；
 - checkpoint layer 顺序错误；
 - restore 包含 current upper；
-- 0、64、65 个 lower；
+- 0、128、129 个 lower；
 - 对每个 build allocation/clone/trap/workdir 步骤注入失败。
 
 P4 中“builder 成功后返回 `-EOPNOTSUPP`”是 P5 提交前的阶段性终值，不是最终
@@ -1015,7 +1015,7 @@ merged 内容未变
 - checkpoint 后继续写，再 restore 任意历史点；
 - A→B→C，restore A 后创建 A′；
 - restore 同一 checkpoint 多次，分别形成独立分支；
-- 1、8、32、64 层 lookup 和 restore。
+- 1、8、32、64、128 层 lookup 和 restore。
 
 每个用例同时验证 merged view 和物理 frozen layer。Frozen layer 的内容 hash、mtime、inode 和文件大小在后续写入后必须保持不变。
 
@@ -1082,7 +1082,7 @@ P5 的第一次可观察切换优先使用 restore：初始 view 与目标 lower
 
 ### 16.5 生命周期
 
-- 连续至少 100 次 checkpoint/restore；
+- 连续至少 164 次 checkpoint/restore；
 - 长时间保留 stale dcache/inode cache 后继续切换；
 - 反复 mount/unmount；
 - module unload；
@@ -1110,20 +1110,20 @@ tools/deltafs/p7_acceptance_test.sh \
 `/sys/kernel/debug/fail_function`）、kmemleak（`CONFIG_DEBUG_KMEMLEAK`）、
 KASAN/KFENCE/UBSAN/lockdep/PROVE_RCU 等*能力型*调试选项改为探测：缺失时跳过依赖
 该能力的阶段（深层故障注入循环、kmemleak 扫描、sanitizer dmesg 覆盖），非注入部分
-（P5/P6、native ABI 矩阵、100 次 switch、unload 循环、documented limits）仍照常
+（P5/P6、native ABI 矩阵、164 次 switch、unload 循环、documented limits）仍照常
 运行，最后以 SKIP（退出码 4）结束；能力齐全时才以 0 退出。它会保存内核 config、
 每个阶段日志、dmesg marker window、kmemleak 双扫描结果和 `section-17.tsv`。
 
 P7 先重跑具备最终提交语义的 P5 cache/multi-commit 和 P6 controller 验证；P4
 阶段的 build/free 故障覆盖由下述最终语义下的深层动态故障注入取代。随后：
 
-- 在同一 controller sandbox 完成 63 次 checkpoint，得到 `base + 63 snapshot`
-  的 64-lower chain；随后 restore 该 chain，并确认 controller 的第 65 次
-  checkpoint 在任何树变更前拒绝。native ABI helper 另行发送 `nr_lower=65`，
+- 在同一 controller sandbox 完成 127 次 checkpoint，得到 `base + 127 snapshot`
+  的 128-lower chain；随后 restore 该 chain，并确认 controller 的第 129 次
+  checkpoint 在任何树变更前拒绝。native ABI helper 另行发送 `nr_lower=129`，
   确认内核返回 `-E2BIG`；
 - 每个 frozen layer 的两个物理文件均记录 hash、inode、size、mode 与 mtime，
   每次后续 switch/失败注入后重新校验；
-- 在 64-lower restore 上用 `ovl_deltafs_build_checkpoint()` 的第 N 次动态失败
+- 在 128-lower restore 上用 `ovl_deltafs_build_checkpoint()` 的第 N 次动态失败
   注入驱动所有实际 ownership checkpoint。`fail_function` 的全局 `count` 无法通过
   debugfs 重置，因此每轮固定 `interval=1` 并重置 `space=N`；该注入点的 size 为
   1，故能精确命中本轮第 N 次调用。连续 `-ENOMEM` 必须保留 generation、state、
@@ -1131,20 +1131,22 @@ P7 先重跑具备最终提交语义的 P5 cache/multi-commit 和 P6 controller 
   提交，因此计数不会依赖易失的硬编码值。注入 helper 本体必须包含 compiler
   barrier，阻止 GCC 在 `-O2` 下跨过程证明其恒为 0 并删除调用；debug 构建后的
   `deltafs.o` 还必须通过“调用 relocation 数等于源码调用点数”的静态检查；运行时
-  实际注入次数必须至少为 64，以证明按 layer 执行的循环调用点也已覆盖。production
+  实际注入次数必须至少为 128，以证明按 layer 执行的循环调用点也已覆盖。production
   构建关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 后，同一静态检查以 `disabled` 模式
   断言 relocation 数为 0；
-- 以该成功 restore 作为第 64 次成功切换，再做 36 次历史 restore，使总数恰为
-  100，最终 generation 为 101；每次 restore 后的写入必须进入其 `gN/upper`；
+- 以该成功 restore 作为第 128 次成功切换，再循环 restore `s07`、`s31`、
+  `s63`、`s127` 共 36 次，分别覆盖 8、32、64、128-lower chain，使总数恰为
+  164，最终 generation 为 165 且 active chain 回到 128 层；每次 restore 后的
+  写入必须进入其 `gN/upper`，并立即校验目标 snapshot 对应的 layer depth；
 - 在独立 sandbox 中至少十次 checkpoint → umount → `modprobe -r overlay`，并在
   最后 module unload 后执行 kmemleak 双扫描和整个 P7 marker window 的 sanitizer
   检查。
 
-P7 脚本实现完成本身不等于 P7 已通过。2026-08-11 用户确认已在符合上述配置的
-QEMU/KVM guest 中执行 P7，终端成功标志和第 17 节八项均通过；该结果目录尚未导入
-当前源码工作区，因此本文记录为“用户确认通过”，不虚构具体目录名、checkpoint
-计数或日志内容。该确认对应本次编译隔离重构前的基线；重构后的 debug build 仍须
-按本节重新执行 P7。发布或交接时应归档新的完整结果目录。
+P7 脚本实现完成本身不等于 P7 已通过。2026-08-11 用户确认过此前的 64-lower、
+100-switch 基线，终端成功标志和第 17 节八项均通过；该结果目录尚未导入当前源码
+工作区。当前 128-lower、164-switch 版本扩大了固定 UAPI 和深层矩阵，尚未在本工作区
+获得新的 QEMU 运行证据，必须按本节重新执行 P7。发布或交接时应归档新的完整结果
+目录，不能用旧基线替代。
 
 ### 16.7 不验收场景
 
@@ -1160,23 +1162,23 @@ QEMU/KVM guest 中执行 P7，终端成功标志和第 17 节八项均通过；�
 
 ## 17. v1 完成判定
 
-只有同时满足以下条件，才能称为 DeltaFS v1。2026-08-11 用户确认目标 guest 的
-`section-17.tsv` 中以下八项均为 `PASS`；当前工作区未包含该结果目录，后续交付需
-保留原始运行证据。此次故障注入编译隔离重构完成后，还需用 debug build 重新生成
-一份结果目录：
+只有同时满足以下条件，才能称为当前 128 层 DeltaFS v1。2026-08-11 的旧
+64-lower 基线曾由用户确认八项均为 `PASS`，但当前工作区未包含该结果目录，而且该
+结果不覆盖本次 UAPI 和深层栈扩展。后续交付必须用当前 debug build 重新生成并保留
+原始运行证据：
 
 1. 两个 ioctl 在声明边界内完成 checkpoint 和任意历史 restore。
 2. 成功切换 generation 恰好加一，失败不改变 active view。
 3. 正/负缓存预热后仍能读取当前 view。
 4. frozen layer 在后续写入中保持不变。
 5. restore 后的分支写入只进入 fresh upper。
-6. 64 层以内功能正确，超限明确失败。
+6. 128 层以内功能正确，超限明确失败。
 7. 反复切换和 unmount 无 UAF、double free、deadlock 或引用泄漏。
 8. 文档明确保留旧 fd、mmap、并发、GC 和崩溃恢复限制。
 
 ## 18. 最终产出
 
 DeltaFS v1 的实现产物包括 OverlayFS 内核补丁、UAPI、controller、P1--P7 测试
-helper 和本设计文档。P7 结果目录是完成判定的运行时证据；用户已确认目标
-QEMU/KVM debug guest 运行通过，但结果目录未随源码导入，不能用本文档替代原始
-`section-17.tsv`、dmesg 和 kmemleak 日志。
+helper 和本设计文档。P7 结果目录是完成判定的运行时证据；旧 64-lower 基线曾由
+用户确认通过，但当前 128-lower 版本仍需新的 QEMU/KVM debug guest 结果。不能用
+本文档替代原始 `section-17.tsv`、dmesg 和 kmemleak 日志。

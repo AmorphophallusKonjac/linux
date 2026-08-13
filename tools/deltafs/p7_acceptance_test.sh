@@ -18,8 +18,9 @@ readonly FAIL_FUNCTION_DIR=/sys/kernel/debug/fail_function
 readonly BUILD_CHECKPOINT=ovl_deltafs_build_checkpoint
 readonly KMEMLEAK_MIN_AGE_SECONDS=6
 readonly KMEMLEAK_SCAN_SETTLE_SECONDS=2
-readonly MAX_LOWER_CHECKPOINTS=63
-readonly REQUIRED_SUCCESSFUL_SWITCHES=100
+readonly MAX_LOWERS=128
+readonly MAX_LOWER_CHECKPOINTS=$((MAX_LOWERS - 1))
+readonly REQUIRED_SUCCESSFUL_SWITCHES=$((MAX_LOWERS + 36))
 readonly DEFAULT_UNLOAD_CYCLES=10
 readonly MAX_FAULT_NTH=4096
 
@@ -573,16 +574,18 @@ run_deep_fault_injection()
 		enable_fault_injection "$nth"
 		fault_log="$results_dir/deep-fault-${nth}.log"
 		set +e
-		LC_ALL=C "$controller" --assume-quiesced restore "$root" s63 \
+		LC_ALL=C "$controller" --assume-quiesced restore "$root" s127 \
 			> "$fault_log" 2>&1
 		status=$?
 		set -e
 		disable_fault_injection
 
 		if ((status == 0)); then
+			((nth - 1 >= MAX_LOWERS)) ||
+				die "deep fault injection covered only $((nth - 1)) ownership checkpoints"
 			assert_clean_transaction "$root"
 			assert_generation "$root/merged" "$((generation + 1))"
-			assert_active_depth "$root" 64
+			assert_active_depth "$root" "$MAX_LOWERS"
 			verify_frozen_files
 			printf '%s\n' "$nth" > "$results_dir/deep-fault-checkpoints.txt"
 			pass "deep fault injection exhausted after $((nth - 1)) injected checkpoints"
@@ -599,7 +602,7 @@ run_deep_fault_injection()
 		[[ ! -e "$root/branches/g$((generation + 1))" ]] ||
 			die "fault checkpoint $nth leaked fresh branch g$((generation + 1))"
 		assert_clean_transaction "$root"
-		expect_contents "$root/merged/p7-frozen" s63 "fault checkpoint $nth"
+		expect_contents "$root/merged/p7-frozen" s127 "fault checkpoint $nth"
 		assert_generation "$root/merged" "$generation"
 		verify_frozen_files
 	done
@@ -627,6 +630,36 @@ run_native_abi_matrix()
 	pass 'native ABI-negative matrix left generation and view unchanged'
 }
 
+deep_restore_target()
+{
+	local operation=$1
+	local depths=(8 32 64 128)
+	local index
+	local depth
+
+	((operation > MAX_LOWERS &&
+	   operation <= REQUIRED_SUCCESSFUL_SWITCHES)) || return 1
+	index=$(((operation - MAX_LOWERS - 1) % ${#depths[@]}))
+	depth=${depths[index]}
+	printf 's%02d %d\n' "$((depth - 1))" "$depth"
+}
+
+validate_deep_restore_schedule()
+{
+	local depths=(8 32 64 128)
+	local restore_count=$((REQUIRED_SUCCESSFUL_SWITCHES - MAX_LOWERS))
+	local final_id
+	local final_depth
+
+	((restore_count > 0 && restore_count % ${#depths[@]} == 0)) ||
+		die 'deep restore schedule does not end on its final target'
+	read -r final_id final_depth < <(
+		deep_restore_target "$REQUIRED_SUCCESSFUL_SWITCHES"
+	) || die 'could not calculate the final deep restore target'
+	[[ "$final_id" == s127 && "$final_depth" == "$MAX_LOWERS" ]] ||
+		die 'deep restore schedule does not end at s127 / maximum depth'
+}
+
 run_deep_switch_and_fault_matrix()
 {
 	local root="$run_dir/deep-switch"
@@ -636,10 +669,13 @@ run_deep_switch_and_fault_matrix()
 	local overflow_log="$results_dir/deep-overflow.log"
 	local before_overflow
 	local overflow_status
-	local restore_ids=(s01 s08 s32 s63)
-	local restore_index
+	local expected_depth
+	local restore_count=$((REQUIRED_SUCCESSFUL_SWITCHES - MAX_LOWERS))
 	local branch_file
 	local operation
+	local final_generation=$((REQUIRED_SUCCESSFUL_SWITCHES + 1))
+
+	validate_deep_restore_schedule
 
 	ensure_overlay_unloaded
 	load_overlay
@@ -666,50 +702,54 @@ run_deep_switch_and_fault_matrix()
 		verify_frozen_files
 	done
 
-	assert_active_depth "$root" 64
+	assert_active_depth "$root" "$MAX_LOWERS"
 	before_overflow=$(state_hash "$root")
 	set +e
 	LC_ALL=C "$controller" --assume-quiesced checkpoint "$root" overflow \
 		> "$overflow_log" 2>&1
 	overflow_status=$?
 	set -e
-	((overflow_status != 0)) || die 'controller accepted checkpoint beyond 64 lowers'
-	grep -Fq 'checkpoint would exceed the 64-lower v1 limit' "$overflow_log" || {
+	((overflow_status != 0)) || die 'controller accepted checkpoint beyond 128 lowers'
+	grep -Fq 'checkpoint would exceed the 128-lower v1 limit' "$overflow_log" || {
 		sed -n '1,160p' "$overflow_log" >&2 || true
 		die 'controller limit failure was not the expected E2BIG preflight'
 	}
 	[[ "$(state_hash "$root")" == "$before_overflow" ]] ||
 		die 'over-limit controller checkpoint changed state.json'
-	[[ ! -e "$root/layers/overflow" && ! -e "$root/branches/g65" ]] ||
+	[[ ! -e "$root/layers/overflow" &&
+	   ! -e "$root/branches/g$((MAX_LOWERS + 1))" ]] ||
 		die 'over-limit controller checkpoint mutated the backing tree'
 	assert_clean_transaction "$root"
-	assert_generation "$root/merged" 64
+	assert_generation "$root/merged" 128
 	verify_frozen_files
-	pass '64-lower controller boundary rejects a 65th checkpoint without mutation'
+	pass '128-lower controller boundary rejects a 129th checkpoint without mutation'
 
-	# The first non-injected restore is successful switch 64.
+	# The first non-injected restore is successful switch 128.
 	if ((have_injection)); then
-		run_deep_fault_injection "$root" 64
+		run_deep_fault_injection "$root" 128
 	else
-		note_skip 'deep fault injection unavailable; non-injected restore to s63 substitutes switch 64'
-		LC_ALL=C "$controller" --assume-quiesced restore "$root" s63 \
+		note_skip 'deep fault injection unavailable; non-injected restore to s127 substitutes switch 128'
+		LC_ALL=C "$controller" --assume-quiesced restore "$root" s127 \
 			>> "$results_dir/deep-restores.log" 2>&1 ||
-			die 'non-injected deep restore to s63 failed'
+			die 'non-injected deep restore to s127 failed'
 		printf 'skipped\n' > "$results_dir/deep-fault-checkpoints.txt"
 	fi
-	expect_contents "$root/merged/p7-frozen" s63 'deep restore after fault injection'
+	expect_contents "$root/merged/p7-frozen" s127 'deep restore after fault injection'
 	printf 'fault-success\n' > "$root/merged/p7-fault-success"
-	expect_contents "$root/branches/g65/upper/p7-fault-success" fault-success \
+	expect_contents "$root/branches/g$((MAX_LOWERS + 1))/upper/p7-fault-success" \
+		fault-success \
 		'deep restore fresh upper'
 	verify_frozen_files
 
-	for ((operation = 65; operation <= REQUIRED_SUCCESSFUL_SWITCHES; operation++)); do
-		restore_index=$(((operation - 65) % ${#restore_ids[@]}))
-		id=${restore_ids[restore_index]}
+	for ((operation = MAX_LOWERS + 1;
+	      operation <= REQUIRED_SUCCESSFUL_SWITCHES; operation++)); do
+		read -r id expected_depth < <(deep_restore_target "$operation") ||
+			die "could not calculate restore target for switch $operation"
 		"$controller" --assume-quiesced restore "$root" "$id" \
 			>> "$results_dir/deep-restores.log" 2>&1 ||
 			die "restore $id at successful switch $operation failed"
 		generation=$((operation + 1))
+		assert_active_depth "$root" "$expected_depth"
 		expect_contents "$root/merged/p7-frozen" "$id" \
 			"restore $id at successful switch $operation"
 		branch_file="p7-branch-$operation"
@@ -721,15 +761,17 @@ run_deep_switch_and_fault_matrix()
 		verify_frozen_files
 	done
 
-	assert_active_depth "$root" 64
-	grep -Fq '"kernel_generation": 101' "$root/meta/state.json" ||
-		die '100 successful switches did not reach generation 101'
-	grep -Fq '"active_branch": "g101"' "$root/meta/state.json" ||
-		die '100 successful switches did not select branch g101'
+	assert_active_depth "$root" "$MAX_LOWERS"
+	grep -Fq "\"kernel_generation\": $final_generation" \
+		"$root/meta/state.json" ||
+		die "$REQUIRED_SUCCESSFUL_SWITCHES successful switches did not reach generation $final_generation"
+	grep -Fq "\"active_branch\": \"g$final_generation\"" \
+		"$root/meta/state.json" ||
+		die "$REQUIRED_SUCCESSFUL_SWITCHES successful switches did not select branch g$final_generation"
 	verify_frozen_files
 	unmount_current
 	ensure_overlay_unloaded
-	pass '63 checkpoints plus 37 restores completed 100 successful switches'
+	pass "$MAX_LOWER_CHECKPOINTS checkpoints plus $((restore_count + 1)) restores completed $REQUIRED_SUCCESSFUL_SWITCHES successful switches"
 }
 
 run_unload_cycles()
@@ -873,6 +915,21 @@ while (($#)); do
 	esac
 done
 
+if [[ ${DELTAFS_P7_SCHEDULE_SELFTEST:-0} == 1 ]]; then
+	validate_deep_restore_schedule
+	read -r first_id first_depth < <(deep_restore_target "$((MAX_LOWERS + 1))")
+	read -r last_id last_depth < <(
+		deep_restore_target "$REQUIRED_SUCCESSFUL_SWITCHES"
+	)
+	[[ "$first_id" == s07 && "$first_depth" == 8 ]] ||
+		die 'deep restore schedule does not start at s07 / depth 8'
+	[[ "$last_id" == s127 && "$last_depth" == "$MAX_LOWERS" ]] ||
+		die 'deep restore schedule self-test did not finish at maximum depth'
+	printf 'PASS: P7 deep restore schedule ends at s127 / depth %d\n' \
+		"$MAX_LOWERS"
+	exit 0
+fi
+
 [[ -n "$backing_root" && -n "$extra_backing_root" ]] || {
 	usage >&2
 	exit 1
@@ -881,6 +938,13 @@ done
 	((unload_cycles >= DEFAULT_UNLOAD_CYCLES)) ||
 	die "--unload-cycles must be an integer of at least $DEFAULT_UNLOAD_CYCLES"
 ((EUID == 0)) || die 'must run as root inside the guest'
+nofile_limit=$(ulimit -n)
+if [[ "$nofile_limit" != unlimited ]]; then
+	if [[ ! "$nofile_limit" =~ ^[0-9]+$ ]] ||
+	   ((nofile_limit < 160)); then
+		die 'RLIMIT_NOFILE must be at least 160 for the 128-lower matrix'
+	fi
+fi
 
 for command in awk cat cp date dmesg findmnt grep mkdir mktemp modinfo modprobe \
 	mount mountpoint realpath rm sed sha256sum sleep stat tr umount uname; do
@@ -1021,16 +1085,16 @@ verify_documented_limits
 scan_kmemleak
 scan_kernel_window
 
-record_gate 1 'P6 controller scenario plus 64-layer historical restores'
+record_gate 1 'P6 controller scenario plus 128-layer historical restores'
 record_gate 2 'generation probes after all successes and injected failures'
 record_gate 3 'P5 real-switch positive/negative cache and root readdir coverage'
 record_gate 4 'physical fingerprints of every frozen P7 layer after every operation'
 record_gate 5 'fresh-upper writes after deep restore and every later restore'
-record_gate 6 '64 lower restore, controller preflight, and raw 65-lower E2BIG'
+record_gate 6 '128 lower restore, controller preflight, and raw 129-lower E2BIG'
 if ((have_injection && have_kmemleak && have_sanitizers)); then
-	record_gate 7 'deep fault unwind, 100 switches, repeated unload, sanitizers, kmemleak'
+	record_gate 7 'deep fault unwind, 164 switches, repeated unload, sanitizers, kmemleak'
 else
-	record_gate_skip 7 'deep fault unwind, 100 switches, repeated unload, sanitizers, kmemleak (capability-dependent phases skipped)'
+	record_gate_skip 7 'deep fault unwind, 164 switches, repeated unload, sanitizers, kmemleak (capability-dependent phases skipped)'
 fi
 record_gate 8 'documented old-fd/mmap/concurrency/GC/crash-recovery limits'
 

@@ -6,7 +6,7 @@
 #include <linux/types.h>
 
 #define DELTAFS_ABI_VERSION		1
-#define DELTAFS_V1_MAX_LOWERS		64
+#define DELTAFS_V1_MAX_LOWERS		128
 #define DELTAFS_IOC_MAGIC		0xdf
 
 struct deltafs_ioc_switch_v1 {

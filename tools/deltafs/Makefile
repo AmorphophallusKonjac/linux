@@ -39,6 +39,9 @@ clean:
 test-p6-controller: deltafsctl
 	./p6_controller_unit_test.sh
 
+test-p7-schedule:
+	DELTAFS_P7_SCHEDULE_SELFTEST=1 ./p7_acceptance_test.sh
+
 p7-tools: p5_commit_test p5_checkpoint_test p6_generation_test \
 	p7_ioctl_test deltafsctl deltafsctl_test
 
@@ -54,4 +57,5 @@ test-p7: p7-tools
 	./p7_acceptance_test.sh --backing-root "$(BACKING_ROOT)" \
 		--extra-backing-root "$(EXTRA_BACKING_ROOT)"
 
-.PHONY: all clean test-p6-controller p7-tools check-p7-checkpoints test-p7
+.PHONY: all clean test-p6-controller test-p7-schedule p7-tools \
+	check-p7-checkpoints test-p7
