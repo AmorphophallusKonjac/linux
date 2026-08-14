@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: GPL-2.0
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import pathlib
+import statistics
+import sys
+import tempfile
+import unittest
+
+
+E3 = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(E3))
+import analyze  # noqa: E402
+import events  # noqa: E402
+import run  # noqa: E402
+
+
+def write_json(path: pathlib.Path, value: object) -> None:
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="ascii")
+
+
+def write_jsonl(path: pathlib.Path, values: list[dict]) -> None:
+    path.write_text("".join(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        for value in values
+    ), encoding="ascii")
+
+
+def manifest(config: str, event_hash: str, event_count: int) -> dict:
+    fs_type = "ext4" if config.startswith("ext4") else "xfs"
+    return {
+        "schema": 1, "preset": "smoke", "run_index": 1, "seed": events.SEED,
+        "event_file": "events.jsonl", "event_file_sha256": event_hash,
+        "event_count": event_count, "git_commit": "test", "kernel_release": "test",
+        "kernel_config_sha256": "", "fs_type": fs_type, "fs_config": config,
+        "fs_uuid": "test", "backing_source": f"/dev/{config}",
+        "backing_mount_options": "rw", "xfs_info": "" if fs_type == "ext4" else
+        f"reflink={1 if config == 'xfs_reflink' else 0}",
+        "device_stat": "/sys/block/test/stat",
+        "canonical_device_stat": "/sys/devices/test/stat",
+        "overlay_mount_options": list(run.MOUNT_FEATURES), "started_at": "test",
+        "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
+        "warm_count_per_cell": 1, "cold_count_per_cell": 1,
+        "independent_runs": 1, "noop_interval": 20, "noop_repetitions": 3,
+        "settle_interval_ms": 100, "settle_stable_comparisons": 3,
+        "settle_timeout_ms": 10000,
+    }
+
+
+def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> None:
+    directory = root / config
+    fiemap_dir = directory / "fiemap"
+    fiemap_dir.mkdir(parents=True)
+    event_data = events.canonical_jsonl(event_values)
+    (directory / "events.jsonl").write_bytes(event_data)
+    write_json(directory / "manifest.json", manifest(
+        config, hashlib.sha256(event_data).hexdigest(), len(event_values),
+    ))
+    rows = []
+    for number, event in enumerate(event_values, start=1):
+        fiemap_name = f"sample-{number:03d}.json"
+        write_json(fiemap_dir / fiemap_name, {
+            "schema": 1, "file_size": event["file_size_before"], "block_size": 4096,
+            "status": "ok", "errno": 0,
+            "extents": [{"logical": 0, "physical": number * 4096,
+                         "length": event["file_size_before"], "flags": 1}],
+        })
+        rows.append({
+            "schema": 1, "run": event["run"], "sample": number,
+            "sample_id": f"sample-{number:03d}", "sample_kind": "edit",
+            "control_batch": 1, "cache_mode": event["cache_mode"],
+            "fs_config": config, "event_id": event["event_id"],
+            "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
+            "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
+            "dirty_blocks": event["dirty_blocks"],
+            "copyup_bytes": event["file_size_before"], "shared_bytes": 0,
+            "allocated_bytes_total": event["file_size_before"],
+            "copyup_amplification": event["file_size_before"] / event["write_bytes"],
+            "sectors_before": 1000, "sectors_after": 1008, "physical_io_bytes": 4096,
+            "settle_timeout": False, "pre_sha256": event["expected_before_sha256"],
+            "post_sha256": event["expected_after_sha256"],
+            "upper_sha256": event["expected_after_sha256"],
+            "lower_sha256": event["expected_before_sha256"],
+            "fiemap_path": f"fiemap/{fiemap_name}", "fiemap_block_size": 4096,
+            "status": "ok", "errno": 0, "invalid_reason": None,
+        })
+    write_jsonl(directory / "raw.jsonl", rows)
+    controls = []
+    sample = 0
+    for cache_mode in ("warm", "cold"):
+        for replica in range(1, 4):
+            sample += 1
+            controls.append({
+                "schema": 1, "run": 1, "sample": sample,
+                "sample_id": f"control-{cache_mode}-{replica}",
+                "sample_kind": "control", "cache_mode": cache_mode,
+                "fs_config": config, "control_batch": 1, "replica": replica,
+                "sectors_before": 2000, "sectors_after": 2002,
+                "physical_io_bytes": 1024, "settle_timeout": False,
+                "status": "ok", "errno": 0, "invalid_reason": None,
+            })
+    write_jsonl(directory / "controls.jsonl", controls)
+    write_json(directory / "summary.json", {
+        "schema": 1, "preset": "smoke", "completed": True, "passed": True,
+        "counts": {"ok": len(rows), "invalid": 0, "failed": 0},
+        "control_counts": {"ok": len(controls), "invalid": 0, "failed": 0},
+        "planned_edits": len(rows), "planned_controls": len(controls),
+        "dmesg_failures": [], "finished_at": "test",
+    })
+
+
+class AnalyzeTests(unittest.TestCase):
+    def test_percentile_and_bootstrap(self) -> None:
+        self.assertEqual(analyze.percentile([1, 2, 3, 4], 0.5), 2.5)
+        rows = [{"run": 1, "value": value} for value in (1, 2, 3)]
+        first = analyze.cluster_bootstrap(
+            rows, lambda row: row["value"], statistics.median, ("test",), 50,
+        )
+        second = analyze.cluster_bootstrap(
+            rows, lambda row: row["value"], statistics.median, ("test",), 50,
+        )
+        self.assertEqual(first, second)
+
+    def test_paired_join_reports_missing_and_uses_event_delta(self) -> None:
+        rows = []
+        for config, value in (("ext4_noreflink", 10), ("xfs_noreflink", 8),
+                              ("xfs_reflink", 3)):
+            rows.append({
+                "event_id": "e", "run": 1, "cache_mode": "warm", "size_bin": "4KiB",
+                "fs_config": config, "status": "ok", "copyup_bytes": value,
+                "physical_io_bytes": value, "physical_io_bytes_corrected": value,
+            })
+        paired, errors_found = analyze.paired_rows(rows)
+        self.assertFalse(errors_found)
+        metadata = next(row for row in paired if row["comparison"] == "xfs_metadata"
+                        and row["metric"] == "copyup_bytes")
+        reflink = next(row for row in paired if row["comparison"] == "reflink"
+                       and row["metric"] == "copyup_bytes")
+        self.assertEqual(metadata["bytes_saved"], 2)
+        self.assertEqual(reflink["bytes_saved"], 5)
+        _, errors_found = analyze.paired_rows(rows[:-1])
+        self.assertTrue(errors_found)
+
+    def test_end_to_end_smoke_artifacts(self) -> None:
+        event_values = events.generate_events("smoke")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            stats, errors_found = analyze.analyze(root, replicates=20)
+            self.assertFalse(errors_found)
+            self.assertEqual(len(stats), 108)
+            analysis_dir = root / "analysis"
+            expected = {
+                "summary.tsv", "paired-benefit.tsv", "paired-benefit-summary.tsv",
+                "regression.tsv", "noop-sensitivity.tsv", "pairing-errors.tsv",
+                "invalid.jsonl", "copyup-by-size.png", "physical-io-by-size.png",
+                "summary.json",
+            }
+            self.assertEqual({path.name for path in analysis_dir.iterdir()}, expected)
+            self.assertTrue(json.loads(
+                (analysis_dir / "summary.json").read_text(encoding="utf-8")
+            )["passed"])
+            self.assertGreater((analysis_dir / "copyup-by-size.png").stat().st_size, 1000)
+
+    def test_event_hash_mismatch_is_rejected(self) -> None:
+        event_values = events.generate_events("smoke")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            value = read = json.loads(
+                (root / "xfs_reflink" / "manifest.json").read_text(encoding="ascii")
+            )
+            value = copy.deepcopy(read)
+            value["event_file_sha256"] = "0" * 64
+            write_json(root / "xfs_reflink" / "manifest.json", value)
+            with self.assertRaises(analyze.AnalysisError):
+                analyze.discover(root)
+
+
+if __name__ == "__main__":
+    unittest.main()

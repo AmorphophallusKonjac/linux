@@ -3,6 +3,9 @@
 This file supplements the repo-root `AGENTS.md`. Both apply when working in
 `fs/deltafs`.
 
+deltafs is based on overlayfs from Linux 6.8.0 and adds support for hot-swapping
+the layer stack to provide filesystem version control.
+
 ## Testing
 
 - After development, perform **static testing only** in this environment:

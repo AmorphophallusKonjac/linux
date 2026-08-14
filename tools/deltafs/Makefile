@@ -11,6 +11,12 @@ CPPFLAGS += -I$(UAPI_HEADERS)
 all: p5_commit_test p5_checkpoint_test p6_generation_test p7_ioctl_test \
 	deltafsctl deltafsctl_test
 
+e2-bench:
+	$(MAKE) -C bench/e2 all
+
+e3-bench:
+	$(MAKE) -C bench/e3 all
+
 p5_commit_test: p5_commit_test.c $(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
@@ -35,6 +41,8 @@ $(UAPI_HEADERS)/linux/deltafs.h:
 clean:
 	$(RM) p5_commit_test p5_checkpoint_test p6_generation_test p7_ioctl_test \
 		deltafsctl deltafsctl_test
+	$(MAKE) -C bench/e2 clean
+	$(MAKE) -C bench/e3 clean
 
 test-p6-controller: deltafsctl
 	./p6_controller_unit_test.sh
@@ -57,5 +65,5 @@ test-p7: p7-tools
 	./p7_acceptance_test.sh --backing-root "$(BACKING_ROOT)" \
 		--extra-backing-root "$(EXTRA_BACKING_ROOT)"
 
-.PHONY: all clean test-p6-controller test-p7-schedule p7-tools \
+.PHONY: all e2-bench e3-bench clean test-p6-controller test-p7-schedule p7-tools \
 	check-p7-checkpoints test-p7

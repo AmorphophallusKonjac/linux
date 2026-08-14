@@ -634,8 +634,9 @@ production 配置（关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 等）下也可运�
 /debugfs 配置、可写 `/dev/kmsg` 等）不满足时仍 fail closed；但缺少故障注入
 （`CONFIG_FUNCTION_ERROR_INJECTION` 或 `/sys/kernel/debug/fail_function`）、kmemleak
 或 sanitizer/lockdep/PROVE_RCU 时，harness 跳过依赖该能力的阶段（深层故障注入循环改用
-一次非注入 restore 顶替 switch 64、kmemleak 扫描跳过、sanitizer dmesg 覆盖减弱），
-非注入部分（P5/P6、native ABI 矩阵、100 次 switch、unload 循环、documented limits）仍
+一次非注入 restore 顶替 switch 128、kmemleak 扫描跳过、sanitizer dmesg 覆盖减弱），
+非注入部分（P5/P6、native ABI 矩阵、8/32/64/128 层历史 restore、164 次 switch、
+unload 循环、documented limits）仍
 运行，并以 SKIP（退出码 4）结束。完整 unwind 证据仍需同源码的 debug guest P7 结果。
 
 使用项目现有的 x86_64 rootfs 和两个已格式化的独立数据盘启动 debug guest；以下
@@ -678,7 +679,7 @@ tools/deltafs/p7_acceptance_test.sh \
 
 成功标志必须同时包含 `All P7 DeltaFS v1 acceptance checks passed`、第 17 节八条
 `PASS`，并且 `deep fault injection exhausted after N injected checkpoints` 中
-`N >= 64`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。
+`N >= 128`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。
 
 若 guest 缺少故障注入、kmemleak 或 sanitizer/lockdep/PROVE_RCU 能力，harness 改为以
 SKIP 结束：退出码为 4，终端打印若干 `SKIP:` 行，`section-17.tsv` 中条件 7 记为 `SKIP`
@@ -695,9 +696,9 @@ dmesg -T > /mnt/host/p7-dmesg-full.log
 findmnt -t overlay > /mnt/host/p7-overlay-mounts.log
 ```
 
-2026-08-11 用户确认目标 QEMU/KVM guest 已满足上述成功条件；原始结果目录未导入
-当前源码工作区，因此后续重构验收仍需重新执行并归档，而不能从该确认推导具体 N
-或日志内容。
+2026-08-11 用户确认的是旧 64-lower、100-switch 基线；原始结果目录未导入当前
+源码工作区。当前 128-lower、164-switch 成功条件仍需重新执行并归档，不能从旧确认
+推导新的 N 或日志内容。
 
 失败退出会在卸载 OverlayFS 后保留 `.deltafs-p7-run.*` 和另一数据盘上的
 `.deltafs-p7-extra.*`，终端会打印两个路径；连同结果目录一起保留后再分析。
