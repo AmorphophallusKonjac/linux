@@ -6,6 +6,26 @@ This file supplements the repo-root `AGENTS.md`. Both apply when working in
 deltafs is based on overlayfs from Linux 6.8.0 and adds support for hot-swapping
 the layer stack to provide filesystem version control.
 
+## Repository layout — scope all searches
+
+This tree is a full Linux 6.8 checkout (~83k files). deltafs work lives in
+only three directories:
+
+- `fs/overlayfs/` — deltafs kernel module source (fork of overlayfs)
+- `tools/deltafs/` — userspace tools and tests (p1 … p7, acceptance)
+- `docs/` — design docs and test/reproduction guides
+
+Everything else is stock upstream kernel, reference only. Blind whole-tree
+searches waste context on upstream noise, so:
+
+- Never run rg/grep/find without a path argument scoping it to the
+  directories above, e.g. `rg pattern fs/overlayfs/`.
+- For upstream context (VFS helpers, struct definitions), read the specific
+  known file (e.g. `include/linux/fs.h`) or search one specific directory,
+  e.g. `rg pattern include/linux/`.
+- Matches outside the directories above are upstream kernel code — never
+  treat or cite them as deltafs code.
+
 ## Testing
 
 - After development, perform **static testing only** in this environment:
