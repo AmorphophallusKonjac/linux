@@ -542,6 +542,9 @@ static int ovl_get_upper(struct super_block *sb, struct ovl_fs *ofs,
 	/* Don't inherit atime flags */
 	upper_mnt->mnt_flags &= ~(MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME);
 	upper_layer->mnt = upper_mnt;
+	upper_layer->delta_source = *upperpath;
+	path_get(&upper_layer->delta_source);
+	upper_layer->delta_source_valid = true;
 	upper_layer->idx = 0;
 	upper_layer->fsid = 0;
 
@@ -1100,6 +1103,9 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 
 		layers[ofs->numlayer].trap = trap;
 		layers[ofs->numlayer].mnt = mnt;
+		layers[ofs->numlayer].delta_source = l->path;
+		path_get(&layers[ofs->numlayer].delta_source);
+		layers[ofs->numlayer].delta_source_valid = true;
 		layers[ofs->numlayer].idx = ofs->numlayer;
 		layers[ofs->numlayer].fsid = fsid;
 		layers[ofs->numlayer].fs = &ofs->fs[fsid];

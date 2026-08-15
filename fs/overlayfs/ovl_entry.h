@@ -33,6 +33,9 @@ struct ovl_sb {
 struct ovl_layer {
 	/* ovl_free_fs() relies on @mnt being the first member! */
 	struct vfsmount *mnt;
+	/* Stable backing path, independent of the private mount clone. */
+	struct path delta_source;
+	bool delta_source_valid;
 	/* Trap in ovl inode cache */
 	struct inode *trap;
 	struct ovl_sb *fs;
@@ -60,7 +63,7 @@ struct ovl_entry {
  * unmount, so partial-build and retired teardown share one release path.
  *
  * ofs->fs and its anonymous devices are deliberately not represented here:
- * DeltaFS v1 only accepts layers from the active backing superblock and those
+ * DeltaFS v2 only accepts layers from the active backing superblock and those
  * objects remain owned by the overlay superblock.
  */
 struct ovl_delta_state {
@@ -126,8 +129,9 @@ struct ovl_fs {
 	bool no_shared_whiteout;
 	/* r/o snapshot of upperdir sb's only taken on volatile mounts */
 	errseq_t errseq;
-	/* DeltaFS v1 runtime state. */
+	/* DeltaFS v2 runtime state. */
 	u64 delta_generation;
+	/* Serializes target snapshots and view commits. */
 	struct mutex delta_lock;
 	struct list_head delta_retired;
 	/* Borrowed from the active upper private mount, or NULL if lower-only. */
@@ -198,7 +202,7 @@ static inline struct dentry *ovl_lowerdata_dentry(struct ovl_entry *oe)
 /* private information held for every overlayfs dentry */
 static inline unsigned long *OVL_E_FLAGS(struct dentry *dentry)
 {
-	return (unsigned long *) &dentry->d_fsdata;
+	return (unsigned long *)&dentry->d_fsdata;
 }
 
 struct ovl_inode {

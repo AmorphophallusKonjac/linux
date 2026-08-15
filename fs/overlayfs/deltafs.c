@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * DeltaFS v1 ioctl front-end, target state builder, and view commit.
+ * DeltaFS v2 ioctl front-end, target state builder, and view commit.
  *
  * A target view is fully built outside the active ovl_fs.  Commit then moves
  * every dynamic owner under a fixed lock order, retires the old view, and
@@ -25,11 +25,42 @@
 
 #include "overlayfs.h"
 
+struct ovl_delta_path {
+	struct path path;
+	struct inode *trap;
+};
+
 struct ovl_delta_paths {
-	struct path upper;
-	struct path work;
+	struct ovl_delta_path upper;
+	struct ovl_delta_path work;
 	unsigned int nr_lower;
-	struct path lower[];
+	struct ovl_delta_path lower[];
+};
+
+struct ovl_delta_request {
+	unsigned int cmd;
+	u64 expected_generation;
+	unsigned int keep_bottom;
+	unsigned int nr_lower;
+	int upper_fd;
+	int work_fd;
+	int lower_fds[DELTAFS_V2_MAX_LOWERS];
+};
+
+struct ovl_delta_snapshot_layer {
+	struct path source;
+	struct inode *trap;
+	bool source_valid;
+	bool has_xwhiteouts;
+};
+
+struct ovl_delta_snapshot {
+	struct ovl_layer *active_layers;
+	unsigned int current_numlayer;
+	unsigned int first_layer;
+	unsigned int nr_layers;
+	unsigned int target_numlower;
+	struct ovl_delta_snapshot_layer layers[];
 };
 
 struct ovl_delta_empty_ctx {
@@ -63,29 +94,105 @@ static __always_inline int ovl_deltafs_build_checkpoint(void)
 }
 #endif
 
-static int ovl_deltafs_validate_abi(const struct deltafs_ioc_switch_v1 *req)
+static int
+ovl_deltafs_validate_checkpoint_abi(const struct deltafs_ioc_checkpoint_v2 *req)
+{
+	if (req->size != sizeof(*req) ||
+	    req->version != DELTAFS_ABI_VERSION || req->flags ||
+	    memchr_inv(req->reserved, 0, sizeof(req->reserved)))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int
+ovl_deltafs_validate_restore_abi(const struct deltafs_ioc_restore_v2 *req)
 {
 	unsigned int i;
 
 	if (req->size != sizeof(*req) ||
 	    req->version != DELTAFS_ABI_VERSION || req->flags ||
-	    req->reserved0 || memchr_inv(req->reserved, 0, sizeof(req->reserved)))
+	    memchr_inv(req->reserved, 0, sizeof(req->reserved)))
 		return -EINVAL;
-	if (!req->nr_lower)
+	if (req->nr_fds < DELTAFS_V2_RESTORE_LOWER_BASE)
 		return -EINVAL;
-	if (req->nr_lower > DELTAFS_V1_MAX_LOWERS)
+	if (req->nr_fds > DELTAFS_V2_MAX_RESTORE_FDS)
 		return -E2BIG;
-	for (i = req->nr_lower; i < DELTAFS_V1_MAX_LOWERS; i++) {
-		if (req->lower_fds[i] != -1)
+	for (i = req->nr_fds; i < DELTAFS_V2_MAX_RESTORE_FDS; i++) {
+		if (req->fds[i] != -1)
 			return -EINVAL;
 	}
 
 	return 0;
 }
 
+static struct ovl_delta_request *
+ovl_deltafs_copy_request(unsigned int cmd, unsigned long arg)
+{
+	struct ovl_delta_request *req;
+	unsigned int i;
+	int err;
+
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return ERR_PTR(-ENOMEM);
+	req->cmd = cmd;
+
+	if (cmd == DELTAFS_IOC_CHECKPOINT) {
+		struct deltafs_ioc_checkpoint_v2 user_req;
+
+		if (copy_from_user(&user_req, (void __user *)arg,
+				   sizeof(user_req))) {
+			err = -EFAULT;
+			goto out_err;
+		}
+		err = ovl_deltafs_validate_checkpoint_abi(&user_req);
+		if (err)
+			goto out_err;
+		req->expected_generation = user_req.expected_generation;
+		req->upper_fd = user_req.upper_fd;
+		req->work_fd = user_req.work_fd;
+		return req;
+	}
+
+	if (cmd == DELTAFS_IOC_RESTORE) {
+		struct deltafs_ioc_restore_v2 *user_req;
+
+		user_req = memdup_user((void __user *)arg, sizeof(*user_req));
+		if (IS_ERR(user_req)) {
+			err = PTR_ERR(user_req);
+			goto out_err;
+		}
+		err = ovl_deltafs_validate_restore_abi(user_req);
+		if (err)
+			goto out_restore;
+		req->expected_generation = user_req->expected_generation;
+		req->keep_bottom = user_req->keep_bottom;
+		req->nr_lower = user_req->nr_fds -
+				DELTAFS_V2_RESTORE_LOWER_BASE;
+		req->upper_fd = user_req->fds[DELTAFS_V2_RESTORE_UPPER_FD];
+		req->work_fd = user_req->fds[DELTAFS_V2_RESTORE_WORK_FD];
+		for (i = 0; i < req->nr_lower; i++)
+			req->lower_fds[i] =
+				user_req->fds[DELTAFS_V2_RESTORE_LOWER_BASE + i];
+		kfree(user_req);
+		return req;
+
+out_restore:
+		kfree(user_req);
+		goto out_err;
+	}
+
+	err = -ENOIOCTLCMD;
+out_err:
+	kfree(req);
+	return ERR_PTR(err);
+}
+
 static int ovl_deltafs_validate_generation(struct ovl_fs *ofs,
 					   u64 expected_generation)
 {
+	/* Pairs with the release-store after a successful commit. */
 	u64 generation = smp_load_acquire(&ofs->delta_generation);
 
 	if (expected_generation != generation)
@@ -122,19 +229,21 @@ static void ovl_deltafs_put_paths(struct ovl_delta_paths *paths)
 
 	if (!paths)
 		return;
-	if (paths->upper.dentry)
-		path_put(&paths->upper);
-	if (paths->work.dentry)
-		path_put(&paths->work);
+	iput(paths->upper.trap);
+	if (paths->upper.path.dentry)
+		path_put(&paths->upper.path);
+	if (paths->work.path.dentry)
+		path_put(&paths->work.path);
 	for (i = 0; i < paths->nr_lower; i++) {
-		if (paths->lower[i].dentry)
-			path_put(&paths->lower[i]);
+		iput(paths->lower[i].trap);
+		if (paths->lower[i].path.dentry)
+			path_put(&paths->lower[i].path);
 	}
 	kfree(paths);
 }
 
 static struct ovl_delta_paths *
-ovl_deltafs_get_paths(const struct deltafs_ioc_switch_v1 *req)
+ovl_deltafs_get_paths(const struct ovl_delta_request *req)
 {
 	struct ovl_delta_paths *paths;
 	unsigned int i;
@@ -145,14 +254,24 @@ ovl_deltafs_get_paths(const struct deltafs_ioc_switch_v1 *req)
 		return ERR_PTR(-ENOMEM);
 	paths->nr_lower = req->nr_lower;
 
-	err = ovl_deltafs_get_path(req->upper_fd, &paths->upper);
+	err = ovl_deltafs_get_path(req->upper_fd, &paths->upper.path);
 	if (err)
 		goto out_err;
-	err = ovl_deltafs_get_path(req->work_fd, &paths->work);
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		goto out_err;
+	err = ovl_deltafs_get_path(req->work_fd, &paths->work.path);
+	if (err)
+		goto out_err;
+	err = ovl_deltafs_build_checkpoint();
 	if (err)
 		goto out_err;
 	for (i = 0; i < req->nr_lower; i++) {
-		err = ovl_deltafs_get_path(req->lower_fds[i], &paths->lower[i]);
+		err = ovl_deltafs_get_path(req->lower_fds[i],
+					   &paths->lower[i].path);
+		if (err)
+			goto out_err;
+		err = ovl_deltafs_build_checkpoint();
 		if (err)
 			goto out_err;
 	}
@@ -165,38 +284,19 @@ out_err:
 }
 
 static const struct path *ovl_deltafs_path(const struct ovl_delta_paths *paths,
-					    unsigned int index)
+					   unsigned int index)
 {
 	if (!index)
-		return &paths->upper;
+		return &paths->upper.path;
 	if (index == 1)
-		return &paths->work;
-	return &paths->lower[index - 2];
+		return &paths->work.path;
+	return &paths->lower[index - 2].path;
 }
 
 static bool ovl_deltafs_same_root(const struct path *a, const struct path *b)
 {
 	return a->mnt->mnt_sb == b->mnt->mnt_sb &&
 	       d_inode(a->dentry) == d_inode(b->dentry);
-}
-
-static bool ovl_deltafs_overlaps(const struct path *a, const struct path *b)
-{
-	if (a->mnt->mnt_sb != b->mnt->mnt_sb)
-		return false;
-
-	return is_subdir(a->dentry, b->dentry) ||
-	       is_subdir(b->dentry, a->dentry);
-}
-
-static bool ovl_deltafs_overlaps_dentry(const struct path *path,
-					 struct dentry *dentry)
-{
-	if (!dentry || path->mnt->mnt_sb != dentry->d_sb)
-		return false;
-
-	return is_subdir(path->dentry, dentry) ||
-	       is_subdir(dentry, path->dentry);
 }
 
 static bool ovl_deltafs_empty_actor(struct dir_context *ctx, const char *name,
@@ -238,6 +338,8 @@ static int ovl_deltafs_check_empty(const struct path *path)
 static int ovl_deltafs_validate_features(struct super_block *sb,
 					 struct ovl_fs *ofs)
 {
+	unsigned int i;
+
 	if (!ofs->layers || !ofs->numlayer || !ovl_upper_mnt(ofs) ||
 	    !ofs->config.upperdir || !ofs->config.workdir ||
 	    !ofs->workbasedir || !ofs->workdir || !ofs->delta_backing_sb ||
@@ -254,6 +356,15 @@ static int ovl_deltafs_validate_features(struct super_block *sb,
 	    ofs->config.ovl_volatile || ofs->numdatalayer ||
 	    ofs->numfs != 1 || ofs->xino_mode != 0)
 		return -EOPNOTSUPP;
+	for (i = 0; i < ofs->numlayer; i++) {
+		const struct ovl_layer *layer = &ofs->layers[i];
+
+		if (!layer->delta_source_valid ||
+		    is_idmapped_mnt(layer->delta_source.mnt) ||
+		    layer->delta_source.mnt->mnt_sb->s_type == &ovl_fs_type ||
+		    layer->delta_source.mnt->mnt_sb != ofs->delta_backing_sb)
+			return -EOPNOTSUPP;
+	}
 
 	return 0;
 }
@@ -264,10 +375,10 @@ static int ovl_deltafs_validate_paths(struct ovl_fs *ofs,
 	unsigned int nr_paths = paths->nr_lower + 2;
 	unsigned int i, j;
 
-	if (paths->upper.mnt != paths->work.mnt)
+	if (paths->upper.path.mnt != paths->work.path.mnt)
 		return -EINVAL;
-	if (__mnt_is_readonly(paths->upper.mnt) ||
-	    __mnt_is_readonly(paths->work.mnt))
+	if (__mnt_is_readonly(paths->upper.path.mnt) ||
+	    __mnt_is_readonly(paths->work.path.mnt))
 		return -EROFS;
 
 	for (i = 0; i < nr_paths; i++) {
@@ -288,8 +399,7 @@ static int ovl_deltafs_validate_paths(struct ovl_fs *ofs,
 			const struct path *a = ovl_deltafs_path(paths, i);
 			const struct path *b = ovl_deltafs_path(paths, j);
 
-			if (ovl_deltafs_same_root(a, b) ||
-			    ovl_deltafs_overlaps(a, b))
+			if (ovl_deltafs_same_root(a, b))
 				return -EINVAL;
 		}
 	}
@@ -304,9 +414,9 @@ static int ovl_deltafs_validate_empty(struct super_block *sb,
 	int err;
 
 	old_cred = ovl_override_creds(sb);
-	err = ovl_deltafs_check_empty(&paths->upper);
+	err = ovl_deltafs_check_empty(&paths->upper.path);
 	if (!err)
-		err = ovl_deltafs_check_empty(&paths->work);
+		err = ovl_deltafs_check_empty(&paths->work.path);
 	revert_creds(old_cred);
 
 	return err;
@@ -356,8 +466,11 @@ static void ovl_deltafs_free_state(struct ovl_delta_state *state)
 
 	mounts = (struct vfsmount **)state->lowerdir_names;
 	for (i = 0; i < state->numlayer; i++) {
-		if (state->layers)
+		if (state->layers) {
 			iput(state->layers[i].trap);
+			if (state->layers[i].delta_source_valid)
+				path_put(&state->layers[i].delta_source);
+		}
 		if (state->lowerdir_names)
 			kfree(state->lowerdir_names[i]);
 		if (state->layers && state->layers[i].mnt) {
@@ -378,12 +491,13 @@ static void ovl_deltafs_free_state(struct ovl_delta_state *state)
 }
 
 static struct ovl_delta_state *
-ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
-			const struct ovl_delta_paths *paths)
+ovl_deltafs_alloc_state(const struct ovl_delta_request *req,
+			const struct ovl_delta_paths *paths,
+			unsigned int target_numlower)
 {
 	struct ovl_delta_state *state;
+	size_t name_size = sizeof(*state->lowerdir_names);
 	char *name;
-	unsigned int i;
 	int err;
 
 	state = kzalloc(sizeof(*state), GFP_KERNEL);
@@ -391,7 +505,7 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 		return ERR_PTR(-ENOMEM);
 	INIT_LIST_HEAD(&state->node);
 	state->generation = req->expected_generation + 1;
-	state->numlayer = req->nr_lower + 1;
+	state->numlayer = target_numlower + 1;
 
 	err = ovl_deltafs_build_checkpoint();
 	if (err)
@@ -407,8 +521,7 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 	if (err)
 		goto out_err;
 
-	state->lowerdir_names = kcalloc(state->numlayer,
-					 sizeof(*state->lowerdir_names), GFP_KERNEL);
+	state->lowerdir_names = kcalloc(state->numlayer, name_size, GFP_KERNEL);
 	if (!state->lowerdir_names) {
 		err = -ENOMEM;
 		goto out_err;
@@ -417,7 +530,7 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 	if (err)
 		goto out_err;
 
-	state->root_oe = ovl_alloc_entry(req->nr_lower);
+	state->root_oe = ovl_alloc_entry(target_numlower);
 	if (!state->root_oe) {
 		err = -ENOMEM;
 		goto out_err;
@@ -426,7 +539,7 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 	if (err)
 		goto out_err;
 
-	name = ovl_deltafs_path_name(&paths->upper);
+	name = ovl_deltafs_path_name(&paths->upper.path);
 	if (IS_ERR(name)) {
 		err = PTR_ERR(name);
 		goto out_err;
@@ -436,7 +549,7 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 	if (err)
 		goto out_err;
 
-	name = ovl_deltafs_path_name(&paths->work);
+	name = ovl_deltafs_path_name(&paths->work.path);
 	if (IS_ERR(name)) {
 		err = PTR_ERR(name);
 		goto out_err;
@@ -446,18 +559,6 @@ ovl_deltafs_alloc_state(const struct deltafs_ioc_switch_v1 *req,
 	if (err)
 		goto out_err;
 
-	for (i = 0; i < req->nr_lower; i++) {
-		name = ovl_deltafs_path_name(&paths->lower[i]);
-		if (IS_ERR(name)) {
-			err = PTR_ERR(name);
-			goto out_err;
-		}
-		state->lowerdir_names[i + 1] = name;
-		err = ovl_deltafs_build_checkpoint();
-		if (err)
-			goto out_err;
-	}
-
 	return state;
 
 out_err:
@@ -466,71 +567,28 @@ out_err:
 }
 
 static bool ovl_deltafs_path_matches_layer(const struct path *path,
-					    const struct ovl_layer *layer)
+					   const struct ovl_layer *layer)
 {
-	return layer->mnt && path->mnt->mnt_sb == layer->mnt->mnt_sb &&
-	       d_inode(path->dentry) == d_inode(layer->mnt->mnt_root);
+	return layer->delta_source_valid &&
+	       ovl_deltafs_same_root(path, &layer->delta_source);
 }
 
-static int ovl_deltafs_validate_command_locked(
-		struct ovl_fs *ofs, unsigned int cmd,
-		const struct deltafs_ioc_switch_v1 *req,
-		const struct ovl_delta_paths *paths)
+static void ovl_deltafs_free_snapshot(struct ovl_delta_snapshot *snapshot)
 {
 	unsigned int i;
 
-	if (cmd == DELTAFS_IOC_CHECKPOINT) {
-		if (req->nr_lower != ofs->numlayer)
-			return -EINVAL;
-		for (i = 0; i < req->nr_lower; i++) {
-			if (!ovl_deltafs_path_matches_layer(&paths->lower[i],
-							    &ofs->layers[i]))
-				return -EINVAL;
-		}
-	} else {
-		for (i = 0; i < req->nr_lower; i++) {
-			if (ovl_deltafs_path_matches_layer(&paths->lower[i],
-							   &ofs->layers[0]))
-				return -EINVAL;
-		}
+	if (!snapshot)
+		return;
+	for (i = 0; i < snapshot->nr_layers; i++) {
+		iput(snapshot->layers[i].trap);
+		if (snapshot->layers[i].source_valid)
+			path_put(&snapshot->layers[i].source);
 	}
-
-	return 0;
+	kfree(snapshot);
 }
 
-static int ovl_deltafs_validate_active_path_locked(
-		struct ovl_fs *ofs, const struct path *path)
-{
-	struct ovl_delta_state *retired;
-	unsigned int i;
-
-	for (i = 0; i < ofs->numlayer; i++) {
-		if (ofs->layers[i].mnt &&
-		    ovl_deltafs_overlaps_dentry(path,
-						   ofs->layers[i].mnt->mnt_root))
-			return -EINVAL;
-	}
-	if (ovl_deltafs_overlaps_dentry(path, ofs->workbasedir) ||
-	    ovl_deltafs_overlaps_dentry(path, ofs->workdir))
-		return -EINVAL;
-
-	list_for_each_entry(retired, &ofs->delta_retired, node) {
-		for (i = 0; i < retired->numlayer; i++) {
-			if (retired->layers[i].mnt &&
-			    ovl_deltafs_overlaps_dentry(
-				    path, retired->layers[i].mnt->mnt_root))
-				return -EINVAL;
-		}
-		if (ovl_deltafs_overlaps_dentry(path, retired->workbasedir) ||
-		    ovl_deltafs_overlaps_dentry(path, retired->workdir))
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
-static struct inode *ovl_deltafs_find_trap_locked(
-		struct ovl_fs *ofs, const struct path *path)
+static struct inode *ovl_deltafs_find_trap_locked(struct ovl_fs *ofs,
+						  const struct path *path)
 {
 	struct ovl_delta_state *retired;
 	struct inode *trap;
@@ -556,26 +614,25 @@ static struct inode *ovl_deltafs_find_trap_locked(
 	return NULL;
 }
 
-static int ovl_deltafs_get_layer_traps_locked(
-		struct super_block *sb, struct ovl_fs *ofs,
-		const struct ovl_delta_paths *paths,
-		struct ovl_delta_state *state)
+static int ovl_deltafs_get_layer_traps_locked(struct super_block *sb,
+					      struct ovl_fs *ofs,
+					      struct ovl_delta_paths *paths)
 {
-	const struct path *path;
+	struct ovl_delta_path *input;
 	struct inode *trap;
 	unsigned int i;
 	int err;
 
-	for (i = 0; i < state->numlayer; i++) {
-		path = !i ? &paths->upper : &paths->lower[i - 1];
-		trap = ovl_deltafs_find_trap_locked(ofs, path);
+	for (i = 0; i <= paths->nr_lower; i++) {
+		input = !i ? &paths->upper : &paths->lower[i - 1];
+		trap = ovl_deltafs_find_trap_locked(ofs, &input->path);
 		if (!trap)
-			trap = ovl_get_trap_inode(sb, path->dentry);
+			trap = ovl_get_trap_inode(sb, input->path.dentry);
 		if (IS_ERR(trap)) {
 			err = PTR_ERR(trap);
 			return err == -ELOOP ? -EINVAL : err;
 		}
-		state->layers[i].trap = trap;
+		input->trap = trap;
 		err = ovl_deltafs_build_checkpoint();
 		if (err)
 			return err;
@@ -584,14 +641,19 @@ static int ovl_deltafs_get_layer_traps_locked(
 	return 0;
 }
 
-static int ovl_deltafs_prepare_locked(
-		struct file *file, unsigned int cmd,
-		const struct deltafs_ioc_switch_v1 *req,
-		const struct ovl_delta_paths *paths,
-		struct ovl_delta_state *state)
+static int ovl_deltafs_prepare_locked(struct file *file,
+				      const struct ovl_delta_request *req,
+				      struct ovl_delta_paths *paths,
+				      struct ovl_delta_snapshot **snapshotp)
 {
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct ovl_fs *ofs = OVL_FS(sb);
+	struct ovl_delta_snapshot *snapshot;
+	unsigned int current_numlower;
+	unsigned int first_layer;
+	unsigned int nr_layers;
+	unsigned int target_numlower;
+	unsigned int i;
 	int err;
 
 	err = ovl_deltafs_validate_generation(ofs, req->expected_generation);
@@ -602,51 +664,171 @@ static int ovl_deltafs_prepare_locked(
 	err = ovl_deltafs_validate_features(sb, ofs);
 	if (err)
 		return err;
-	err = ovl_deltafs_validate_active_path_locked(ofs, &paths->upper);
-	if (err)
-		return err;
-	err = ovl_deltafs_validate_active_path_locked(ofs, &paths->work);
-	if (err)
-		return err;
-	err = ovl_deltafs_validate_command_locked(ofs, cmd, req, paths);
-	if (err)
-		return err;
 
-	return ovl_deltafs_get_layer_traps_locked(sb, ofs, paths, state);
+	current_numlower = ofs->numlayer - 1;
+	if (req->cmd == DELTAFS_IOC_CHECKPOINT) {
+		if (current_numlower >= DELTAFS_V2_MAX_LOWERS)
+			return -E2BIG;
+		first_layer = 0;
+		nr_layers = ofs->numlayer;
+		target_numlower = current_numlower + 1;
+	} else {
+		if (req->keep_bottom > current_numlower)
+			return -EINVAL;
+		if (!req->nr_lower && !req->keep_bottom)
+			return -EINVAL;
+		if (req->nr_lower >
+		    DELTAFS_V2_MAX_LOWERS - req->keep_bottom)
+			return -E2BIG;
+		first_layer = ofs->numlayer - req->keep_bottom;
+		nr_layers = req->keep_bottom;
+		target_numlower = req->nr_lower + req->keep_bottom;
+	}
+
+	snapshot = kzalloc(struct_size(snapshot, layers, nr_layers), GFP_KERNEL);
+	if (!snapshot)
+		return -ENOMEM;
+	snapshot->active_layers = ofs->layers;
+	snapshot->current_numlayer = ofs->numlayer;
+	snapshot->first_layer = first_layer;
+	snapshot->nr_layers = nr_layers;
+	snapshot->target_numlower = target_numlower;
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		goto out_err;
+
+	for (i = 0; i < nr_layers; i++) {
+		const struct ovl_layer *layer = &ofs->layers[first_layer + i];
+		struct ovl_delta_snapshot_layer *input = &snapshot->layers[i];
+
+		if (!layer->delta_source_valid) {
+			err = -EOPNOTSUPP;
+			goto out_err;
+		}
+		input->source = layer->delta_source;
+		path_get(&input->source);
+		input->source_valid = true;
+		input->has_xwhiteouts = layer->has_xwhiteouts;
+		err = ovl_deltafs_build_checkpoint();
+		if (err)
+			goto out_err;
+
+		input->trap = igrab(layer->trap);
+		if (!input->trap) {
+			err = -ESTALE;
+			goto out_err;
+		}
+		err = ovl_deltafs_build_checkpoint();
+		if (err)
+			goto out_err;
+	}
+
+	err = ovl_deltafs_get_layer_traps_locked(sb, ofs, paths);
+	if (err)
+		goto out_err;
+
+	*snapshotp = snapshot;
+	return 0;
+
+out_err:
+	ovl_deltafs_free_snapshot(snapshot);
+	return err;
 }
 
-static int ovl_deltafs_build_layers(struct ovl_fs *ofs,
-				    const struct ovl_delta_paths *paths,
-				    struct ovl_delta_state *state)
+static int ovl_deltafs_build_layer(struct ovl_fs *ofs,
+				   struct ovl_delta_state *state,
+				   unsigned int index,
+				   const struct path *source,
+				   struct inode *source_trap,
+				   bool has_xwhiteouts)
 {
-	const struct path *path;
-	struct ovl_layer *layer;
+	struct ovl_layer *layer = &state->layers[index];
 	struct vfsmount *mnt;
-	unsigned int i;
+	char *name;
 	int err;
 
-	for (i = 0; i < state->numlayer; i++) {
-		path = !i ? &paths->upper : &paths->lower[i - 1];
-		layer = &state->layers[i];
-		mnt = clone_private_mount(path);
-		if (IS_ERR(mnt))
-			return PTR_ERR(mnt);
+	mnt = clone_private_mount(source);
+	if (IS_ERR(mnt))
+		return PTR_ERR(mnt);
+	if (!index)
+		mnt->mnt_flags &= ~(MNT_NOATIME | MNT_NODIRATIME | MNT_RELATIME);
+	else
+		mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
+	layer->mnt = mnt;
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		return err;
 
-		if (!i)
-			mnt->mnt_flags &= ~(MNT_NOATIME | MNT_NODIRATIME |
-					    MNT_RELATIME);
-		else
-			mnt->mnt_flags |= MNT_READONLY | MNT_NOATIME;
+	layer->delta_source = *source;
+	path_get(&layer->delta_source);
+	layer->delta_source_valid = true;
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		return err;
 
-		layer->mnt = mnt;
-		layer->idx = i;
-		layer->fsid = 0;
-		layer->fs = &ofs->fs[0];
+	if (WARN_ON_ONCE(!source_trap))
+		return -ESTALE;
+	layer->trap = igrab(source_trap);
+	if (!layer->trap)
+		return -ESTALE;
+	err = ovl_deltafs_build_checkpoint();
+	if (err)
+		return err;
 
+	layer->idx = index;
+	layer->fsid = 0;
+	layer->fs = &ofs->fs[0];
+	layer->has_xwhiteouts = has_xwhiteouts;
+
+	if (index) {
+		name = ovl_deltafs_path_name(source);
+		if (IS_ERR(name))
+			return PTR_ERR(name);
+		state->lowerdir_names[index] = name;
 		err = ovl_deltafs_build_checkpoint();
 		if (err)
 			return err;
 	}
+
+	return 0;
+}
+
+static int ovl_deltafs_build_layers(struct ovl_fs *ofs,
+				    const struct ovl_delta_request *req,
+				    const struct ovl_delta_paths *paths,
+				    const struct ovl_delta_snapshot *snapshot,
+				    struct ovl_delta_state *state)
+{
+	unsigned int index = 0;
+	unsigned int i;
+	int err;
+
+	err = ovl_deltafs_build_layer(ofs, state, index++,
+				      &paths->upper.path, paths->upper.trap, false);
+	if (err)
+		return err;
+
+	if (req->cmd == DELTAFS_IOC_RESTORE) {
+		for (i = 0; i < paths->nr_lower; i++) {
+			err = ovl_deltafs_build_layer(ofs, state,
+						      index++, &paths->lower[i].path,
+						      paths->lower[i].trap, false);
+			if (err)
+				return err;
+		}
+	}
+
+	for (i = 0; i < snapshot->nr_layers; i++) {
+		const struct ovl_delta_snapshot_layer *input = &snapshot->layers[i];
+
+		err = ovl_deltafs_build_layer(ofs, state, index++, &input->source,
+					      input->trap, input->has_xwhiteouts);
+		if (err)
+			return err;
+	}
+
+	if (WARN_ON_ONCE(index != state->numlayer))
+		return -EINVAL;
 
 	if (!ovl_inuse_trylock(state->layers[0].mnt->mnt_root))
 		return -EBUSY;
@@ -690,7 +872,7 @@ static int ovl_deltafs_build_workdir(struct super_block *sb,
 	struct inode *trap;
 	int err;
 
-	state->workbasedir = dget(paths->work.dentry);
+	state->workbasedir = dget(paths->work.path.dentry);
 	err = ovl_deltafs_build_checkpoint();
 	if (err)
 		return err;
@@ -713,14 +895,16 @@ static int ovl_deltafs_build_workdir(struct super_block *sb,
 		return err;
 
 	ovl_deltafs_init_work_view(&view, ofs, state);
-	err = ovl_make_workdir(sb, &view, &paths->work, true);
+	err = ovl_make_workdir(sb, &view, &paths->work.path, true);
 	state->workdir = view.workdir;
 	state->workdir_trap = view.workdir_trap;
 	if (err)
 		return err;
 
-	/* These are superblock-static in DeltaFS v1.  A weaker result for the
-	 * new directory would make the active capability fields lie. */
+	/*
+	 * These are superblock-static in DeltaFS v2.  A weaker result for the
+	 * new directory would make the active capability fields lie.
+	 */
 	if (view.tmpfile != ofs->tmpfile || view.noxattr != ofs->noxattr ||
 	    view.nofh != ofs->nofh)
 		return -EOPNOTSUPP;
@@ -755,8 +939,10 @@ static int ovl_deltafs_build_root(struct ovl_fs *ofs,
 	state->root_impure =
 		ovl_get_dir_xattr_val(ofs, &path, OVL_XATTR_IMPURE) == 'y';
 
-	/* Match ovl_get_root(): the bottommost lower cannot contain xwhiteouts
-	 * that hide an even lower layer. */
+	/*
+	 * Match ovl_get_root(): the bottommost lower cannot contain xwhiteouts
+	 * that hide an even lower layer.
+	 */
 	for (i = 1; i + 1 < state->numlayer; i++) {
 		path.mnt = state->layers[i].mnt;
 		path.dentry = state->layers[i].mnt->mnt_root;
@@ -769,9 +955,10 @@ static int ovl_deltafs_build_root(struct ovl_fs *ofs,
 	return ovl_deltafs_build_checkpoint();
 }
 
-static int ovl_deltafs_build_state(struct file *file, unsigned int cmd,
-				   const struct deltafs_ioc_switch_v1 *req,
+static int ovl_deltafs_build_state(struct file *file,
+				   const struct ovl_delta_request *req,
 				   const struct ovl_delta_paths *paths,
+				   const struct ovl_delta_snapshot *snapshot,
 				   struct ovl_delta_state **statep)
 {
 	struct super_block *sb = file_inode(file)->i_sb;
@@ -780,17 +967,11 @@ static int ovl_deltafs_build_state(struct file *file, unsigned int cmd,
 	const struct cred *old_cred;
 	int err;
 
-	state = ovl_deltafs_alloc_state(req, paths);
+	state = ovl_deltafs_alloc_state(req, paths, snapshot->target_numlower);
 	if (IS_ERR(state))
 		return PTR_ERR(state);
 
-	mutex_lock(&ofs->delta_lock);
-	err = ovl_deltafs_prepare_locked(file, cmd, req, paths, state);
-	mutex_unlock(&ofs->delta_lock);
-	if (err)
-		goto out_err;
-
-	err = ovl_deltafs_build_layers(ofs, paths, state);
+	err = ovl_deltafs_build_layers(ofs, req, paths, snapshot, state);
 	if (err)
 		goto out_err;
 
@@ -810,13 +991,14 @@ out_err:
 	return err;
 }
 
-static int ovl_deltafs_final_revalidate_locked(
-		struct file *file, unsigned int cmd,
-		const struct deltafs_ioc_switch_v1 *req,
-		const struct ovl_delta_paths *paths)
+static int
+ovl_deltafs_final_revalidate_locked(struct file *file,
+				    const struct ovl_delta_request *req,
+				    const struct ovl_delta_snapshot *snapshot)
 {
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct ovl_fs *ofs = OVL_FS(sb);
+	unsigned int i;
 	int err;
 
 	err = ovl_deltafs_validate_generation(ofs, req->expected_generation);
@@ -824,8 +1006,31 @@ static int ovl_deltafs_final_revalidate_locked(
 		return err;
 	if (file_dentry(file) != sb->s_root)
 		return -ENOTTY;
+	if (ofs->layers != snapshot->active_layers ||
+	    ofs->numlayer != snapshot->current_numlayer)
+		return -ESTALE;
+	for (i = 0; i < snapshot->nr_layers; i++) {
+		const struct ovl_layer *layer =
+			&ofs->layers[snapshot->first_layer + i];
+		const struct path *source = &snapshot->layers[i].source;
 
-	return ovl_deltafs_validate_command_locked(ofs, cmd, req, paths);
+		if (layer->trap != snapshot->layers[i].trap)
+			return -ESTALE;
+		if (!ovl_deltafs_path_matches_layer(source, layer))
+			return -ESTALE;
+	}
+
+	if (req->cmd == DELTAFS_IOC_CHECKPOINT) {
+		if (snapshot->first_layer ||
+		    snapshot->nr_layers != ofs->numlayer)
+			return -ESTALE;
+	} else if (req->keep_bottom > ofs->numlayer - 1 ||
+		   snapshot->first_layer != ofs->numlayer - req->keep_bottom ||
+		   snapshot->nr_layers != req->keep_bottom) {
+		return -ESTALE;
+	}
+
+	return 0;
 }
 
 static void ovl_deltafs_update_root_locked(struct super_block *sb,
@@ -954,10 +1159,11 @@ static void ovl_deltafs_commit_locked(struct super_block *sb,
 
 long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-	struct deltafs_ioc_switch_v1 *req;
+	struct ovl_delta_request *req;
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct ovl_delta_state *state = NULL;
 	struct ovl_delta_state *old = NULL;
+	struct ovl_delta_snapshot *snapshot = NULL;
 	struct ovl_delta_paths *paths;
 	struct ovl_fs *ofs = OVL_FS(sb);
 	int err;
@@ -975,18 +1181,9 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
-	/* The request struct is ~600 bytes; keep it off the ioctl stack frame. */
-	req = kzalloc(sizeof(*req), GFP_KERNEL);
-	if (!req)
-		return -ENOMEM;
-	if (copy_from_user(req, (void __user *)arg, sizeof(*req))) {
-		err = -EFAULT;
-		goto out_req;
-	}
-
-	err = ovl_deltafs_validate_abi(req);
-	if (err)
-		goto out_req;
+	req = ovl_deltafs_copy_request(cmd, arg);
+	if (IS_ERR(req))
+		return PTR_ERR(req);
 
 	mutex_lock(&ofs->delta_lock);
 	err = ovl_deltafs_validate_generation(ofs, req->expected_generation);
@@ -1015,9 +1212,15 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (err)
 		goto out_paths;
 
-	err = ovl_deltafs_build_state(file, cmd, req, paths, &state);
+	mutex_lock(&ofs->delta_lock);
+	err = ovl_deltafs_prepare_locked(file, req, paths, &snapshot);
+	mutex_unlock(&ofs->delta_lock);
 	if (err)
 		goto out_paths;
+
+	err = ovl_deltafs_build_state(file, req, paths, snapshot, &state);
+	if (err)
+		goto out_snapshot;
 
 	old = kzalloc(sizeof(*old), GFP_KERNEL);
 	if (!old) {
@@ -1030,7 +1233,7 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		goto out_state;
 
 	mutex_lock(&ofs->delta_lock);
-	err = ovl_deltafs_final_revalidate_locked(file, cmd, req, paths);
+	err = ovl_deltafs_final_revalidate_locked(file, req, snapshot);
 	if (!err)
 		ovl_deltafs_commit_locked(sb, state, old);
 	mutex_unlock(&ofs->delta_lock);
@@ -1044,6 +1247,8 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 out_state:
 	ovl_deltafs_free_state(old);
 	ovl_deltafs_free_state(state);
+out_snapshot:
+	ovl_deltafs_free_snapshot(snapshot);
 out_paths:
 	ovl_deltafs_put_paths(paths);
 out_req:

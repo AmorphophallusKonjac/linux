@@ -762,6 +762,8 @@ void ovl_free_fs(struct ovl_fs *ofs)
 	mounts = (struct vfsmount **) ofs->config.lowerdirs;
 	for (i = 0; i < ofs->numlayer; i++) {
 		iput(ofs->layers[i].trap);
+		if (ofs->layers[i].delta_source_valid)
+			path_put(&ofs->layers[i].delta_source);
 		kfree(ofs->config.lowerdirs[i]);
 		mounts[i] = ofs->layers[i].mnt;
 	}
