@@ -3,7 +3,7 @@
 本文只验收 v2 工作包一：checkpoint/restore UABI、kernel target builder、layer
 source-path 生命周期和 native ioctl helper。format-2 controller、自动化 guest
 acceptance、E2/E3 更新属于后续工作包；旧 v1 P1-P7 binary 使用已删除的 v1 request，
-不能作为 v2 结果运行或引用。
+已经从当前工具树删除，不能作为 v2 结果运行或引用。
 
 ## 1. Host 静态构建
 
@@ -38,7 +38,7 @@ do
   scripts/checkpatch.pl --no-tree --strict --file "$f"
 done
 rg -n "call_rcu|kfree_rcu|rcu_assign_pointer|synchronize_rcu" fs/overlayfs/
-make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
 ```
 
 `super.c` 和 `params.c` 是 upstream 6.8 文件，整文件 strict checkpatch 存在与本次

@@ -58,8 +58,8 @@ cmd_module() {
 }
 
 cmd_tools() {
-	echo "==> make -C tools/deltafs all p7-tools"
-	make -C "$KROOT/tools/deltafs" all p7-tools
+	echo "==> make -C tools/deltafs v2-tools"
+	make -C "$KROOT/tools/deltafs" v2-tools
 }
 
 cmd_status() {

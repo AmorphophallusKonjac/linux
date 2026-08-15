@@ -1,5 +1,8 @@
 # DeltaFS v1 详细设计
 
+> 历史文档：v1 UAPI 测试 helper 和 P5--P7 harness 已从当前工具树删除。本文中的旧
+> 测试命令只记录当时的设计与验收过程，不适用于当前 v2 工作树。
+
 > 状态：设计定稿，P1--P6 代码与 QEMU/KVM 运行时验收已完成；P7 验收
 > harness 已实现，运行结论必须由 QEMU/KVM debug guest 产生
 >

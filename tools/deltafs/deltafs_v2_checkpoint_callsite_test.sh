@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0
 #
-# Static P7 regression gate: ownership checkpoints must match the build mode
+# Static DeltaFS v2 gate: ownership checkpoints must match the build mode
 # after optimization (all retained for debug injection, none for production).
 
 set -Eeuo pipefail

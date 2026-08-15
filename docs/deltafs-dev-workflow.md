@@ -18,7 +18,7 @@
 # host
 ./tools/deltafs/dev/host-build.sh module
 #   = make -j$(nproc) M=fs/overlayfs modules
-#   + make -C tools/deltafs all p7-tools（UAPI 头变更自动触发 headers_install）
+#   + make -C tools/deltafs v2-tools（UAPI 头变更自动触发 headers_install）
 
 # guest（root）
 bash /mnt/host/tools/deltafs/dev/guest-reload.sh

@@ -1,7 +1,9 @@
-# DeltaFS v1 E3 copy-up benchmark detailed design
+# DeltaFS E3 copy-up benchmark detailed design
 
 > E3 measures one OverlayFS copy-up edit. It is independent of the E2 switch
 > ioctl benchmark and does not use `deltafsctl` or any DeltaFS switch request.
+> Its event schema remains version 1, but that schema is independent of the
+> DeltaFS kernel UAPI. Current functional prerequisites use only v2 tests.
 >
 > Without the authors' SWE-Search event corpus, the fixed synthetic preset is a
 > method reproduction. Its output must not be described as an exact Fig. 9
@@ -396,14 +398,10 @@ separate GCC `-fanalyzer` compile is also used during implementation. This
 environment must not load the module or mount OverlayFS, and no host result may
 be presented as functional, copy-up, or physical-I/O verification.
 
-2026-08-13 this worktree passed the complete static gate: all existing
-userspace tools plus E2/E3 helpers compiled and linked with warnings as errors;
-E2's C fixture and 14 Python tests passed; E3's three C fixtures and 19 Python
-tests passed; Python byte compilation, GCC `-fanalyzer`, every
-`tools/deltafs/*.sh` syntax check, `git diff --check`, and sparse for all
-OverlayFS sources passed. No module was loaded and no OverlayFS mount or real
-block-stat measurement was run here. Functional and physical-I/O claims remain
-pending the QEMU procedure below.
+The host gate covers v2 userspace tools and E3 only. The legacy E2 helper uses
+the removed v1 switch request and is not an E3 prerequisite. No module is loaded
+and no OverlayFS mount or real block-stat measurement is run by this gate;
+functional and physical-I/O claims remain subject to the QEMU procedure below.
 
 ## 11. QEMU/KVM functional handoff
 
@@ -415,15 +413,15 @@ the current worktree kernel.
 From the repository root:
 
     make -j"$(nproc)" bzImage modules
-    make -C tools/deltafs clean all
-    make -C tools/deltafs p7-tools e2-bench e3-bench
+    make -C tools/deltafs clean v2-tools e3-bench
+    make -C tools/deltafs check-v2-layout test-v2-controller
+    make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
 
 Expected files include:
 
     arch/x86/boot/bzImage
     fs/overlayfs/overlay.ko
     tools/deltafs/deltafsctl
-    tools/deltafs/bench/e2/switch_once
     tools/deltafs/bench/e3/copyup_bench
 
 ### 11.2 Prepare dedicated images and boot
@@ -457,7 +455,7 @@ Boot with the worktree kernel and the three images:
 The examples below assume the guest names the data disks `/dev/vdb`,
 `/dev/vdc`, and `/dev/vdd`; verify with `lsblk -f` before mounting.
 
-### 11.3 Guest setup and P1--P7 acceptance gate
+### 11.3 Guest setup and v2 acceptance gate
 
     mkdir -p /mnt/host /mnt/e3/{ext4,xfs-noreflink,xfs-reflink,results}
     mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
@@ -477,36 +475,25 @@ The examples below assume the guest names the data disks `/dev/vdb`,
     modprobe -r overlay 2>/dev/null || true
     modprobe overlay
     cd /mnt/host
-    make -C tools/deltafs p7-tools e2-bench e3-bench
+    make -C tools/deltafs v2-tools e3-bench
 
-Use two dedicated roots to run the existing final P1--P7 gate before E3:
+Use two dedicated roots on different filesystems to run the v2 gate before E3:
 
-    make -C tools/deltafs test-p6-controller
-    tools/deltafs/p5_commit_test.sh \
-      --backing-root /mnt/e3/xfs-reflink/p5
-    tools/deltafs/p5_checkpoint_test.sh \
-      --backing-root /mnt/e3/xfs-reflink/p5
-    tools/deltafs/p6_controller_test.sh \
-      --backing-root /mnt/e3/xfs-reflink/p6
-
-    mkdir -p /mnt/e3/xfs-reflink/p7-main /mnt/e3/xfs-noreflink/p7-extra
-    tools/deltafs/p7_acceptance_test.sh \
-      --backing-root /mnt/e3/xfs-reflink/p7-main \
-      --extra-backing-root /mnt/e3/xfs-noreflink/p7-extra
-
-The P7 script prints and preserves its result directory. Remove only its empty
-temporary backing directories after copying or retaining those results; do not
-blindly `rmdir` the paths above.
+    make -C tools/deltafs test-v2-controller
+    mkdir -p /mnt/e3/xfs-reflink/v2-main /mnt/e3/xfs-noreflink/v2-extra
+    tools/deltafs/deltafs_v2_acceptance_test.sh \
+      --backing-root /mnt/e3/xfs-reflink/v2-main \
+      --extra-backing-root /mnt/e3/xfs-noreflink/v2-extra
 
 Expected final line:
 
-    All P7 DeltaFS v1 acceptance checks passed
+    All DeltaFS v2 acceptance checks passed
 
-There are no current standalone P1--P4 scripts; those names refer to historical
-development phases. Expected output is controller unit PASS, both P5 suites
-PASS, P6 suite PASS, then the P7 line above. The saved P7 result must show
-sections 1--8 PASS and deep fault injection
-`N >= 128`. Do not continue to E3 after a skipped or failed acceptance run.
+The acceptance harness preserves its result directory under `v2-main`. A debug
+guest must report the target-depth, `keep_bottom`, fault-injection, teardown,
+sanitizer, and kmemleak checks as `PASS`. Exit code 4 means capability-dependent
+checks were skipped and is not a complete acceptance result. Do not continue to
+E3 after a skipped or failed v2 acceptance run.
 
 ### 11.4 E3 smoke
 

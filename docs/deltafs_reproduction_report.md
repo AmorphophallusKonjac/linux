@@ -605,39 +605,35 @@ index=off,nfs_export=off,metacopy=off,xino=off,redirect_dir=nofollow \
 
 验收：故障点重启后只出现 old 或 new committed view，不出现混合层栈；GC 不删除在用 layer；1000+ switch 和 fsstress 后无泄漏/UAF/deadlock。
 
-### P7：v1 最终验收与 QEMU/KVM 交接
+### P7：现行 v2 最终验收与 QEMU/KVM 交接
 
 宿主机在仓库根目录完成静态构建和注入点检查：
 
 ```bash
 make -j"$(nproc)" bzImage modules
-make -C tools/deltafs p7-tools
-make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=enabled
+make M=fs/overlayfs W=1
+make C=2 CHECK=sparse M=fs/overlayfs
+make -C tools/deltafs clean v2-tools
+make -C tools/deltafs check-v2-layout
+make -C tools/deltafs test-v2-controller
+make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
 ```
 
-最后一条必须报告 `deltafs.o` 中的调用 relocation 数与源码静态调用点数相同
-（当前均为 18；其中循环调用点会按 layer 数动态执行）。数量不相等时，即使运行时
-harness 返回 0，也不能认定故障 unwind 覆盖成立。构建环境不加载模块，也不执行
-P7 功能测试。production 配置关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 时，helper
-退化为恒零内联函数；对该配置构建的对象应执行同一目标并传入
-`CHECKPOINT_MODE=disabled`，期望报告 0 个调用 relocation。
+`check-v2-checkpoints` 必须报告 `deltafs.o` 中的 ownership checkpoint relocation 与
+源码静态调用点完整匹配，或在 production 配置下全部被优化掉。构建环境不加载模块，
+也不执行运行态功能测试。production 配置关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 时可对
+对应对象显式运行：
 
 ```bash
-make -C tools/deltafs check-p7-checkpoints \
+make -C tools/deltafs check-v2-checkpoints \
     KERNEL_DELTAFS_OBJ=/absolute/production/build/fs/overlayfs/deltafs.o \
     CHECKPOINT_MODE=disabled
-# 期望：PASS: ... removes all 18 source ... call sites
+# 期望：PASS: ... removes all ... source ... call sites
 ```
 
-production 配置（关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 等）下也可运行 P7 总入口：
-基础前置（QEMU/KVM guest、无既有 overlay mount、模块化 overlay、overlay/module-unload
-/debugfs 配置、可写 `/dev/kmsg` 等）不满足时仍 fail closed；但缺少故障注入
-（`CONFIG_FUNCTION_ERROR_INJECTION` 或 `/sys/kernel/debug/fail_function`）、kmemleak
-或 sanitizer/lockdep/PROVE_RCU 时，harness 跳过依赖该能力的阶段（深层故障注入循环改用
-一次非注入 restore 顶替 switch 128、kmemleak 扫描跳过、sanitizer dmesg 覆盖减弱），
-非注入部分（P5/P6、native ABI 矩阵、8/32/64/128 层历史 restore、164 次 switch、
-unload 循环、documented limits）仍
-运行，并以 SKIP（退出码 4）结束。完整 unwind 证据仍需同源码的 debug guest P7 结果。
+v2 不再拆分 P1--P7 阶段 binary。旧 P5--P7 v1 helper 和 harness 已删除，运行态统一由
+`deltafs_v2_acceptance_test.sh` 覆盖 native ABI、checkpoint 派生、restore suffix/prefix、
+深度边界、故障注入、retired state teardown 和 module unload。
 
 使用项目现有的 x86_64 rootfs 和两个已格式化的独立数据盘启动 debug guest；以下
 变量替换为本机镜像绝对路径：
@@ -645,8 +641,8 @@ unload 循环、documented limits）仍
 ```bash
 KERNEL="$PWD/arch/x86/boot/bzImage"
 ROOTFS=/absolute/path/to/rootfs.qcow2
-DATA1=/absolute/path/to/p7-disk1.raw
-DATA2=/absolute/path/to/p7-disk2.raw
+DATA1=/absolute/path/to/deltafs-v2-data1.raw
+DATA2=/absolute/path/to/deltafs-v2-data2.raw
 
 qemu-system-x86_64 \
     -enable-kvm -cpu host -smp 4 -m 4096 -nographic \
@@ -659,51 +655,38 @@ qemu-system-x86_64 \
 ```
 
 若项目 rootfs 的根分区不是 `/dev/vda1`，只替换 `root=`；不得复用同一 backing
-superblock 充当两个 P7 数据盘。进入 guest 后安装本次构建的模块、挂载共享目录和
+superblock 充当两个 v2 数据盘。进入 guest 后安装本次构建的模块、挂载共享目录和
 两个数据盘：
 
 ```bash
-mkdir -p /mnt/host /mnt/deltafs-test/p7/disk1 /mnt/deltafs-test/p7/disk2
+mkdir -p /mnt/host /mnt/deltafs-v2/disk1 /mnt/deltafs-v2/disk2
 mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
-mount /dev/vdb /mnt/deltafs-test/p7/disk1
-mount /dev/vdc /mnt/deltafs-test/p7/disk2
+mount /dev/vdb /mnt/deltafs-v2/disk1
+mount /dev/vdc /mnt/deltafs-v2/disk2
 install -D -m 0644 /mnt/host/fs/overlayfs/overlay.ko \
     "/lib/modules/$(uname -r)/kernel/fs/overlayfs/overlay.ko"
 depmod -a
 cd /mnt/host
-make -C tools/deltafs p7-tools
-tools/deltafs/p7_acceptance_test.sh \
-    --backing-root /mnt/deltafs-test/p7/disk1 \
-    --extra-backing-root /mnt/deltafs-test/p7/disk2
+make -C tools/deltafs v2-tools
+mkdir -p /mnt/deltafs-v2/disk1/acceptance
+tools/deltafs/deltafs_v2_acceptance_test.sh \
+    --backing-root /mnt/deltafs-v2/disk1/acceptance \
+    --extra-backing-root /mnt/deltafs-v2/disk2
 ```
 
-成功标志必须同时包含 `All P7 DeltaFS v1 acceptance checks passed`、第 17 节八条
-`PASS`，并且 `deep fault injection exhausted after N injected checkpoints` 中
-`N >= 128`。结果保存在脚本打印的 `deltafs-p7-results-*` 目录。
-
-若 guest 缺少故障注入、kmemleak 或 sanitizer/lockdep/PROVE_RCU 能力，harness 改为以
-SKIP 结束：退出码为 4，终端打印若干 `SKIP:` 行，`section-17.tsv` 中条件 7 记为 `SKIP`
-（其余条件仍为 `PASS`），并打印
-`P7 DeltaFS v1 acceptance completed with skipped capability-dependent phases`，
-此时不会出现 `All P7 DeltaFS v1 acceptance checks passed` 与
-`deep fault injection exhausted after N injected checkpoints` 两行。能力齐全的 debug
-guest 才能取得上述完整成功标志。失败时收集：
+完整成功标志为 `All DeltaFS v2 acceptance checks passed`，并要求输出中的 target lower、
+`keep_bottom`、checkpoint derived chain、fault injection、module unload、sanitizer、
+kmemleak 和 retired teardown 项全部为 `PASS`。缺少依赖能力时脚本以退出码 4 和 `SKIP`
+结束，不算完整验收。失败时从脚本打印的结果目录收集：
 
 ```bash
-R=/mnt/deltafs-test/p7/disk1/deltafs-p7-results-YYYYMMDDTHHMMSSZ-PID
+R=/mnt/deltafs-v2/disk1/acceptance/v2-acceptance-YYYYMMDD-HHMMSS-PID
 cp -a "$R" /mnt/host/
-dmesg -T > /mnt/host/p7-dmesg-full.log
-findmnt -t overlay > /mnt/host/p7-overlay-mounts.log
+dmesg -T > /mnt/host/deltafs-v2-dmesg-full.log
+findmnt -J > /mnt/host/deltafs-v2-findmnt.json
 ```
 
-2026-08-11 用户确认的是旧 64-lower、100-switch 基线；原始结果目录未导入当前
-源码工作区。当前 128-lower、164-switch 成功条件仍需重新执行并归档，不能从旧确认
-推导新的 N 或日志内容。
-
-失败退出会在卸载 OverlayFS 后保留 `.deltafs-p7-run.*` 和另一数据盘上的
-`.deltafs-p7-extra.*`，终端会打印两个路径；连同结果目录一起保留后再分析。
-
-### P8：性能复现（P7 v1 验收后）
+### P8：性能复现（v2 总验收后）
 
 工作：
 

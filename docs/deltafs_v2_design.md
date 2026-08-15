@@ -635,6 +635,7 @@ make C=2 CHECK=sparse M=fs/overlayfs
 make -C tools/deltafs clean v2-tools
 make -C tools/deltafs test-v2-controller
 make -C tools/deltafs check-v2-layout
+make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
 for f in tools/deltafs/*.sh; do bash -n "$f"; done
 ```
 
@@ -644,11 +645,12 @@ layer-stack RCU pointer、callback 或 reclaim worker。本环境不加载 `over
 
 ### 12.2 测试入口
 
-v2 不拆分 P1 到 P7 阶段脚本。最终 HEAD 只维护三个入口：
+v2 不拆分 P1 到 P7 阶段脚本。旧 P5--P7 helper/harness 已删除；最终 HEAD 维护四个入口：
 
 | 入口 | 运行位置 | 主要证明 |
 |---|---|---|
 | `check-v2-layout` | host | 两种 request 的 size、offset 和 fd index |
+| `check-v2-checkpoints` | host | debug/production build 的 ownership fault-injection 调用点完整性 |
 | `test-v2-controller` | host/guest | format-2 parser、最长公共后缀和失败补偿 |
 | `deltafs_v2_acceptance_test.sh` | QEMU guest | kernel UABI、切换、cache、压力和 teardown |
 

@@ -1,9 +1,14 @@
 # DeltaFS v1 E2 switch bench 设计方案
 
+> 历史移植输入：本方案及当前 `tools/deltafs/bench/e2/` 使用已删除的 v1 switch UAPI，
+> 不能在 v2 上构建、运行或产生可引用结果。下文旧 P5--P7 和 E2 命令只记录 v1 实验
+> 契约，不是当前测试交接；完成 v2 request、generation probe 和指标 schema 移植前
+> 不得执行。
+
 > E2 只测 DeltaFS checkpoint/restore ioctl 的延迟和正确性。
 > backing filesystem 和磁盘镜像由 QEMU 环境提供；bench 不执行 `mkfs`。
 >
-> 适用版本：当前工作树 DeltaFS v1，UAPI lower 上限为 128。
+> 适用版本：历史 DeltaFS v1，UAPI lower 上限为 128。
 
 ## 1. 简化目标和边界
 

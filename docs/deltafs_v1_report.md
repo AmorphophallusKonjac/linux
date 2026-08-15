@@ -1,5 +1,8 @@
 # DeltaFS v1 实现汇报
 
+> 历史文档：v1 UAPI 测试 helper 和 P5--P7 harness 已从当前工具树删除。本文中的旧
+> 测试命令只记录当时的实现状态，不适用于当前 v2 工作树。
+
 > 用途：向导师汇报 DeltaFS v1 的实现进展、技术方案和验收安排。
 > 代码基线：Linux 6.8.0，分支 `deltafs/6.8`，当前提交
 > `d99dd3bfce6fba8b404595c1bba5ae9aadea33b0`（2026-08-11）。
