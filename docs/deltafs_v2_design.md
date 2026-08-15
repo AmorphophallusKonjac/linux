@@ -1,7 +1,6 @@
 # DeltaFS v2 设计与可行性评估
 
-> 状态：第一阶段代码与静态门禁完成，QEMU 运行证据待用户；controller 与总验收
-> 属于第二阶段
+> 状态：v2 第一至三阶段完成；静态门禁与 QEMU 总验收通过
 >
 > 基线：当前 DeltaFS v1，Linux 6.8.0 OverlayFS
 >
@@ -514,7 +513,7 @@ target container 可以直接释放而不会释放已安装 owner。
 
 ### 9.1 Manifest format
 
-建议将 `state.json` 和 `transaction.json` 的 `format` 升级为 2。full
+`state.json` 和 `transaction.json` 使用 `format` 2。full
 `active_lowers` 和 snapshot chain 仍保存完整路径；format bump 防止 v1 controller
 误用新 UABI。
 
@@ -670,17 +669,17 @@ acceptance harness 内部调用一个 native `deltafs_v2_ioctl_test` helper，�
 
 ## 13. QEMU/KVM 完整测试交接
 
-本节定义完整 v2 实现后的运行态 handoff。第一阶段已有 v2 layout 和 native ioctl
-binary；format-2 controller 与总 acceptance 尚未实现，不得把第一阶段或 v1 测试
-结果记录成完整 v2 通过。
+本节定义完整 v2 实现后的运行态 handoff。v2 layout、format-2 controller、native
+ioctl binary 和总 acceptance 已在源码树中提供。本开发环境执行的静态门禁与用户在
+QEMU debug guest 中执行的总验收均已通过（2026-08-15）。
 
 第一阶段的独立静态与 QEMU 交接见
-`docs/deltafs_v2_phase1_test.md`。该交接只判定 UABI、kernel builder、source-path
-生命周期和 native helper；在 format-2 controller 与总 acceptance 完成前，不得宣称
-整个 v2 已完成。
+`docs/deltafs_v2_phase1_test.md`。第二阶段总入口为
+`tools/deltafs/deltafs_v2_acceptance_test.sh`，它会额外执行 format-2 controller、
+最长公共后缀、lower 边界和 teardown 验收。
 
-guest 运行态由 `tools/deltafs/deltafs_v2_phase1_test.sh` 一键编排；用户无需逐条复制
-负向矩阵、checkpoint/restore 或 ownership fault-injection 命令。
+guest 运行态由 `tools/deltafs/deltafs_v2_acceptance_test.sh` 一键编排；用户无需逐条
+复制负向矩阵、checkpoint/restore 或 ownership fault-injection 命令。
 
 ### 13.1 Host 构建
 
@@ -792,6 +791,7 @@ sudo tools/deltafs/deltafs_v2_acceptance_test.sh \
 target_lower_128=PASS
 target_lower_129_e2big=PASS
 restore_keep_bottom_0=PASS
+restore_keep_bottom_1=PASS
 restore_keep_bottom_all=PASS
 checkpoint_derived_chain=PASS
 retired_state_teardown=PASS

@@ -1,0 +1,8 @@
+{
+  "format": 2,
+  "kernel_generation": 1,
+  "active_branch": "g1",
+  "active_lowers": ["base"],
+  "retired_branches": [],
+  "snapshots": {}
+}

@@ -12,7 +12,7 @@ all: v2-phase1-tools
 
 v2-phase1-tools: deltafs_v2_layout_test deltafs_v2_ioctl_test
 
-v2-tools: v2-phase1-tools
+v2-tools: v2-phase1-tools deltafsctl
 
 e2-bench:
 	$(MAKE) -C bench/e2 all
@@ -83,6 +83,17 @@ test-v2-phase1: v2-phase1-tools
 check-v2-layout: deltafs_v2_layout_test
 	./deltafs_v2_layout_test
 
+test-v2-controller: deltafsctl
+	./deltafs_v2_controller_test.sh
+
+test-v2-acceptance: v2-tools
+	@test -n "$(BACKING_ROOT)" || \
+		{ echo "BACKING_ROOT is required" >&2; exit 2; }
+	@test -n "$(EXTRA_BACKING_ROOT)" || \
+		{ echo "EXTRA_BACKING_ROOT is required" >&2; exit 2; }
+	./deltafs_v2_acceptance_test.sh --backing-root "$(BACKING_ROOT)" \
+		--extra-backing-root "$(EXTRA_BACKING_ROOT)"
+
 .PHONY: all v2-phase1-tools v2-tools e2-bench e3-bench clean \
 	test-p6-controller test-p7-schedule p7-tools check-p7-checkpoints test-p7 \
-	test-v2-phase1 check-v2-layout
+	test-v2-phase1 check-v2-layout test-v2-controller test-v2-acceptance

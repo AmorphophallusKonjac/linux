@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * DeltaFS v1 checkpoint/restore controller.
+ * DeltaFS v2 checkpoint/restore controller.
  *
  * The controller deliberately implements only the two runtime state
  * transitions exposed by the DeltaFS UAPI.  Sandbox creation, mounting and
@@ -28,7 +28,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define DELTAFSCTL_STATE_FORMAT		1
+#define DELTAFSCTL_STATE_FORMAT		2
 #define DELTAFSCTL_MAX_STATE_SIZE	(1024U * 1024U)
 #define DELTAFSCTL_MAX_SNAPSHOTS	1024U
 #define DELTAFSCTL_MAX_RETIRED		4096U
@@ -91,7 +91,7 @@ struct switch_fds {
 	int branch_fd;
 	int upper_fd;
 	int work_fd;
-	int lower_fds[DELTAFS_V1_MAX_LOWERS];
+	int lower_fds[DELTAFS_V2_MAX_LOWERS];
 	unsigned int nr_lower;
 };
 
@@ -591,7 +591,7 @@ static int json_snapshot(struct json_parser *parser, struct strvec *lowers)
 			}
 			seen_lowers = true;
 			if (json_string_array(parser, lowers,
-					      DELTAFS_V1_MAX_LOWERS))
+					      DELTAFS_V2_MAX_LOWERS))
 				goto out;
 		} else {
 			json_error(parser, "unknown snapshot field '%s'", key);
@@ -715,7 +715,7 @@ static struct controller_state *json_parse_state(const char *data, size_t len,
 			}
 			seen_active_lowers = true;
 			if (json_string_array(&parser, &state->active_lowers,
-					      DELTAFS_V1_MAX_LOWERS))
+					      DELTAFS_V2_MAX_LOWERS))
 				goto field_out;
 		} else if (!strcmp(key, "retired_branches")) {
 			if (seen_retired) {
@@ -830,9 +830,9 @@ static int validate_lower_chain(const struct strvec *lowers, const char *what)
 {
 	size_t i, j;
 
-	if (!lowers->nr || lowers->nr > DELTAFS_V1_MAX_LOWERS)
+	if (!lowers->nr || lowers->nr > DELTAFS_V2_MAX_LOWERS)
 		return state_semantic_error("%s lower count is outside [1, %u]",
-					    what, DELTAFS_V1_MAX_LOWERS);
+					    what, DELTAFS_V2_MAX_LOWERS);
 	if (strcmp(lowers->items[lowers->nr - 1], "base"))
 		return state_semantic_error("%s lower chain does not end in base",
 					    what);
@@ -1040,6 +1040,8 @@ static int serialize_transaction(enum operation operation,
 				 const char *new_branch,
 				 const char *snapshot_id,
 				 const struct strvec *target_lowers,
+				 const struct strvec *prefix_lowers,
+				 size_t keep_bottom,
 				 struct text *text)
 {
 	if (text_appendf(text,
@@ -1057,6 +1059,9 @@ static int serialize_transaction(enum operation operation,
 	    text_json_string(text, new_branch) ||
 	    text_append(text, ",\n  \"snapshot\": ") ||
 	    text_json_string(text, snapshot_id) ||
+	    text_appendf(text, ",\n  \"keep_bottom\": %zu,\n"
+			      "  \"new_lower_prefix\": ", keep_bottom) ||
+	    serialize_string_array(text, prefix_lowers, 2) ||
 	    text_append(text, ",\n  \"target_lowers\": ") ||
 	    serialize_string_array(text, target_lowers, 2) ||
 	    text_append(text, "\n}\n"))
@@ -1087,9 +1092,9 @@ static int build_target_lowers(enum operation operation,
 		errno = EEXIST;
 		return -1;
 	}
-	if (state->active_lowers.nr >= DELTAFS_V1_MAX_LOWERS) {
-		error_msg("checkpoint would exceed the %u-lower v1 limit",
-			  DELTAFS_V1_MAX_LOWERS);
+	if (state->active_lowers.nr >= DELTAFS_V2_MAX_LOWERS) {
+		error_msg("checkpoint would exceed the %u-lower v2 limit",
+			  DELTAFS_V2_MAX_LOWERS);
 		errno = E2BIG;
 		return -1;
 	}
@@ -1102,6 +1107,36 @@ static int build_target_lowers(enum operation operation,
 		return -1;
 	for (i = 0; i < state->active_lowers.nr; i++) {
 		if (strvec_push(target, state->active_lowers.items[i]))
+			return -1;
+	}
+	return 0;
+}
+
+/* Return the number of lower layers shared verbatim at the bottom. */
+static size_t longest_common_suffix(const struct strvec *active,
+				    const struct strvec *target)
+{
+	size_t shared = 0;
+
+	while (shared < active->nr && shared < target->nr &&
+	       !strcmp(active->items[active->nr - 1 - shared],
+		       target->items[target->nr - 1 - shared]))
+		shared++;
+	return shared;
+}
+
+static int build_restore_prefix(const struct strvec *target,
+				size_t keep_bottom, struct strvec *prefix)
+{
+	size_t i, nr_prefix;
+
+	if (keep_bottom > target->nr) {
+		errno = EINVAL;
+		return -1;
+	}
+	nr_prefix = target->nr - keep_bottom;
+	for (i = 0; i < nr_prefix; i++) {
+		if (strvec_push(prefix, target->items[i]))
 			return -1;
 	}
 	return 0;
@@ -1553,7 +1588,7 @@ static void switch_fds_init(struct switch_fds *fds)
 	fds->upper_fd = -1;
 	fds->work_fd = -1;
 	fds->nr_lower = 0;
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
+	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		fds->lower_fds[i] = -1;
 }
 
@@ -1561,7 +1596,7 @@ static void switch_fds_close(struct switch_fds *fds)
 {
 	unsigned int i;
 
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
+	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		close_preserve_errno(fds->lower_fds[i]);
 	close_preserve_errno(fds->work_fd);
 	close_preserve_errno(fds->upper_fd);
@@ -1678,12 +1713,28 @@ out:
 	return ret;
 }
 
-static int fill_request(struct deltafs_ioc_switch_v1 *request,
-			const struct switch_fds *fds, uint64_t generation)
+static void fill_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *request,
+				    const struct switch_fds *fds,
+				    uint64_t generation)
+{
+	memset(request, 0, sizeof(*request));
+	request->size = sizeof(*request);
+	request->version = DELTAFS_ABI_VERSION;
+	request->expected_generation = generation;
+	request->upper_fd = fds->upper_fd;
+	request->work_fd = fds->work_fd;
+}
+
+static int fill_restore_request(struct deltafs_ioc_restore_v2 *request,
+				const struct switch_fds *fds,
+				 uint64_t generation, size_t keep_bottom)
 {
 	unsigned int i;
 
-	if (!fds->nr_lower || fds->nr_lower > DELTAFS_V1_MAX_LOWERS) {
+	if (keep_bottom > UINT_MAX ||
+	    fds->nr_lower > DELTAFS_V2_MAX_LOWERS ||
+	    fds->nr_lower + keep_bottom > DELTAFS_V2_MAX_LOWERS ||
+	    fds->nr_lower + keep_bottom == 0) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -1691,13 +1742,15 @@ static int fill_request(struct deltafs_ioc_switch_v1 *request,
 	request->size = sizeof(*request);
 	request->version = DELTAFS_ABI_VERSION;
 	request->expected_generation = generation;
-	request->upper_fd = fds->upper_fd;
-	request->work_fd = fds->work_fd;
-	request->nr_lower = fds->nr_lower;
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
-		request->lower_fds[i] = -1;
+	request->keep_bottom = (unsigned int)keep_bottom;
+	request->nr_fds = DELTAFS_V2_RESTORE_LOWER_BASE + fds->nr_lower;
+	for (i = 0; i < DELTAFS_V2_MAX_RESTORE_FDS; i++)
+		request->fds[i] = -1;
+	request->fds[DELTAFS_V2_RESTORE_UPPER_FD] = fds->upper_fd;
+	request->fds[DELTAFS_V2_RESTORE_WORK_FD] = fds->work_fd;
 	for (i = 0; i < fds->nr_lower; i++)
-		request->lower_fds[i] = fds->lower_fds[i];
+		request->fds[DELTAFS_V2_RESTORE_LOWER_BASE + i] =
+			fds->lower_fds[i];
 	return 0;
 }
 
@@ -1755,12 +1808,14 @@ static bool test_failpoint(const char *name)
 static int run_operation(enum operation operation, const char *sandbox_root,
 			 const char *snapshot_id)
 {
-	struct deltafs_ioc_switch_v1 request;
+	struct deltafs_ioc_checkpoint_v2 checkpoint_request;
+	struct deltafs_ioc_restore_v2 restore_request;
 	struct controller_state *state = NULL;
 	struct controller_state *next_state = NULL;
 	struct controller controller;
 	struct switch_fds fds;
 	struct strvec target_lowers = { };
+	struct strvec prefix_lowers = { };
 	struct text state_text = { };
 	struct text transaction_text = { };
 	char new_branch[64];
@@ -1772,6 +1827,7 @@ static int run_operation(enum operation operation, const char *sandbox_root,
 	bool fresh_created = false;
 	bool renamed = false;
 	bool kernel_committed = false;
+	size_t keep_bottom = 0;
 	unsigned long command;
 
 	controller_init(&controller);
@@ -1796,6 +1852,15 @@ static int run_operation(enum operation operation, const char *sandbox_root,
 			error_errno("build target lower chain");
 		goto out;
 	}
+	if (operation == OP_RESTORE) {
+		keep_bottom = longest_common_suffix(&state->active_lowers,
+						    &target_lowers);
+		if (build_restore_prefix(&target_lowers, keep_bottom,
+					 &prefix_lowers)) {
+			error_msg("build restore lower prefix");
+			goto out;
+		}
+	}
 	if (validate_layout(&controller, state, operation, snapshot_id,
 			    new_branch, &target_lowers))
 		goto out;
@@ -1809,7 +1874,8 @@ static int run_operation(enum operation operation, const char *sandbox_root,
 	    serialize_state(next_state, &state_text) ||
 	    serialize_transaction(operation, state->generation,
 				  state->active_branch, new_branch, snapshot_id,
-				  &target_lowers, &transaction_text)) {
+				  &target_lowers, &prefix_lowers, keep_bottom,
+				  &transaction_text)) {
 		if (errno == ENOMEM)
 			error_errno("preallocate controller transaction");
 		goto out;
@@ -1858,12 +1924,16 @@ static int run_operation(enum operation operation, const char *sandbox_root,
 		}
 	}
 
-	if (open_switch_fds(&controller, new_branch, &target_lowers, &fds)) {
+	if (open_switch_fds(&controller, new_branch, &prefix_lowers, &fds)) {
 		primary_errno = errno;
 		error_errno("open switch paths");
 		goto rollback;
 	}
-	if (fill_request(&request, &fds, state->generation)) {
+	if (operation == OP_CHECKPOINT)
+		fill_checkpoint_request(&checkpoint_request, &fds,
+					state->generation);
+	else if (fill_restore_request(&restore_request, &fds,
+				      state->generation, keep_bottom)) {
 		primary_errno = errno;
 		goto rollback;
 	}
@@ -1876,9 +1946,11 @@ static int run_operation(enum operation operation, const char *sandbox_root,
 	}
 #endif
 
-	command = operation == OP_CHECKPOINT ?
-		  DELTAFS_IOC_CHECKPOINT : DELTAFS_IOC_RESTORE;
-	if (ioctl(controller.merged_fd, command, &request)) {
+	command = operation == OP_CHECKPOINT ? DELTAFS_IOC_CHECKPOINT :
+		DELTAFS_IOC_RESTORE;
+	if (ioctl(controller.merged_fd, command,
+		  operation == OP_CHECKPOINT ? (void *)&checkpoint_request :
+					       (void *)&restore_request)) {
 		primary_errno = errno;
 		error_errno("%s ioctl", operation_name(operation));
 		goto rollback;
@@ -1943,6 +2015,7 @@ out:
 	text_free(&transaction_text);
 	text_free(&state_text);
 	strvec_free(&target_lowers);
+	strvec_free(&prefix_lowers);
 	state_free(next_state);
 	state_free(state);
 	controller_close(&controller);
@@ -1957,7 +2030,7 @@ static void usage(FILE *stream)
 		"  %s --assume-quiesced restore    SANDBOX CHECKPOINT_ID\n"
 		"\n"
 		"SANDBOX must contain base, layers, branches, meta and the mounted\n"
-		"merged root.  --assume-quiesced is mandatory because DeltaFS v1\n"
+		"merged root.  --assume-quiesced is mandatory because DeltaFS v2\n"
 		"does not make open workload fds, mmap or concurrent writes safe.\n",
 		program_name, program_name);
 }
