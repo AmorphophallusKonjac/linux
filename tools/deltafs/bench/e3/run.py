@@ -24,6 +24,10 @@ import events
 
 
 SCHEMA = events.SCHEMA
+DELTAFS_ABI_VERSION = 2
+INITIAL_GENERATION = 1
+CHECKPOINT_GENERATION = 2
+COPYUP_SOURCE = "checkpoint_frozen_upper"
 MOUNT_FEATURES = (
     "index=off", "nfs_export=off", "metacopy=off", "xino=off",
     "uuid=off", "redirect_dir=nofollow",
@@ -340,6 +344,10 @@ def build_manifest(preset: str, run_index: int, event_path: pathlib.Path,
         "device_stat": str(device_arg.absolute()),
         "canonical_device_stat": str(device),
         "overlay_mount_options": list(MOUNT_FEATURES),
+        "deltafs_abi_version": DELTAFS_ABI_VERSION,
+        "initial_generation": INITIAL_GENERATION,
+        "checkpoint_generation": CHECKPOINT_GENERATION,
+        "copyup_source": COPYUP_SOURCE,
         "started_at": utc_now(),
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
         "warm_count_per_cell": configuration["warm"],
@@ -372,19 +380,22 @@ def sample_id(event: dict[str, Any], sample_number: int) -> str:
 
 
 def create_sample(sample_dir: pathlib.Path, event: dict[str, Any] | None) -> None:
-    (sample_dir / "lower").mkdir(parents=True)
-    (sample_dir / "upper").mkdir()
-    (sample_dir / "work").mkdir()
+    (sample_dir / "base").mkdir(parents=True)
+    (sample_dir / "generation-1" / "upper").mkdir(parents=True)
+    (sample_dir / "generation-1" / "work").mkdir()
+    (sample_dir / "generation-2" / "upper").mkdir(parents=True)
+    (sample_dir / "generation-2" / "work").mkdir()
+    (sample_dir / "layers").mkdir()
     (sample_dir / "merged").mkdir()
     if event is not None:
         before, _ = events.event_images(event)
-        target = sample_dir / "lower" / event["relative_path"]
+        target = sample_dir / "generation-1" / "upper" / event["relative_path"]
         target.write_bytes(before)
         target.chmod(0o644)
         with target.open("rb") as stream:
             os.fsync(stream.fileno())
         if sha256_file(target) != event["expected_before_sha256"]:
-            raise E3Error("generated lower preimage hash mismatch")
+            raise E3Error("generated generation-1 upper preimage hash mismatch")
     syncfs(sample_dir)
     device = sample_dir.stat().st_dev
     for path in sample_dir.rglob("*"):
@@ -393,7 +404,10 @@ def create_sample(sample_dir: pathlib.Path, event: dict[str, Any] | None) -> Non
 
 
 def mount_sample(sample_dir: pathlib.Path, logs: Logs) -> None:
-    options = ["lowerdir=lower", "upperdir=upper", "workdir=work", *MOUNT_FEATURES]
+    options = [
+        "lowerdir=base", "upperdir=generation-1/upper",
+        "workdir=generation-1/work", *MOUNT_FEATURES,
+    ]
     logs.subprocess(
         ["mount", "-t", "overlay", "overlay", "-o", ",".join(options), "merged"],
         cwd=sample_dir,
@@ -409,6 +423,17 @@ def mount_sample(sample_dir: pathlib.Path, logs: Logs) -> None:
     found = sorted(set(mount["options"].split(",")) & conflicting)
     if found:
         raise E3Error(f"mounted OverlayFS feature mismatch: {found}")
+
+
+def checkpoint_sample(sample_dir: pathlib.Path, helper: pathlib.Path, logs: Logs) -> None:
+    initial_upper = sample_dir / "generation-1" / "upper"
+    frozen_upper = sample_dir / "layers" / "g1"
+    os.rename(initial_upper, frozen_upper)
+    logs.subprocess([
+        str(helper), str(sample_dir / "merged"), str(INITIAL_GENERATION),
+        str(sample_dir / "generation-2" / "upper"),
+        str(sample_dir / "generation-2" / "work"),
+    ])
 
 
 def unmount_sample(sample_dir: pathlib.Path, logs: Logs) -> None:
@@ -465,7 +490,8 @@ def exception_reason(stage: str, error: BaseException) -> str:
     return f"{stage}: {str(error).replace(chr(10), ' ')}"[:1000]
 
 
-def run_edit(backing: pathlib.Path, helper: pathlib.Path, out_dir: pathlib.Path,
+def run_edit(backing: pathlib.Path, helper: pathlib.Path,
+             checkpoint_helper: pathlib.Path, out_dir: pathlib.Path,
              raw_path: pathlib.Path, logs: Logs, device: pathlib.Path,
              fs_config: str, event: dict[str, Any], number: int,
              batch: int) -> dict[str, Any]:
@@ -482,12 +508,14 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path, out_dir: pathlib.Path,
         stage = "mount_sample"
         mount_sample(sample_dir, logs)
         mounted = True
+        stage = "checkpoint_sample"
+        checkpoint_sample(sample_dir, checkpoint_helper, logs)
         stage = "run_helper"
         command = [
             str(helper), "edit", "--merged", str(sample_dir / "merged"),
             "--target", str(sample_dir / "merged" / "edit.bin"),
-            "--upper", str(sample_dir / "upper" / "edit.bin"),
-            "--lower", str(sample_dir / "lower" / "edit.bin"),
+            "--upper", str(sample_dir / "generation-2" / "upper" / "edit.bin"),
+            "--lower", str(sample_dir / "layers" / "g1" / "edit.bin"),
             "--device-stat", str(device), "--file-size", str(event["file_size_before"]),
             "--offset", str(event["offset"]), "--write-bytes", str(event["write_bytes"]),
             "--payload-seed", str(event["payload_seed"]),
@@ -533,9 +561,11 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path, out_dir: pathlib.Path,
     return row
 
 
-def run_control(backing: pathlib.Path, helper: pathlib.Path, controls_path: pathlib.Path,
+def run_control(backing: pathlib.Path, helper: pathlib.Path,
+                checkpoint_helper: pathlib.Path, controls_path: pathlib.Path,
                 logs: Logs, device: pathlib.Path, fs_config: str, run: int,
-                cache_mode: str, sample: int, batch: int, replica: int) -> dict[str, Any]:
+                cache_mode: str, sample: int, batch: int,
+                replica: int) -> dict[str, Any]:
     identity = f"r{run:02d}-{cache_mode}-b{batch:04d}-control-{replica}"
     sample_dir = backing / ".e3-work" / identity
     result_path = sample_dir / "helper-result.json"
@@ -554,6 +584,8 @@ def run_control(backing: pathlib.Path, helper: pathlib.Path, controls_path: path
         stage = "mount_control"
         mount_sample(sample_dir, logs)
         mounted = True
+        stage = "checkpoint_control"
+        checkpoint_sample(sample_dir, checkpoint_helper, logs)
         stage = "run_control_helper"
         process = logs.subprocess([
             str(helper), "control", "--merged", str(sample_dir / "merged"),
@@ -661,6 +693,7 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
                   mount: dict[str, str], fs_config: str, xfs_info: str) -> int:
     logs = Logs(out_dir)
     helper = pathlib.Path(__file__).resolve().with_name("copyup_bench")
+    checkpoint_helper = pathlib.Path(__file__).resolve().with_name("checkpoint_v2")
     event_path = out_dir / "events.jsonl"
     raw_path = out_dir / "raw.jsonl"
     controls_path = out_dir / "controls.jsonl"
@@ -680,6 +713,8 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
     try:
         if not helper.is_file() or not os.access(helper, os.X_OK):
             raise E3Error("copyup_bench is not built; run make -C tools/deltafs e3-bench")
+        if not checkpoint_helper.is_file() or not os.access(checkpoint_helper, os.X_OK):
+            raise E3Error("checkpoint_v2 is not built; run make -C tools/deltafs e3-bench")
         (out_dir / "fiemap").mkdir()
         (backing / ".e3-work").mkdir(mode=0o700)
         dmesg_before = read_dmesg(logs)
@@ -705,8 +740,8 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
             for event in group:
                 edit_number += 1
                 row = run_edit(
-                    backing, helper, out_dir, raw_path, logs, device, fs_config,
-                    event, edit_number, batch,
+                    backing, helper, checkpoint_helper, out_dir, raw_path, logs,
+                    device, fs_config, event, edit_number, batch,
                 )
                 rows.append(row)
                 if row["status"] != "ok":
@@ -718,8 +753,9 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
             for replica in range(1, NOOP_REPETITIONS + 1):
                 control_number += 1
                 control = run_control(
-                    backing, helper, controls_path, logs, device, fs_config,
-                    run, cache_mode, control_number, batch, replica,
+                    backing, helper, checkpoint_helper, controls_path, logs,
+                    device, fs_config, run, cache_mode, control_number, batch,
+                    replica,
                 )
                 controls.append(control)
                 if control["status"] != "ok":
@@ -765,7 +801,9 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Measure OverlayFS copy-up and device I/O")
+    parser = argparse.ArgumentParser(
+        description="Measure DeltaFS v2 post-checkpoint copy-up and device I/O",
+    )
     subparsers = parser.add_subparsers(dest="preset", required=True)
     smoke = subparsers.add_parser("smoke", help="run one sample per legal cell")
     full = subparsers.add_parser("run", help="run one indexed full-result shard")

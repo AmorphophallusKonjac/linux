@@ -23,6 +23,10 @@ import events
 
 SCHEMA = events.SCHEMA
 SEED = events.SEED
+DELTAFS_ABI_VERSION = 2
+INITIAL_GENERATION = 1
+CHECKPOINT_GENERATION = 2
+COPYUP_SOURCE = "checkpoint_frozen_upper"
 BOOTSTRAP_REPLICATES = 10_000
 FS_CONFIGS = ("ext4_noreflink", "xfs_noreflink", "xfs_reflink")
 METRICS = ("copyup_bytes", "physical_io_bytes", "physical_io_bytes_corrected")
@@ -50,6 +54,8 @@ MANIFEST_FIELDS = frozenset((
     "git_commit", "kernel_release", "kernel_config_sha256", "fs_type", "fs_config",
     "fs_uuid", "backing_source", "backing_mount_options", "xfs_info",
     "device_stat", "canonical_device_stat", "overlay_mount_options", "started_at",
+    "deltafs_abi_version", "initial_generation", "checkpoint_generation",
+    "copyup_source",
     "legal_cells", "warm_count_per_cell", "cold_count_per_cell",
     "independent_runs", "noop_interval", "noop_repetitions", "settle_interval_ms",
     "settle_stable_comparisons", "settle_timeout_ms",
@@ -127,6 +133,11 @@ def validate_manifest(value: dict[str, Any]) -> None:
     if value["schema"] != SCHEMA or value["seed"] != SEED or \
             value["preset"] not in events.PRESETS or value["fs_config"] not in FS_CONFIGS:
         raise AnalysisError("manifest schema, seed, preset, or filesystem is invalid")
+    if value["deltafs_abi_version"] != DELTAFS_ABI_VERSION or \
+            value["initial_generation"] != INITIAL_GENERATION or \
+            value["checkpoint_generation"] != CHECKPOINT_GENERATION or \
+            value["copyup_source"] != COPYUP_SOURCE:
+        raise AnalysisError("manifest does not describe the E3 DeltaFS v2 lifecycle")
     configuration = events.PRESETS[value["preset"]]
     if not is_plain_int(value["run_index"]) or \
             not 1 <= value["run_index"] <= configuration["runs"]:
@@ -147,7 +158,7 @@ def validate_manifest(value: dict[str, Any]) -> None:
     }
     for key, expected_value in expected.items():
         if value[key] != expected_value:
-            raise AnalysisError(f"manifest {key} differs from E3 v1")
+            raise AnalysisError(f"manifest {key} differs from the E3 contract")
     if value["fs_config"].startswith("xfs_") != (value["fs_type"] == "xfs") or \
             (value["fs_config"] == "ext4_noreflink") != (value["fs_type"] == "ext4"):
         raise AnalysisError("manifest filesystem type/config mismatch")

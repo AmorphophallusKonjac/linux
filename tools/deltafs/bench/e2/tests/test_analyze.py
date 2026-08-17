@@ -16,7 +16,8 @@ import analyze  # noqa: E402
 
 def smoke_manifest() -> dict:
     return {
-        "schema": 1,
+        "schema": 2,
+        "deltafs_abi_version": 2,
         "preset": "smoke",
         "seed": 14857,
         "git_commit": "0" * 40,
@@ -44,7 +45,7 @@ def row(sample: int, operation: str, depth: int, warmup: bool) -> dict:
     source = depth if operation == "checkpoint" else 128
     target = depth + 1 if operation == "checkpoint" else depth
     return {
-        "schema": 1,
+        "schema": 2,
         "run": 1,
         "sample": sample,
         "warmup": warmup,
@@ -53,6 +54,9 @@ def row(sample: int, operation: str, depth: int, warmup: bool) -> dict:
         "target_depth": target,
         "request_depth": target,
         "rollback_distance": 0 if operation == "checkpoint" else 128 - depth,
+        "keep_bottom": 0 if operation == "checkpoint" else target,
+        "prefix_depth": 0,
+        "request_fd_count": 2,
         "expected_generation": 1,
         "generation_after": 2,
         "cpu_before": 3,
@@ -68,7 +72,7 @@ def row(sample: int, operation: str, depth: int, warmup: bool) -> dict:
 
 def smoke_rows() -> list[dict]:
     rows = [{
-        "schema": 1,
+        "schema": 2,
         "run": 1,
         "sample": 1,
         "warmup": False,
@@ -77,6 +81,9 @@ def smoke_rows() -> list[dict]:
         "target_depth": 129,
         "request_depth": 129,
         "rollback_distance": 0,
+        "keep_bottom": 0,
+        "prefix_depth": 0,
+        "request_fd_count": 2,
         "expected_generation": 1,
         "generation_after": 1,
         "cpu_before": -1,
@@ -109,7 +116,7 @@ def write_run(root: pathlib.Path, rows: list[dict]) -> None:
             stream.write(json.dumps(item) + "\n")
     (root / "summary.json").write_text(
         json.dumps({
-            "schema": 1,
+            "schema": 2,
             "completed": True,
             "passed": True,
             "counts": {
@@ -167,6 +174,16 @@ class AnalyzerTests(unittest.TestCase):
             write_run(root, rows)
             _, errors = analyze.analyze(root)
             self.assertTrue(any("successful-sample contract" in error for error in errors))
+
+    def test_v2_restore_topology_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            rows = smoke_rows()
+            restore = next(item for item in rows if item["operation"] == "restore")
+            restore["keep_bottom"] = 0
+            write_run(root, rows)
+            _, errors = analyze.analyze(root)
+            self.assertTrue(any("restore raw depth semantics" in error for error in errors))
 
     def test_unknown_raw_field_is_rejected(self):
         item = smoke_rows()[0]

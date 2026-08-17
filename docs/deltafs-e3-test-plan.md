@@ -1,9 +1,11 @@
-# DeltaFS E3 copy-up benchmark detailed design
+# DeltaFS E3 v2 copy-up benchmark detailed design
 
-> E3 measures one OverlayFS copy-up edit. It is independent of the E2 switch
-> ioctl benchmark and does not use `deltafsctl` or any DeltaFS switch request.
-> Its event schema remains version 1, but that schema is independent of the
-> DeltaFS kernel UAPI. Current functional prerequisites use only v2 tests.
+> E3 measures one copy-up edit after a native DeltaFS v2 checkpoint. It is
+> independent of the E2 ioctl-latency benchmark and does not use `deltafsctl`.
+> Its synthetic-event schema remains version 1, but that schema is independent
+> of the DeltaFS kernel ABI version recorded in the manifest. Every sample must
+> prove a generation 1 to generation 2 checkpoint with the current v2 request;
+> stock OverlayFS and the removed v1 ABI are rejected before measurement.
 >
 > Without the authors' SWE-Search event corpus, the fixed synthetic preset is a
 > method reproduction. Its output must not be described as an exact Fig. 9
@@ -58,19 +60,23 @@ independent-run shard, so the QEMU driver can interleave filesystem order withou
 running measured devices concurrently. There is no public manifest, reset hook,
 event file, sample count, seed,
 bootstrap count, cache mode, mount option, or filesystem label parameter.
-Changing one of those fixed values requires an E3 schema revision. The runner
-automatically:
+Changing the event schedule or measured settings requires an event-schema
+revision; the DeltaFS lifecycle is identified independently by mandatory
+manifest ABI/generation fields. The runner automatically:
 
 - recognizes ext4/XFS and obtains XFS `reflink=0/1` from `xfs_info`;
 - verifies that `DEVICE_STAT` resolves to `/sys/dev/block/MAJOR:MINOR/stat` for
   `BACKING_DIR`;
 - generates and saves the immutable preset event JSONL;
-- creates, mounts, verifies, unmounts, and removes a fresh sandbox per sample;
+- creates and mounts a fresh generation-1 sandbox per sample;
+- freezes the generation-1 upper by rename and issues one native v2 checkpoint
+  to a fresh generation-2 upper/work pair before starting the counter interval;
+- verifies, unmounts, and removes the sandbox after measurement;
 - captures manifest, raw data, FIEMAP dumps, stdout/stderr, dmesg, and failed
   sandboxes.
 
-`copyup_bench` and event-generator modules are runner internals, not additional
-user interfaces.
+`checkpoint_v2`, `copyup_bench`, and event-generator modules are runner
+internals, not additional user interfaces.
 
 ## 3. Code layout and ownership
 
@@ -78,6 +84,9 @@ user interfaces.
       Makefile
       bench_common.h
       bench_common.c
+      deltafs_v2_common.h
+      deltafs_v2_common.c
+      checkpoint_v2.c
       copyup_bench.c
       events.py
       run.py
@@ -86,14 +95,16 @@ user interfaces.
         fiemap_fixture_test.c
         blockstat_test.c
         common_test.c
+        v2_request_test.c
         test_events.py
         test_runner.py
         test_analyze.py
 
-The C helper owns the measured edit sequence, SHA-256, FIEMAP collection, and
-block-stat settling. Python standard-library code owns JSON, fixed event
-generation, mount orchestration, artifact schemas, and analysis. E3 does not
-import E2 code or artifacts.
+`checkpoint_v2` owns the native v2 request construction and ioctl. The
+`copyup_bench` C helper owns the measured edit sequence, SHA-256, FIEMAP
+collection, and block-stat settling. Python standard-library code owns JSON,
+fixed event generation, mount/checkpoint orchestration, artifact schemas, and
+analysis. E3 does not import E2 code or artifacts.
 
 ## 4. Fixed synthetic events
 
@@ -191,38 +202,54 @@ reading. It does not write `/proc/sys/vm/drop_caches`. Warm samples retain the
 cache populated by the preimage hash. Cold and warm rows are never pooled.
 
 After each group of at most 20 edit samples the schedule runs three fresh
-no-op controls. A control performs the same mount, stable-counter, `syncfs`, and
-stable-counter lifecycle but no file edit. Its triplicate median is the fixed
-batch baseline for sensitivity analysis. Raw physical I/O is always preserved;
-the corrected value is `max(0, raw - no_op_median)`.
+no-op controls. A control performs the same mount, rename, v2 checkpoint,
+stable-counter, `syncfs`, and stable-counter lifecycle but no file edit. Its
+triplicate median is the fixed batch baseline for sensitivity analysis. Raw
+physical I/O is always preserved; the corrected value is
+`max(0, raw - no_op_median)`.
 
-## 5. Fresh sample lifecycle
+## 5. Fresh v2 sample lifecycle
 
 Each attempt exclusively uses:
 
     BACKING_DIR/.e3-work/<sample-id>/
-      lower/edit.bin
-      upper/
-      work/
+      base/
+      generation-1/upper/edit.bin
+      generation-1/work/
+      generation-2/upper/
+      generation-2/work/
+      layers/g1/                 # generation-1 upper after rename
       merged/
       helper-result.json
 
-Before an edit sample, the runner regenerates the exact preimage in lower,
-checks its SHA-256, `fsync`s it, calls `syncfs` on the backing filesystem, and
-verifies that upper has no `edit.bin`. It mounts OverlayFS with:
+Before an edit sample, the runner regenerates the exact preimage in
+`generation-1/upper`, checks its SHA-256, `fsync`s it, calls `syncfs` on the
+backing filesystem, and verifies that the generation-2 upper has no `edit.bin`.
+It mounts generation 1 with:
 
-    lowerdir=lower,upperdir=upper,workdir=work,
+    lowerdir=base,upperdir=generation-1/upper,workdir=generation-1/work,
     index=off,nfs_export=off,metacopy=off,xino=off,uuid=off,
     redirect_dir=nofollow
 
-All sample paths must remain on the backing superblock. A successful sample is
-unmounted and deleted. An invalid/failed sample is unmounted if possible and
-preserved. Any remaining OverlayFS mount aborts the run.
+While the mount is live, the runner renames `generation-1/upper` to `layers/g1`
+and invokes `checkpoint_v2` with expected generation 1 and the fresh
+`generation-2/upper` and `generation-2/work` paths. Success establishes this
+stack before measurement:
+
+    [generation-2/upper (RW), layers/g1 (RO), base (RO)]
+
+All sample paths must remain on the backing superblock. The v2 checkpoint is
+outside the block-stat counter interval. A failed ioctl, including `ENOTTY`
+from stock OverlayFS or a v1-only module, fails the sample and preserves its
+sandbox. A successful sample is unmounted and deleted. An invalid/failed sample
+is unmounted if possible and preserved. Any remaining OverlayFS mount aborts
+the run.
 
 The edit helper then performs this fixed sequence:
 
-1. confirm lower exists, upper does not, merged and lower are regular files;
-2. hash lower/merged and verify size and expected preimage;
+1. confirm frozen `layers/g1/edit.bin` exists, generation-2 upper does not, and
+   merged/frozen paths are regular files;
+2. hash frozen/merged and verify size and expected preimage;
 3. apply cold-cache advice when requested;
 4. wait for the explicit sectors-written counter to stabilize;
 5. open merged, issue exactly one complete positional write, `fsync` the file,
@@ -230,11 +257,13 @@ The edit helper then performs this fixed sequence:
 6. wait for the counter to stabilize again and reject counter regression or
    multiplication overflow;
 7. collect upper FIEMAP with `FIEMAP_FLAG_SYNC`;
-8. hash merged, upper, and lower and apply all postimage oracles;
+8. hash merged, generation-2 upper, and frozen generation-1 upper and apply all
+   postimage oracles;
 9. atomically write helper JSON and the separate FIEMAP JSON dump.
 
-No-op controls execute steps 4--6 without opening or modifying an edit file.
-Setup and unmount I/O occur outside the counter interval.
+No-op controls execute the same generation-1 mount, rename, and v2 checkpoint,
+then steps 4--6 without opening or modifying an edit file. Setup, checkpoint,
+and unmount I/O occur outside the counter interval.
 
 ## 6. FIEMAP contract
 
@@ -297,11 +326,14 @@ Each output directory contains:
     dmesg-after.log
     fiemap/<sample-id>.json
 
-The manifest records schema/preset/run-index/seed, event path/hash/count, git commit,
-kernel release/config hash, filesystem type/config/UUID/source/options,
-`xfs_info`, explicit and canonical device-stat paths, OverlayFS options, start
-time, legal matrix, cache counts, independent runs, no-op interval/repetitions,
-and settle constants.
+The manifest records schema/preset/run-index/seed, event path/hash/count, git
+commit, kernel release/config hash, filesystem type/config/UUID/source/options,
+`xfs_info`, explicit and canonical device-stat paths, OverlayFS options,
+`deltafs_abi_version=2`, initial/checkpoint generations `1` and `2`, copy-up
+source `checkpoint_frozen_upper`, start time, legal matrix, cache counts,
+independent runs, no-op interval/repetitions, and settle constants. Analysis
+requires these exact v2 lifecycle values, so it cannot mix legacy plain-
+OverlayFS E3 artifacts with current results.
 
 Every edit raw row contains:
 
@@ -398,10 +430,11 @@ separate GCC `-fanalyzer` compile is also used during implementation. This
 environment must not load the module or mount OverlayFS, and no host result may
 be presented as functional, copy-up, or physical-I/O verification.
 
-The host gate covers v2 userspace tools and E3 only. The legacy E2 helper uses
-the removed v1 switch request and is not an E3 prerequisite. No module is loaded
-and no OverlayFS mount or real block-stat measurement is run by this gate;
-functional and physical-I/O claims remain subject to the QEMU procedure below.
+The host gate covers v2 userspace tools and E3. E2 also uses the v2 ABI, but its
+latency benchmark is independent and is not an E3 prerequisite. No module is
+loaded and no OverlayFS mount or real block-stat measurement is run by this
+gate; functional and physical-I/O claims remain subject to the QEMU procedure
+below.
 
 ## 11. QEMU/KVM functional handoff
 
@@ -422,6 +455,7 @@ Expected files include:
     arch/x86/boot/bzImage
     fs/overlayfs/overlay.ko
     tools/deltafs/deltafsctl
+    tools/deltafs/bench/e3/checkpoint_v2
     tools/deltafs/bench/e3/copyup_bench
 
 ### 11.2 Prepare dedicated images and boot
@@ -493,7 +527,10 @@ The acceptance harness preserves its result directory under `v2-main`. A debug
 guest must report the target-depth, `keep_bottom`, fault-injection, teardown,
 sanitizer, and kmemleak checks as `PASS`. Exit code 4 means capability-dependent
 checks were skipped and is not a complete acceptance result. Do not continue to
-E3 after a skipped or failed v2 acceptance run.
+E3 after a skipped or failed v2 acceptance run. The acceptance cleanup unloads
+the module, so reload the installed worktree module before E3:
+
+    modprobe overlay
 
 ### 11.4 E3 smoke
 
@@ -516,10 +553,14 @@ backing filesystem:
       /var/tmp/e3-results/smoke/xfs_reflink
     python3 tools/deltafs/bench/e3/analyze.py /var/tmp/e3-results/smoke
 
-Each runner must end with `PASS: E3 smoke ... invalid=0 failed=0`, and analysis
-must end with `PASS: E3 analysis completed`. There are 36 edit events per
-filesystem (18 warm and 18 cold), complete no-op triplets, one raw row and one
-FIEMAP dump per event, and no pairing errors.
+Each runner must log a successful native `checkpoint: generation 1 -> 2` for
+every edit and control, end with `PASS: E3 smoke ... invalid=0 failed=0`, and
+analysis must end with `PASS: E3 analysis completed`. There are 36 edit events
+per filesystem (18 warm and 18 cold), complete no-op triplets, one raw row and
+one FIEMAP dump per event, and no pairing errors. Every manifest must contain
+`"deltafs_abi_version": 2`, `"initial_generation": 1`,
+`"checkpoint_generation": 2`, and
+`"copyup_source": "checkpoint_frozen_upper"`.
 
 ### 11.5 Full E3 run
 
@@ -585,6 +626,9 @@ On any failure, do not delete `.e3-work`, result JSONL, or FIEMAP dumps. Replace
     cp -a "$R" /mnt/host/
 
 Also copy the printed preserved sandbox from its measured backing directory.
-A reset/mount error, hash mismatch, unsupported FIEMAP flag, counter parse or
-settle error, missing pair, incomplete no-op triplet, or new kernel diagnostic
-is a failed run; it must not be hidden by removing the corresponding row.
+A reset/mount/rename/v2-checkpoint error, hash mismatch, unsupported FIEMAP
+flag, counter parse or settle error, missing pair, incomplete no-op triplet, or
+new kernel diagnostic is a failed run; it must not be hidden by removing the
+corresponding row. Include the preserved sample tree and `stderr.log`; an
+`Inappropriate ioctl for device` checkpoint error usually means the guest
+loaded stock OverlayFS or a non-v2 module.

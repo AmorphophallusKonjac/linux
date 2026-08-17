@@ -5,7 +5,6 @@
 
 #include <errno.h>
 #include <fcntl.h>
-#include <inttypes.h>
 #include <linux/deltafs.h>
 #include <sched.h>
 #include <stdbool.h>
@@ -30,6 +29,18 @@ struct measurement {
 	bool ioctl_attempted;
 };
 
+union e2_request {
+	struct deltafs_ioc_checkpoint_v2 checkpoint;
+	struct deltafs_ioc_restore_v2 restore;
+};
+
+#define E2_RESULT_HEADER \
+	"{\"schema\":2,\"ioctl_attempted\":%s,\"ioctl_ret\":%d,"
+#define E2_RESULT_TIMING "\"errno\":%d,\"ioctl_latency_ns\":%llu,"
+#define E2_RESULT_CPU "\"cpu_before\":%d,\"cpu_after\":%d,"
+#define E2_RESULT_STATUS \
+	"\"major_faults\":%ld,\"status\":\"%s\",\"invalid_reason\":%s%s%s}\n"
+
 static void close_fd(int *fd)
 {
 	if (*fd >= 0)
@@ -46,8 +57,8 @@ static int validate_paths(const struct e2_spec *spec, const char *result_path)
 		errno = EINVAL;
 		return -1;
 	}
-	for (i = 0; i < spec->nr_lowers; i++) {
-		if (!spec->lowers[i][0] || spec->lowers[i][0] != '/') {
+	for (i = 0; i < spec->nr_lower_prefix; i++) {
+		if (!spec->lower_prefix[i][0] || spec->lower_prefix[i][0] != '/') {
 			errno = EINVAL;
 			return -1;
 		}
@@ -89,8 +100,8 @@ static int open_switch_paths(const struct e2_spec *spec, int *merged_fd,
 			O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
 	if (*merged_fd < 0 || *upper_fd < 0 || *work_fd < 0)
 		return -1;
-	for (i = 0; i < spec->nr_lowers; i++) {
-		lower_fds[i] = open(spec->lowers[i],
+	for (i = 0; i < spec->nr_lower_prefix; i++) {
+		lower_fds[i] = open(spec->lower_prefix[i],
 				    O_PATH | O_DIRECTORY | O_CLOEXEC |
 				    O_NOFOLLOW);
 		if (lower_fds[i] < 0)
@@ -100,20 +111,19 @@ static int open_switch_paths(const struct e2_spec *spec, int *merged_fd,
 }
 
 static int run_timed_ioctl(int merged_fd, unsigned long command,
-			   struct deltafs_ioc_switch_v1 *request,
+			   void *request, size_t request_size,
 			   struct measurement *measurement)
 {
 	struct rusage usage_before;
 	struct rusage usage_after;
 	struct timespec before;
 	struct timespec after;
-	volatile unsigned char touch;
 	int saved_errno;
 
 	memset(measurement, 0, sizeof(*measurement));
-	touch = ((volatile unsigned char *)request)[0];
-	touch ^= ((volatile unsigned char *)request)[sizeof(*request) - 1];
-	(void)touch;
+	/* Builders initialize every byte; prefetch both ends before timing. */
+	__builtin_prefetch(request, 0, 3);
+	__builtin_prefetch((unsigned char *)request + request_size - 1, 0, 3);
 	if (getrusage(RUSAGE_SELF, &usage_before))
 		return -1;
 	measurement->cpu_before = sched_getcpu();
@@ -174,17 +184,15 @@ static int write_result(const char *path, const struct measurement *measurement,
 	int length;
 
 	length = snprintf(buffer, sizeof(buffer),
-		"{\"schema\":1,\"ioctl_attempted\":%s,\"ioctl_ret\":%d,"
-		"\"errno\":%d,\"ioctl_latency_ns\":%" PRIu64 ","
-		"\"cpu_before\":%d,\"cpu_after\":%d,"
-		"\"major_faults\":%ld,\"status\":\"%s\","
-		"\"invalid_reason\":%s%s%s}\n",
-		measurement->ioctl_attempted ? "true" : "false",
-		measurement->ioctl_ret, measurement->ioctl_errno,
-		measurement->latency_ns, measurement->cpu_before,
-		measurement->cpu_after, measurement->major_faults, status,
-		reason ? "\"" : "null", reason ? reason : "",
-		reason ? "\"" : "");
+			  E2_RESULT_HEADER E2_RESULT_TIMING E2_RESULT_CPU
+			  E2_RESULT_STATUS,
+			  measurement->ioctl_attempted ? "true" : "false",
+			  measurement->ioctl_ret, measurement->ioctl_errno,
+			  (unsigned long long)measurement->latency_ns,
+			  measurement->cpu_before,
+			  measurement->cpu_after, measurement->major_faults,
+			  status, reason ? "\"" : "null", reason ? reason : "",
+			  reason ? "\"" : "");
 	if (length < 0 || (size_t)length >= sizeof(buffer)) {
 		errno = EOVERFLOW;
 		return -1;
@@ -194,16 +202,18 @@ static int write_result(const char *path, const struct measurement *measurement,
 
 int main(int argc, char **argv)
 {
-	struct deltafs_ioc_switch_v1 request;
+	union e2_request request;
 	struct measurement measurement = {
 		.ioctl_ret = -1,
 		.cpu_before = -1,
 		.cpu_after = -1,
 	};
 	struct e2_spec spec;
-	int lower_fds[DELTAFS_V1_MAX_LOWERS];
+	int lower_fds[DELTAFS_V2_MAX_LOWERS];
 	const char *reason = NULL;
 	const char *status;
+	void *request_ptr;
+	size_t request_size;
 	unsigned long command;
 	int merged_fd = -1;
 	int upper_fd = -1;
@@ -211,7 +221,7 @@ int main(int argc, char **argv)
 	int ret = EXIT_FAILURE;
 	size_t i;
 
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
+	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		lower_fds[i] = -1;
 	if (argc != 3 || argv[1][0] != '/' || argv[2][0] != '/') {
 		fprintf(stderr, "Usage: %s ABSOLUTE_SPEC ABSOLUTE_RESULT\n",
@@ -227,27 +237,24 @@ int main(int argc, char **argv)
 			strerror(errno));
 		goto out;
 	}
-	if (spec.nr_lowers > DELTAFS_V1_MAX_LOWERS) {
-		int build_ret;
-
+	if (!strcmp(spec.operation, "checkpoint")) {
 		errno = 0;
-		build_ret = e2_build_request(&request, -1, -1, NULL,
-				       (unsigned int)spec.nr_lowers,
-				       spec.expected_generation);
-		if (build_ret != -1 || errno != E2BIG) {
-			measurement.ioctl_errno = errno;
-			status = "failed";
-			reason = "preflight_failed";
-		} else {
-			measurement.ioctl_errno = E2BIG;
-			status = "expected_reject";
-			reason = NULL;
-		}
-		if (write_result(argv[2], &measurement, status, reason))
+		if (e2_validate_checkpoint_source_depth(spec.source_depth)) {
+			if (errno != E2BIG) {
+				measurement.ioctl_errno = errno;
+				status = "failed";
+				reason = "preflight_failed";
+			} else {
+				measurement.ioctl_errno = E2BIG;
+				status = "expected_reject";
+				reason = NULL;
+			}
+			if (write_result(argv[2], &measurement, status, reason))
+				goto out;
+			ret = !strcmp(status, "expected_reject") ? EXIT_SUCCESS :
+				EXIT_FAILURE;
 			goto out;
-		ret = !strcmp(status, "expected_reject") ? EXIT_SUCCESS :
-			EXIT_FAILURE;
-		goto out;
+		}
 	}
 	if (open_switch_paths(&spec, &merged_fd, &upper_fd, &work_fd,
 			      lower_fds)) {
@@ -255,16 +262,33 @@ int main(int argc, char **argv)
 			strerror(errno));
 		goto out;
 	}
-	if (e2_build_request(&request, upper_fd, work_fd, lower_fds,
-			     (unsigned int)spec.nr_lowers,
-			     spec.expected_generation)) {
-		fprintf(stderr, "switch_once: build request: %s\n",
-			strerror(errno));
-		goto out;
+	if (!strcmp(spec.operation, "checkpoint")) {
+		if (e2_build_checkpoint_request(&request.checkpoint, upper_fd,
+						work_fd,
+						spec.expected_generation)) {
+			fprintf(stderr, "switch_once: build checkpoint request: %s\n",
+				strerror(errno));
+			goto out;
+		}
+		command = DELTAFS_IOC_CHECKPOINT;
+		request_ptr = &request.checkpoint;
+		request_size = sizeof(request.checkpoint);
+	} else {
+		if (e2_build_restore_request(&request.restore, upper_fd,
+					     work_fd, lower_fds,
+					     (unsigned int)spec.nr_lower_prefix,
+					     spec.keep_bottom,
+					     spec.expected_generation)) {
+			fprintf(stderr, "switch_once: build restore request: %s\n",
+				strerror(errno));
+			goto out;
+		}
+		command = DELTAFS_IOC_RESTORE;
+		request_ptr = &request.restore;
+		request_size = sizeof(request.restore);
 	}
-	command = !strcmp(spec.operation, "checkpoint") ?
-		  DELTAFS_IOC_CHECKPOINT : DELTAFS_IOC_RESTORE;
-	if (run_timed_ioctl(merged_fd, command, &request, &measurement)) {
+	if (run_timed_ioctl(merged_fd, command, request_ptr, request_size,
+			    &measurement)) {
 		fprintf(stderr, "switch_once: measure ioctl: %s\n",
 			strerror(errno));
 		goto out;
@@ -273,7 +297,7 @@ int main(int argc, char **argv)
 	close_fd(&merged_fd);
 	close_fd(&upper_fd);
 	close_fd(&work_fd);
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
+	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		close_fd(&lower_fds[i]);
 	if (write_result(argv[2], &measurement, status, reason)) {
 		fprintf(stderr, "switch_once: write result: %s\n", strerror(errno));
@@ -284,7 +308,7 @@ out:
 	close_fd(&merged_fd);
 	close_fd(&upper_fd);
 	close_fd(&work_fd);
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
+	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		close_fd(&lower_fds[i]);
 	e2_free_spec(&spec);
 	return ret;

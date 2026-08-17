@@ -158,24 +158,24 @@ static int parse_int(struct json_reader *reader, int *value)
 	return 0;
 }
 
-static int append_lower(struct e2_spec *spec, char *path)
+static int append_lower_prefix(struct e2_spec *spec, char *path)
 {
 	char **next;
 
-	if (spec->nr_lowers == SIZE_MAX / sizeof(*spec->lowers)) {
+	if (spec->nr_lower_prefix == SIZE_MAX / sizeof(*spec->lower_prefix)) {
 		errno = E2BIG;
 		return -1;
 	}
-	next = realloc(spec->lowers,
-		       (spec->nr_lowers + 1) * sizeof(*spec->lowers));
+	next = realloc(spec->lower_prefix,
+		       (spec->nr_lower_prefix + 1) * sizeof(*spec->lower_prefix));
 	if (!next)
 		return -1;
-	spec->lowers = next;
-	spec->lowers[spec->nr_lowers++] = path;
+	spec->lower_prefix = next;
+	spec->lower_prefix[spec->nr_lower_prefix++] = path;
 	return 0;
 }
 
-static int parse_lowers(struct json_reader *reader, struct e2_spec *spec)
+static int parse_lower_prefix(struct json_reader *reader, struct e2_spec *spec)
 {
 	bool first = true;
 
@@ -193,7 +193,7 @@ static int parse_lowers(struct json_reader *reader, struct e2_spec *spec)
 			return -1;
 		if (parse_string(reader, &path))
 			return -1;
-		if (append_lower(spec, path)) {
+		if (append_lower_prefix(spec, path)) {
 			free(path);
 			return -1;
 		}
@@ -243,13 +243,33 @@ static int parse_field(struct json_reader *reader, struct e2_spec *spec,
 		*seen |= 1U << 2;
 		return 0;
 	}
+	if (!strcmp(key, "source_depth")) {
+		if (*seen & (1U << 3) || parse_u64(reader, &number) ||
+		    !number || number > UINT_MAX) {
+			errno = EINVAL;
+			return -1;
+		}
+		spec->source_depth = (unsigned int)number;
+		*seen |= 1U << 3;
+		return 0;
+	}
 	if (!strcmp(key, "expected_generation")) {
-		if (*seen & (1U << 3) ||
+		if (*seen & (1U << 4) ||
 		    parse_u64(reader, &spec->expected_generation)) {
 			errno = EINVAL;
 			return -1;
 		}
-		*seen |= 1U << 3;
+		*seen |= 1U << 4;
+		return 0;
+	}
+	if (!strcmp(key, "keep_bottom")) {
+		if (*seen & (1U << 5) || parse_u64(reader, &number) ||
+		    number > UINT_MAX) {
+			errno = EINVAL;
+			return -1;
+		}
+		spec->keep_bottom = (unsigned int)number;
+		*seen |= 1U << 5;
 		return 0;
 	}
 	if (!strcmp(key, "merged") || !strcmp(key, "upper") ||
@@ -260,16 +280,16 @@ static int parse_field(struct json_reader *reader, struct e2_spec *spec,
 
 		if (parse_string(reader, &value) || set_string_once(field, value))
 			return -1;
-		*seen |= !strcmp(key, "merged") ? 1U << 4 :
-			 !strcmp(key, "upper") ? 1U << 5 : 1U << 6;
+		*seen |= !strcmp(key, "merged") ? 1U << 6 :
+			 !strcmp(key, "upper") ? 1U << 7 : 1U << 8;
 		return 0;
 	}
-	if (!strcmp(key, "lowers")) {
-		if (*seen & (1U << 7) || parse_lowers(reader, spec)) {
+	if (!strcmp(key, "lower_prefix")) {
+		if (*seen & (1U << 9) || parse_lower_prefix(reader, spec)) {
 			errno = EINVAL;
 			return -1;
 		}
-		*seen |= 1U << 7;
+		*seen |= 1U << 9;
 		return 0;
 	}
 	errno = EINVAL;
@@ -304,34 +324,44 @@ static int parse_spec(char *data, size_t length, struct e2_spec *spec)
 		first = false;
 	}
 	skip_space(&reader);
-	if (reader.cursor != reader.end || seen != 0xffU || spec->schema != 1 ||
+	if (reader.cursor != reader.end || seen != 0x3ffU || spec->schema != 2 ||
 	    (!spec->operation ||
 	     (strcmp(spec->operation, "checkpoint") &&
 	      strcmp(spec->operation, "restore"))) ||
 	    spec->cpu < 0 || !spec->expected_generation ||
-	    !spec->nr_lowers || !spec->merged[0] || !spec->upper[0] ||
-	    !spec->work[0]) {
+	    spec->source_depth > DELTAFS_V2_MAX_LOWERS ||
+	    !spec->merged[0] || !spec->upper[0] || !spec->work[0] ||
+	    (!strcmp(spec->operation, "checkpoint") &&
+	     (spec->keep_bottom || spec->nr_lower_prefix)) ||
+	    (!strcmp(spec->operation, "restore") &&
+	     (spec->keep_bottom > spec->source_depth ||
+	      spec->nr_lower_prefix >
+		DELTAFS_V2_MAX_LOWERS - spec->keep_bottom ||
+	      (!spec->keep_bottom && !spec->nr_lower_prefix)))) {
 		errno = EINVAL;
 		return -1;
 	}
 	return 0;
 }
 
-int e2_build_request(struct deltafs_ioc_switch_v1 *req, int upper_fd,
-		     int work_fd, const int *lower_fds,
-		     unsigned int nr_lower, uint64_t expected_generation)
+int e2_validate_checkpoint_source_depth(unsigned int source_depth)
 {
-	unsigned int i;
-
-	if (!req || !nr_lower || !expected_generation) {
+	if (!source_depth) {
 		errno = EINVAL;
 		return -1;
 	}
-	if (nr_lower > DELTAFS_V1_MAX_LOWERS) {
+	if (source_depth >= DELTAFS_V2_MAX_LOWERS) {
 		errno = E2BIG;
 		return -1;
 	}
-	if (!lower_fds) {
+	return 0;
+}
+
+int e2_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *req,
+				int upper_fd, int work_fd,
+				uint64_t expected_generation)
+{
+	if (!req || !expected_generation) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -341,11 +371,44 @@ int e2_build_request(struct deltafs_ioc_switch_v1 *req, int upper_fd,
 	req->expected_generation = expected_generation;
 	req->upper_fd = upper_fd;
 	req->work_fd = work_fd;
-	req->nr_lower = nr_lower;
-	for (i = 0; i < DELTAFS_V1_MAX_LOWERS; i++)
-		req->lower_fds[i] = -1;
-	for (i = 0; i < nr_lower; i++)
-		req->lower_fds[i] = lower_fds[i];
+	return 0;
+}
+
+int e2_build_restore_request(struct deltafs_ioc_restore_v2 *req,
+			     int upper_fd, int work_fd,
+			     const int *lower_fds,
+			     unsigned int nr_lower_prefix,
+			     unsigned int keep_bottom,
+			     uint64_t expected_generation)
+{
+	unsigned int i;
+
+	if (!req || !expected_generation ||
+	    keep_bottom > DELTAFS_V2_MAX_LOWERS ||
+	    (!nr_lower_prefix && !keep_bottom)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (nr_lower_prefix > DELTAFS_V2_MAX_LOWERS - keep_bottom) {
+		errno = E2BIG;
+		return -1;
+	}
+	if (nr_lower_prefix && !lower_fds) {
+		errno = EINVAL;
+		return -1;
+	}
+	memset(req, 0, sizeof(*req));
+	req->size = sizeof(*req);
+	req->version = DELTAFS_ABI_VERSION;
+	req->expected_generation = expected_generation;
+	req->keep_bottom = keep_bottom;
+	req->nr_fds = DELTAFS_V2_RESTORE_LOWER_BASE + nr_lower_prefix;
+	for (i = 0; i < DELTAFS_V2_MAX_RESTORE_FDS; i++)
+		req->fds[i] = -1;
+	req->fds[DELTAFS_V2_RESTORE_UPPER_FD] = upper_fd;
+	req->fds[DELTAFS_V2_RESTORE_WORK_FD] = work_fd;
+	for (i = 0; i < nr_lower_prefix; i++)
+		req->fds[DELTAFS_V2_RESTORE_LOWER_BASE + i] = lower_fds[i];
 	return 0;
 }
 
@@ -414,9 +477,9 @@ void e2_free_spec(struct e2_spec *spec)
 	free(spec->merged);
 	free(spec->upper);
 	free(spec->work);
-	for (i = 0; i < spec->nr_lowers; i++)
-		free(spec->lowers[i]);
-	free(spec->lowers);
+	for (i = 0; i < spec->nr_lower_prefix; i++)
+		free(spec->lower_prefix[i]);
+	free(spec->lower_prefix);
 	memset(spec, 0, sizeof(*spec));
 }
 

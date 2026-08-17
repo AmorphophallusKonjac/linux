@@ -1,14 +1,11 @@
-# DeltaFS v1 E2 switch bench 设计方案
+# DeltaFS v2 E2 switch bench 设计方案
 
-> 历史移植输入：本方案及当前 `tools/deltafs/bench/e2/` 使用已删除的 v1 switch UAPI，
-> 不能在 v2 上构建、运行或产生可引用结果。下文旧 P5--P7 和 E2 命令只记录 v1 实验
-> 契约，不是当前测试交接；完成 v2 request、generation probe 和指标 schema 移植前
-> 不得执行。
+> 当前实现使用 DeltaFS v2 checkpoint/restore UAPI，工件 schema 为 2。
 
 > E2 只测 DeltaFS checkpoint/restore ioctl 的延迟和正确性。
 > backing filesystem 和磁盘镜像由 QEMU 环境提供；bench 不执行 `mkfs`。
 >
-> 适用版本：历史 DeltaFS v1，UAPI lower 上限为 128。
+> 适用版本：DeltaFS v2，UAPI lower 上限为 128。
 
 ## 1. 简化目标和边界
 
@@ -83,6 +80,8 @@ mount、跨 superblock 路径、不可用的 `CLOCK_MONOTONIC_RAW` 或不匹配�
 `switch_once` 是 runner 的私有子进程，不是用户接口。runner 为每个 sample 生成一个
 `spec.json`，私有进程读取该文件、预先打开 fd 和构造 request，只把 ioctl 放在计时
 区间内，并原子写出一个 `result.json`。用户不手工编写或复用 spec。
+schema-2 spec 明确记录 `source_depth`、`keep_bottom` 和 `lower_prefix`；checkpoint 的
+`keep_bottom=0` 且 prefix 为空，当前 ancestor restore 矩阵只设置 `keep_bottom`。
 
 E2 不依赖 E3 的 event、FIEMAP、block-stat 或分析代码。两者可以共享 UAPI 头文件，
 但不共享 runner、manifest schema 或 Makefile target。
@@ -96,14 +95,17 @@ E2 不依赖 E3 的 event、FIEMAP、block-stat 或分析代码。两者可以�
     view = (active_upper, active_work, lowers[0..D-1], generation)
 
 `lowers[0]` 是最上层只读层，`lowers[D-1]` 是 base，`D` 是 lower 数，不包括
-writable upper。分析变量固定使用 `request_depth = request.nr_lower`：
+writable upper。分析变量保留名称 `request_depth`，在 schema 2 中定义为 ioctl 成功后的
+target lower 深度，而不是 request 中的 fd 数：
 
 - checkpoint：`request_depth = source_depth + 1`；
 - restore：`request_depth = target_depth`。
 
-当前 UAPI 要求 `1 <= nr_lower <= 128`。source depth 127 的 checkpoint 是合法的
-128-lower latency 样本；source depth 128 的 checkpoint 必须在用户态 preflight
-得到 `E2BIG`，只作为 negative gate，不进入延迟分布。
+v2 checkpoint 不携带 lower fd，内核从 current state 派生完整 lower chain。source
+depth 127 的 checkpoint 是合法的 128-lower latency 样本；source depth 128 的
+checkpoint 必须在用户态 preflight 得到 `E2BIG`，只作为 negative gate，不进入延迟
+分布。v2 restore 使用 `keep_bottom=target_depth` 且 lower prefix 为空，因此当前固定
+ancestor rollback 矩阵中 restore request 始终只有 fresh upper/work 两个 fd。
 
 ### 4.2 preset
 
@@ -117,8 +119,9 @@ writable upper。分析变量固定使用 `request_depth = request.nr_lower`：
 
 restore 的 source depth 固定为 128；target 是同一祖先链上的 checkpoint。即使
 target depth 也是 128，restore 仍会丢弃当前 active upper 并安装 fresh upper/work。
-raw 中记录 `rollback_distance = 128 - target_depth`，但主分析按 `request_depth`
-分组，不用 distance 声称复杂度。
+raw 中记录 `rollback_distance = 128 - target_depth`、`keep_bottom`、`prefix_depth` 和
+`request_fd_count`，主分析按 target lower depth（字段名仍为 `request_depth`）分组，
+不能把它解释为 request fd 数，也不用 distance 声称复杂度。
 
 每个 independent run 还执行一次 checkpoint@source-depth=128 preflight，必须得到
 `E2BIG` 且不得调用 ioctl。seed 固定为 `14857`，只用于 marker 内容和 sample 顺序；
@@ -146,8 +149,9 @@ schema、seed、run、operation 和 depth 确定。active upper 为空。所有�
     index=off,nfs_export=off,metacopy=off,xino=off,uuid=off,redirect_dir=nofollow
 
 checkpoint sample 直接以 source chain mount；计时前将空 active upper rename 为新的
-最上层 lower，并创建 fresh upper/work。restore sample 直接以 128 层 source chain
-mount；计时请求安装目标 checkpoint 的完整 lower chain 和 fresh upper/work。
+最上层 lower，并创建 fresh upper/work。checkpoint request 只传 fresh upper/work。
+restore sample 直接以 128 层 source chain mount；计时请求传 fresh upper/work 和
+`keep_bottom=target_depth`，不重复传 retained lower suffix。
 
 一次 ioctl 后立即在计时外验证、umount 并删除成功 sample 的工作目录。失败或 invalid
 sample 不删除现场。这样每个 measured request 的 expected generation 恒为 1，成功后
@@ -157,21 +161,28 @@ sample 不删除现场。这样每个 measured request 的 expected generation �
 
 ### 5.1 request builder
 
-    int e2_build_request(struct deltafs_ioc_switch_v1 *req,
-                         int upper_fd, int work_fd,
-                         const int *lower_fds, unsigned int nr_lower,
-                         uint64_t expected_generation);
+    int e2_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *req,
+                                    int upper_fd, int work_fd,
+                                    uint64_t expected_generation);
+    int e2_build_restore_request(struct deltafs_ioc_restore_v2 *req,
+                                 int upper_fd, int work_fd,
+                                 const int *lower_fds,
+                                 unsigned int nr_lower_prefix,
+                                 unsigned int keep_bottom,
+                                 uint64_t expected_generation);
 
 builder 必须：
 
-- 检查 lower 数为 1..128；
+- 按操作构造 64-byte checkpoint 或 584-byte restore request；
 - 清零整个结构，再设置 size、version、flags 和 expected generation；
-- 保持 `reserved0` 和 `reserved[]` 为 0；
-- 将 `lower_fds[nr_lower..127]` 全部设为 -1；
+- 保持 `reserved[]` 为 0；
+- restore 将 `fds[nr_fds..129]` 全部设为 -1；
+- restore 检查 `prefix_depth + keep_bottom` 为 1..128；
 - 拒绝 generation 0，并且不引入用户指针。
 
-单元测试覆盖 0、1、128、129 lower、结构大小和 reserved 字段。129 lower 在 ioctl 前
-返回 `E2BIG`。
+单元测试覆盖两个 request 的固定布局、restore 的 0/1/128/129 target lower 边界、
+reserved 字段，以及 checkpoint source depth 127/128 preflight。checkpoint@128 在
+ioctl 前返回 `E2BIG`。
 
 ### 5.2 单次执行
 
@@ -180,7 +191,7 @@ builder 必须：
 1. 读取 runner 生成的 spec，验证 schema 和所有绝对路径；
 2. 固定到 spec 已记录的自动选择 CPU；
 3. 以 `O_RDONLY|O_DIRECTORY|O_CLOEXEC` 打开 merged 控制 fd，以
-   `O_PATH|O_DIRECTORY|O_CLOEXEC` 打开 upper、work 和 lower fd；
+   `O_PATH|O_DIRECTORY|O_CLOEXEC` 打开 upper/work；restore 只额外打开 lower prefix；
 4. 构造 request，预触碰 request/result buffer；
 5. 读取 `getrusage` 和当前 CPU；
 6. 读取 RAW clock，调用一次 ioctl，再读取 RAW clock；
@@ -204,8 +215,9 @@ mount。
 
 成功 ioctl 后使用新打开的 merged root fd 做 generation probe：
 
-1. 以 generation 1 和其他字段有效但 fd 为 -1 的 request 再调用，必须返回 `ESTALE`；
-2. 以 generation 2 调用同一无效 fd request，必须越过 generation 检查并返回 `EBADF`。
+1. 构造合法布局的 v2 restore request（`keep_bottom=1`、`nr_fds=2`、两个 fd 为 -1）；
+2. 以 generation 1 调用，必须返回 `ESTALE`；
+3. 以 generation 2 调用，必须越过 generation 检查并返回 `EBADF`。
 
 正确性 oracle 同时检查：
 
@@ -225,8 +237,8 @@ oracle 或 generation probe 失败时 `status=invalid` 并保留整个 sample �
 
 runner 在 `OUT_DIR/manifest.json` 自动记录：
 
-    schema, preset, seed, git_commit, kernel_release, kernel_config_sha256,
-    fs_type, fs_uuid, backing_source, backing_mount_options,
+    schema, deltafs_abi_version, preset, seed, git_commit, kernel_release,
+    kernel_config_sha256, fs_type, fs_uuid, backing_source, backing_mount_options,
     deltafs_mount_options, cpu, clocksource, started_at,
     depth_matrix, warmup_count, measured_count, independent_runs
 
@@ -238,7 +250,7 @@ runner 在 `OUT_DIR/manifest.json` 自动记录：
 每次 measured/warm-up/negative 尝试一行：
 
     {
-      "schema": 1,
+      "schema": 2,
       "run": 2,
       "sample": 17,
       "warmup": false,
@@ -247,6 +259,9 @@ runner 在 `OUT_DIR/manifest.json` 自动记录：
       "target_depth": 8,
       "request_depth": 8,
       "rollback_distance": 120,
+      "keep_bottom": 8,
+      "prefix_depth": 0,
+      "request_fd_count": 2,
       "expected_generation": 1,
       "generation_after": 2,
       "cpu_before": 1,
@@ -259,7 +274,9 @@ runner 在 `OUT_DIR/manifest.json` 自动记录：
       "invalid_reason": null
     }
 
-`status` 只有 `ok`、`expected_reject`、`invalid`、`failed`。分析器只纳入
+checkpoint 行的 `keep_bottom=0`、`prefix_depth=0`、`request_fd_count=2`；当前 restore
+矩阵的对应值为 `target_depth`、0、2。`status` 只有 `ok`、`expected_reject`、
+`invalid`、`failed`。分析器只纳入
 `status=ok && warmup=false`；任何其他行都保留并单独汇总。
 
 ### 7.3 固定分析
@@ -298,10 +315,11 @@ module，也不能把宿主机数据当作功能或 latency 结果。
 `e2-bench` 构建独立的 `switch_once`，不调用 `deltafsctl`，也不把 controller wall
 time 混入 ioctl latency。`check` 只运行 host-safe 的布局和 parser/analyzer 单元测试。
 
-2026-08-13 当前工作树已完成上述静态门禁：全部现有 userspace 工具和 E2 helper 以
-`-Wall -Wextra -Werror` 编译链接通过；request layout 与 C preflight 测试通过；14 个
-Python runner/analyzer 测试通过；`fs/overlayfs`（含 `deltafs.c`）通过 sparse。额外的
-GCC `-fanalyzer` 检查也通过。未在宿主机加载 module、mount OverlayFS 或产生 latency
+2026-08-15 当前工作树已完成上述静态门禁：v2 userspace 工具和 E2 helper 以
+`-Wall -Wextra -Werror` 编译链接通过；两个 v2 request layout、边界和 C preflight
+测试通过；17 个 Python runner/analyzer 测试通过；GCC `-fanalyzer` 和严格 checkpatch
+通过；v2 layout/controller/callsite 门禁通过；`fs/overlayfs`（含 `deltafs.c`）通过
+sparse 并生成 `overlay.ko`。未在宿主机加载 module、mount OverlayFS 或产生 latency
 数据；E2 smoke/run 的功能与性能结论仍必须由下述 QEMU/KVM 步骤产生。
 
 ## 9. QEMU/KVM 测试交接
@@ -314,17 +332,17 @@ GCC `-fanalyzer` 检查也通过。未在宿主机加载 module、mount OverlayF
 
     make -j"$(nproc)" bzImage modules
     make -C tools/deltafs clean all
-    make -C tools/deltafs p7-tools
+    make -C tools/deltafs v2-tools
     make -C tools/deltafs e2-bench
 
     if grep -q '^CONFIG_FUNCTION_ERROR_INJECTION=y' .config; then
-      make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=enabled
+      make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=enabled
     else
-      make -C tools/deltafs check-p7-checkpoints CHECKPOINT_MODE=disabled
+      make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=disabled
     fi
 
-期望生成 `arch/x86/boot/bzImage`、`fs/overlayfs/overlay.ko`、现有 P5--P7 工具以及
-`tools/deltafs/bench/e2/switch_once`。其余 P5--P7 gate 仍应执行。
+期望生成 `arch/x86/boot/bzImage`、`fs/overlayfs/overlay.ko`、v2 controller/layout/ioctl
+工具以及 `tools/deltafs/bench/e2/switch_once`。
 
 ### 9.2 启动 guest
 
@@ -357,38 +375,30 @@ GCC `-fanalyzer` 检查也通过。未在宿主机加载 module、mount OverlayF
       mount -t debugfs debugfs /sys/kernel/debug
     ulimit -n 192
     cd /mnt/host
-    make -C tools/deltafs p7-tools
+    make -C tools/deltafs v2-tools
     make -C tools/deltafs e2-bench
 
 确认 `uname -r` 对应本次 kernel、`findmnt -rn -t overlay` 没有输出，并以 root 执行
 后续命令。不要对未知或已挂载块设备运行 `mkfs`。
 
-### 9.3 现有功能门禁
+### 9.3 现有 v2 功能门禁
 
-当前没有可执行的 p1--p4 文件；它们是历史开发阶段，不应把缺失脚本记为失败。依次运行：
+历史 P1--P7 helper 已从 v2 工作树删除，不能把缺少这些旧入口记为失败。创建两个位于
+不同 backing filesystem 的专用目录后，依次运行现行 v2 门禁：
 
-    make -C tools/deltafs test-p6-controller
+    mkdir -p /mnt/deltafs-test/disk1/v2 /mnt/deltafs-test/disk2/v2
+    make -C tools/deltafs check-v2-layout
+    make -C tools/deltafs test-v2-controller
+    make -C tools/deltafs test-v2-acceptance \
+      BACKING_ROOT=/mnt/deltafs-test/disk1/v2 \
+      EXTRA_BACKING_ROOT=/mnt/deltafs-test/disk2/v2
 
-    tools/deltafs/p5_commit_test.sh \
-      --backing-root /mnt/deltafs-test/disk1/p5
+期望分别看到 layout PASS、controller unit tests PASS，以及：
 
-    tools/deltafs/p5_checkpoint_test.sh \
-      --backing-root /mnt/deltafs-test/disk1/p5
+    All DeltaFS v2 acceptance checks passed
 
-    tools/deltafs/p6_controller_test.sh \
-      --backing-root /mnt/deltafs-test/disk1/p6
-
-    tools/deltafs/p7_acceptance_test.sh \
-      --backing-root /mnt/deltafs-test/disk1 \
-      --extra-backing-root /mnt/deltafs-test/disk2
-
-期望分别看到 controller unit tests PASS、两个 P5 suite PASS、P6 suite PASS，以及：
-
-    All P7 DeltaFS v1 acceptance checks passed
-
-完整 debug guest 还要求 `section-17.tsv` 的 1--8 全部 PASS，且 deep fault injection
-报告 `N >= 128`。缺少 fault injection/sanitizer 能力时，P7 可以退出码 4 并显示
-capability-dependent `SKIP`；这不是完整 debug 证据。
+acceptance 在缺少 fault injection、sanitizer 或其他 debug capability 时可以退出码 4 并
+显示 capability-dependent `SKIP`；这不是完整 debug 证据，不能代替完整 v2 验收。
 
 ### 9.4 E2 smoke、主实验和分析
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -78,7 +79,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(row["fiemap_path"], "fiemap/sample.json")
         self.assertEqual(row["logical_bytes_changed"], event["write_bytes"])
 
-    def test_sample_preimage_remains_writable_for_copyup(self) -> None:
+    def test_sample_preimage_starts_in_generation_one_upper(self) -> None:
         event = events.generate_events("smoke")[0]
         with tempfile.TemporaryDirectory() as temporary:
             sample = pathlib.Path(temporary) / "sample"
@@ -88,9 +89,41 @@ class RunnerTests(unittest.TestCase):
                 run.create_sample(sample, event)
             finally:
                 run.syncfs = original_syncfs
-            target = sample / "lower" / "edit.bin"
+            target = sample / "generation-1" / "upper" / "edit.bin"
             self.assertEqual(target.stat().st_mode & 0o777, 0o644)
             self.assertEqual(run.sha256_file(target), event["expected_before_sha256"])
+            self.assertFalse((sample / "generation-2" / "upper" / "edit.bin").exists())
+
+    def test_checkpoint_freezes_generation_one_and_uses_v2_helper(self) -> None:
+        class RecordingLogs:
+            def __init__(self) -> None:
+                self.commands: list[list[str]] = []
+
+            def subprocess(self, command: list[str], **_kwargs: object
+                           ) -> subprocess.CompletedProcess[str]:
+                self.commands.append(command)
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+        event = events.generate_events("smoke")[0]
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = pathlib.Path(temporary) / "sample"
+            original_syncfs = run.syncfs
+            run.syncfs = lambda _path: None
+            try:
+                run.create_sample(sample, event)
+            finally:
+                run.syncfs = original_syncfs
+            logs = RecordingLogs()
+            helper = pathlib.Path("/tmp/checkpoint_v2")
+            run.checkpoint_sample(sample, helper, logs)  # type: ignore[arg-type]
+            frozen = sample / "layers" / "g1" / "edit.bin"
+            self.assertEqual(run.sha256_file(frozen), event["expected_before_sha256"])
+            self.assertFalse((sample / "generation-1" / "upper").exists())
+            self.assertEqual(logs.commands, [[
+                str(helper), str(sample / "merged"), "1",
+                str(sample / "generation-2" / "upper"),
+                str(sample / "generation-2" / "work"),
+            ]])
 
 
 if __name__ == "__main__":

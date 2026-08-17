@@ -42,6 +42,10 @@ def manifest(config: str, event_hash: str, event_count: int) -> dict:
         "device_stat": "/sys/block/test/stat",
         "canonical_device_stat": "/sys/devices/test/stat",
         "overlay_mount_options": list(run.MOUNT_FEATURES), "started_at": "test",
+        "deltafs_abi_version": run.DELTAFS_ABI_VERSION,
+        "initial_generation": run.INITIAL_GENERATION,
+        "checkpoint_generation": run.CHECKPOINT_GENERATION,
+        "copyup_source": run.COPYUP_SOURCE,
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
         "warm_count_per_cell": 1, "cold_count_per_cell": 1,
         "independent_runs": 1, "noop_interval": 20, "noop_repetitions": 3,
@@ -179,6 +183,19 @@ class AnalyzeTests(unittest.TestCase):
             value["event_file_sha256"] = "0" * 64
             write_json(root / "xfs_reflink" / "manifest.json", value)
             with self.assertRaises(analyze.AnalysisError):
+                analyze.discover(root)
+
+    def test_non_v2_manifest_is_rejected(self) -> None:
+        event_values = events.generate_events("smoke")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            path = root / "ext4_noreflink" / "manifest.json"
+            value = json.loads(path.read_text(encoding="ascii"))
+            value["deltafs_abi_version"] = 1
+            write_json(path, value)
+            with self.assertRaisesRegex(analyze.AnalysisError, "v2 lifecycle"):
                 analyze.discover(root)
 
 

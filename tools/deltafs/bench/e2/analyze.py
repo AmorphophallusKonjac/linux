@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-SCHEMA = 1
+SCHEMA = 2
+DELTAFS_ABI_VERSION = 2
 SEED = 14857
 MAX_LOWERS = 128
 BOOTSTRAP_REPLICATES = 10_000
@@ -27,6 +28,7 @@ VALID_STATUSES = frozenset(("ok", "expected_reject", "invalid", "failed"))
 RAW_FIELDS = frozenset((
     "schema", "run", "sample", "warmup", "operation", "source_depth",
     "target_depth", "request_depth", "rollback_distance",
+    "keep_bottom", "prefix_depth", "request_fd_count",
     "expected_generation", "generation_after", "cpu_before", "cpu_after",
     "major_faults", "ioctl_ret", "errno", "ioctl_latency_ns", "status",
     "invalid_reason",
@@ -106,7 +108,8 @@ def validate_raw_row(row: dict[str, Any], line_number: int) -> None:
         raise AnalysisError(f"raw line {line_number} has invalid status/warmup")
     integer_fields = (
         "run", "sample", "source_depth", "target_depth", "request_depth",
-        "rollback_distance", "expected_generation", "cpu_before", "cpu_after",
+        "rollback_distance", "keep_bottom", "prefix_depth", "request_fd_count",
+        "expected_generation", "cpu_before", "cpu_after",
         "major_faults", "ioctl_ret", "errno", "ioctl_latency_ns",
     )
     if any(not is_plain_int(row[field]) for field in integer_fields):
@@ -122,7 +125,8 @@ def validate_raw_row(row: dict[str, Any], line_number: int) -> None:
 
 def validate_manifest(manifest: dict[str, Any]) -> None:
     required = {
-        "schema", "preset", "seed", "git_commit", "kernel_release",
+        "schema", "deltafs_abi_version", "preset", "seed", "git_commit",
+        "kernel_release",
         "kernel_config_sha256", "fs_type", "fs_uuid",
         "backing_source", "backing_mount_options", "deltafs_mount_options",
         "cpu", "clocksource", "started_at", "depth_matrix", "warmup_count",
@@ -133,9 +137,13 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             f"manifest schema mismatch: missing={sorted(required - set(manifest))} "
             f"extra={sorted(set(manifest) - required)}"
         )
-    if not is_plain_int(manifest["schema"]) or not is_plain_int(manifest["seed"]) or \
-            manifest["schema"] != SCHEMA or manifest["seed"] != SEED:
-        raise AnalysisError("manifest schema or seed does not match E2 v1")
+    if not is_plain_int(manifest["schema"]) or \
+            not is_plain_int(manifest["deltafs_abi_version"]) or \
+            not is_plain_int(manifest["seed"]) or \
+            manifest["schema"] != SCHEMA or \
+            manifest["deltafs_abi_version"] != DELTAFS_ABI_VERSION or \
+            manifest["seed"] != SEED:
+        raise AnalysisError("manifest schema, ABI, or seed does not match E2 v2")
     if manifest["preset"] not in ("smoke", "run"):
         raise AnalysisError("manifest preset is not smoke or run")
     if manifest["fs_type"] not in ("ext4", "xfs"):
@@ -167,7 +175,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         manifest["independent_runs"],
     )
     if actual != expected:
-        raise AnalysisError(f"manifest preset matrix differs from E2 v1: {actual}")
+        raise AnalysisError(f"manifest preset matrix differs from E2 v2: {actual}")
 
 
 def validate_row_semantics(row: dict[str, Any], cpu: int) -> None:
@@ -177,12 +185,15 @@ def validate_row_semantics(row: dict[str, Any], cpu: int) -> None:
     if operation == "checkpoint":
         if row["target_depth"] != row["source_depth"] + 1 or \
                 row["request_depth"] != row["target_depth"] or \
-                row["rollback_distance"] != 0:
+                row["rollback_distance"] != 0 or row["keep_bottom"] != 0 or \
+                row["prefix_depth"] != 0 or row["request_fd_count"] != 2:
             raise AnalysisError("checkpoint raw depth semantics are invalid")
     else:
         if row["source_depth"] != MAX_LOWERS or \
                 row["target_depth"] != row["request_depth"] or \
-                row["rollback_distance"] != MAX_LOWERS - row["target_depth"]:
+                row["rollback_distance"] != MAX_LOWERS - row["target_depth"] or \
+                row["keep_bottom"] != row["target_depth"] or \
+                row["prefix_depth"] != 0 or row["request_fd_count"] != 2:
             raise AnalysisError("restore raw depth semantics are invalid")
     if row["status"] == "ok":
         if row["ioctl_ret"] != 0 or row["errno"] != 0 or \

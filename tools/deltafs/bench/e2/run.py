@@ -24,7 +24,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-SCHEMA = 1
+SCHEMA = 2
+DELTAFS_ABI_VERSION = 2
 SEED = 14857
 MAX_LOWERS = 128
 MOUNT_FEATURES = (
@@ -67,7 +68,7 @@ _IOC_NRSHIFT = 0
 _IOC_TYPESHIFT = 8
 _IOC_SIZESHIFT = 16
 _IOC_DIRSHIFT = 30
-REQUEST_FORMAT = "=IIQQiiII128i4Q"
+RESTORE_REQUEST_FORMAT = "=IIQQII130i4Q"
 REQUEST_SIZE = 584
 DELTAFS_IOC_RESTORE = (
     (_IOC_WRITE << _IOC_DIRSHIFT)
@@ -372,6 +373,7 @@ def build_manifest(preset_name: str, mount: dict[str, str], cpu: int) -> dict[st
         if clocksource_path.is_file() else "unknown"
     return {
         "schema": SCHEMA,
+        "deltafs_abi_version": DELTAFS_ABI_VERSION,
         "preset": preset_name,
         "seed": SEED,
         "git_commit": git_commit(repo_root),
@@ -568,22 +570,23 @@ def syncfs(path: pathlib.Path) -> None:
 
 
 def write_spec(sample_dir: pathlib.Path, attempt: Attempt, cpu: int) -> pathlib.Path:
-    lowers = target_lower_paths(sample_dir, attempt)
-    if len(lowers) != attempt.request_depth:
-        raise E2Error("internal request-depth mismatch")
+    lower_prefix: list[pathlib.Path] = []
+    keep_bottom = attempt.target_depth if attempt.operation == "restore" else 0
     all_paths = [sample_dir / "merged", sample_dir / "next" / "upper",
-                 sample_dir / "next" / "work", *lowers]
+                 sample_dir / "next" / "work", *lower_prefix]
     if any(len(str(path)) >= 4096 for path in all_paths):
         raise E2Error("an E2 switch path reaches PATH_MAX")
     spec = {
         "schema": SCHEMA,
         "operation": attempt.operation,
         "cpu": cpu,
+        "source_depth": attempt.source_depth,
         "expected_generation": 1,
+        "keep_bottom": keep_bottom,
         "merged": str(sample_dir / "merged"),
         "upper": str(sample_dir / "next" / "upper"),
         "work": str(sample_dir / "next" / "work"),
-        "lowers": [str(path) for path in lowers],
+        "lower_prefix": [str(path) for path in lower_prefix],
     }
     spec_path = sample_dir / "spec.json"
     atomic_write_json(spec_path, spec)
@@ -615,7 +618,7 @@ def run_driver(switch_once: pathlib.Path, spec_path: pathlib.Path,
     }
     if set(result) != required or result["schema"] != SCHEMA or \
             result["status"] not in ("ok", "expected_reject", "invalid", "failed"):
-        raise E2Error("switch_once result violates schema 1")
+        raise E2Error(f"switch_once result violates schema {SCHEMA}")
     if process.returncode and result["status"] != "failed":
         raise E2Error(
             f"switch_once exited {process.returncode} for {result['status']} result"
@@ -625,10 +628,10 @@ def run_driver(switch_once: pathlib.Path, spec_path: pathlib.Path,
 
 def invalid_generation_request(generation: int) -> bytearray:
     import struct
-    values = [REQUEST_SIZE, 1, 0, generation, -1, -1, 1, 0]
-    values.extend([-1] * MAX_LOWERS)
+    values = [REQUEST_SIZE, DELTAFS_ABI_VERSION, 0, generation, 1, 2]
+    values.extend([-1] * (MAX_LOWERS + 2))
     values.extend([0] * 4)
-    request = bytearray(struct.pack(REQUEST_FORMAT, *values))
+    request = bytearray(struct.pack(RESTORE_REQUEST_FORMAT, *values))
     if len(request) != REQUEST_SIZE:
         raise E2Error("Python DeltaFS request layout mismatch")
     return request
@@ -771,6 +774,10 @@ def raw_base(run_number: int, sample_number: int, attempt: Attempt) -> dict[str,
         "target_depth": attempt.target_depth,
         "request_depth": attempt.request_depth,
         "rollback_distance": attempt.rollback_distance,
+        "keep_bottom": attempt.target_depth
+        if attempt.operation == "restore" else 0,
+        "prefix_depth": 0,
+        "request_fd_count": 2,
         "expected_generation": 1,
         "generation_after": None,
         "cpu_before": -1,

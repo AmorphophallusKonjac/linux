@@ -66,7 +66,9 @@ class PresetTests(unittest.TestCase):
     def test_generation_probe_request_layout(self):
         request = run.invalid_generation_request(2)
         self.assertEqual(len(request), run.REQUEST_SIZE)
-        self.assertEqual(request[40:44], b"\xff\xff\xff\xff")
+        self.assertEqual(request[:8], b"H\x02\x00\x00\x02\x00\x00\x00")
+        self.assertEqual(request[24:32], b"\x01\x00\x00\x00\x02\x00\x00\x00")
+        self.assertEqual(request[32:36], b"\xff\xff\xff\xff")
         self.assertEqual(request[-32:], b"\x00" * 32)
 
     def test_mount_option_unescape(self):
@@ -87,14 +89,16 @@ class SampleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             spec = {
-                "schema": 1,
+                "schema": 2,
                 "operation": "checkpoint",
                 "cpu": min(run.os.sched_getaffinity(0)),
+                "source_depth": 128,
                 "expected_generation": 1,
+                "keep_bottom": 0,
                 "merged": "/does/not/exist/merged",
                 "upper": "/does/not/exist/upper",
                 "work": "/does/not/exist/work",
-                "lowers": [f"/does/not/exist/lower-{index}" for index in range(129)],
+                "lower_prefix": [],
             }
             spec_path = root / "spec.json"
             result_path = root / "result.json"
@@ -118,9 +122,11 @@ class SampleTests(unittest.TestCase):
             spec = json.loads(spec_path.read_text(encoding="utf-8"))
             self.assertTrue(active_upper.is_dir())
             self.assertFalse((root / "layers/l128").exists())
-            self.assertEqual(len(spec["lowers"]), 129)
+            self.assertEqual(spec["source_depth"], 128)
+            self.assertEqual(spec["keep_bottom"], 0)
+            self.assertEqual(spec["lower_prefix"], [])
 
-    def test_checkpoint_spec_freezes_upper_and_prepends_it(self):
+    def test_checkpoint_spec_freezes_upper_without_sending_lowers(self):
         attempt = run.Attempt("checkpoint", 2, 3, 3, 0, False)
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary) / "sample"
@@ -130,14 +136,52 @@ class SampleTests(unittest.TestCase):
             )
             self.assertFalse((root / "active/upper").exists())
             self.assertTrue((root / "layers/l002").is_dir())
-            self.assertEqual(
-                spec["lowers"],
-                [
-                    str(root / "layers/l002"),
-                    str(root / "layers/l001"),
-                    str(root / "base"),
-                ],
+            self.assertEqual(spec["source_depth"], 2)
+            self.assertEqual(spec["keep_bottom"], 0)
+            self.assertEqual(spec["lower_prefix"], [])
+
+    def test_restore_spec_keeps_target_bottom_without_prefix_fds(self):
+        attempt = run.Attempt("restore", 128, 8, 8, 120, False)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary) / "sample"
+            run.create_sample(root, 1, attempt)
+            spec = json.loads(
+                run.prepare_spec(root, attempt, 0).read_text(encoding="utf-8")
             )
+            self.assertEqual(spec["source_depth"], 128)
+            self.assertEqual(spec["keep_bottom"], 8)
+            self.assertEqual(spec["lower_prefix"], [])
+
+    def test_switch_once_accepts_v2_restore_spec_before_opening_paths(self):
+        binary = E2_DIR / "switch_once"
+        self.assertTrue(binary.is_file(), "make e2-bench before running tests")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            spec = {
+                "schema": 2,
+                "operation": "restore",
+                "cpu": min(run.os.sched_getaffinity(0)),
+                "source_depth": 128,
+                "expected_generation": 1,
+                "keep_bottom": 8,
+                "merged": "/does/not/exist/merged",
+                "upper": "/does/not/exist/upper",
+                "work": "/does/not/exist/work",
+                "lower_prefix": [],
+            }
+            spec_path = root / "spec.json"
+            result_path = root / "result.json"
+            spec_path.write_text(json.dumps(spec), encoding="utf-8")
+            process = subprocess.run(
+                [str(binary), str(spec_path), str(result_path)],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("open switch paths", process.stderr)
+            self.assertNotIn("read spec", process.stderr)
 
     def test_dmesg_suffix_and_overlap(self):
         self.assertEqual(run.new_dmesg("one\ntwo\n", "one\ntwo\nthree\n"), "three\n")

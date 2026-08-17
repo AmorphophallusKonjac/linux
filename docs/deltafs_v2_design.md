@@ -618,8 +618,8 @@ checkpoint 不再传或重新 `fget` 完整 lower fd 数组。restore 只传 tar
 
 kernel 仍为 target 的派生 layer clone private mounts，因此 builder 成本与 target
 depth 近似线性。mutex commit 本身只移动固定数量的 owner pointer，但完整 ioctl
-不能宣称 O(1)。E2 必须记录 target depth、keep_bottom、prefix depth、ioctl latency
-和 controller operation latency。
+不能宣称 O(1)。E2 必须记录 target depth、keep_bottom、prefix depth、request fd count
+和 ioctl latency；controller 端到端耗时属于独立 benchmark，不能混入 E2 ioctl latency。
 
 ## 12. 验证策略
 
