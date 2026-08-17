@@ -5,7 +5,10 @@
 
 依据：`CONFIG_OVERLAY_FS=m`，内核侧改动全部落在 overlay 模块内；启动所需驱动
 （`VIRTIO_PCI/VIRTIO_BLK/EXT4_FS/VIRTIO_NET`）全部内建；guest 里真正会用到的模块
-只有 9p 三件套 + xfs + overlay 共 5 个 `.ko`。
+是 9p 三件套 + xfs + overlay，它们的模块依赖 netfs（9p/FSCACHE）和
+libcrc32c（XFS），以及 guest 启动期会显式加载的 nls_iso8859-1（EFI/VFAT）、
+autofs4、msr 和 dm-multipath，共 11 个 `.ko`。缺少 nls_iso8859-1 会使
+`/boot/efi` 以 `IO charset iso8859-1 not found` 失败并进入 emergency mode。
 
 配套脚本：`tools/deltafs/dev/`（host 侧 `host-build.sh`；guest 侧 `guest-init.sh` /
 `guest-align.sh` / `guest-reload.sh`，guest 从 9p 共享直接运行）。
@@ -33,7 +36,10 @@ bash /mnt/host/tools/deltafs/dev/guest-reload.sh
 需要：首次对齐、改 `.config` / `CONFIG_LOCALVERSION` / 内核核心代码。
 
 ```bash
-# host：bzImage + 5 个最小模块 + 工具（不编全量 6258 个模块）
+# host：先检查依赖闭包，再构建 bzImage + 11 个最小模块 + 工具
+# （不编全量 6258 个模块）
+./tools/deltafs/dev/minimal-modules-test.sh
+# 期望：PASS: host/guest minimal module lists contain all 11 required modules
 ./tools/deltafs/dev/host-build.sh release
 
 # guest（root）：装最小模块集 + make install + 引导重启
@@ -46,6 +52,23 @@ bash /mnt/host/tools/deltafs/dev/guest-init.sh   # 状态应显示“已对齐�
 ```
 
 之后回到 1.1。
+
+`host-build.sh release` 也会自动运行同一个静态门禁。构建日志必须出现
+`MODPOST Module.symvers` 且没有 `undefined`，最终状态清单应包含：
+
+```text
+arch/x86/kernel/msr.ko
+drivers/md/dm-multipath.ko
+fs/autofs/autofs4.ko
+fs/nls/nls_iso8859-1.ko
+fs/overlayfs/overlay.ko
+fs/xfs/xfs.ko
+lib/libcrc32c.ko
+fs/netfs/netfs.ko
+fs/9p/9p.ko
+net/9p/9pnet.ko
+net/9p/9pnet_virtio.ko
+```
 
 ## 2. QEMU 启动参数
 
@@ -73,6 +96,36 @@ mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
 ```
 
 之后每次开机 `guest-init.sh` 会自动挂载并报告对齐状态。
+
+release 对齐后，在 guest 中验证最小模块树及其依赖解析：
+
+```bash
+KREL=$(uname -r)
+test -f "/lib/modules/$KREL/kernel/fs/netfs/netfs.ko"
+test -f "/lib/modules/$KREL/kernel/lib/libcrc32c.ko"
+test -f "/lib/modules/$KREL/kernel/fs/nls/nls_iso8859-1.ko"
+modprobe nls_iso8859-1
+modprobe autofs4
+modprobe msr
+modprobe dm-multipath
+modprobe xfs
+modprobe 9pnet_virtio
+modprobe 9p
+modprobe overlay
+mountpoint -q /boot/efi || mount /boot/efi
+lsmod | grep -E '^(overlay|9p|9pnet_virtio|9pnet|netfs|xfs|libcrc32c|nls_iso8859_1|autofs4|msr|dm_multipath) '
+```
+
+期望所有命令退出 0；`/boot/efi` 可成功挂载，`lsmod` 至少显示刚加载且未内建的
+模块，`modprobe xfs` 应自动解析 `libcrc32c`，`modprobe 9p` 应自动解析
+`netfs` 和 `9pnet`。若失败，收集：
+
+```bash
+modinfo -F depends "/lib/modules/$KREL/kernel/fs/xfs/xfs.ko"
+modinfo -F depends "/lib/modules/$KREL/kernel/fs/9p/9p.ko"
+find "/lib/modules/$KREL" -maxdepth 5 -type f | sort
+dmesg | tail -100
+```
 
 ## 3. 挂载与测试
 
@@ -106,7 +159,8 @@ mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
 | `rmmod: overlay is in use` | 有 overlay 挂载或进程引用 | `guest-reload.sh` 会列出残留挂载；`lsof`/`ps` 找占用进程 |
 | 重启后 `uname -r` 还是旧串 | grub 默认项没指向新内核 | 检查 `/etc/default/grub` 的 `GRUB_DEFAULT` 与 `/boot` 内容 |
 | `mount -t 9p` 失败 | 9p 模块缺失或 QEMU 没带 `-virtfs` | 确认 `-virtfs` 参数；`modprobe 9pnet_virtio && modprobe 9p` |
-| 某测试 `modprobe: FATAL: Module X not found` | 最小集没含 X | 把对应 `.ko` 路径加进 `host-build.sh` / `guest-align.sh` 的 `MINIMAL_MODULES` |
+| 启动进入 emergency，`/boot/efi` 报 `IO charset iso8859-1 not found` | 新 release 模块树缺 `nls_iso8859-1.ko` | 重跑修复后的 `host-build.sh release` 和 `guest-align.sh`；当次维护模式可手工安装该 `.ko`、`depmod`、`modprobe nls_iso8859-1`后挂载 `/boot/efi` |
+| 某测试 `modprobe: FATAL: Module X not found` | 最小模块依赖闭包不完整 | 先运行 `minimal-modules-test.sh`；把依赖 `.ko` 同时加入 `host-build.sh` / `guest-align.sh` 的 `MINIMAL_MODULES` |
 | `make install` 报 initramfs 错误 | 极少数发行版要求完整模块树 | 在 host 全量 `make modules_install INSTALL_MOD_PATH=...` 后同步，或改用 `-kernel` 直启 |
 | 树的 `kernel.release` 莫名变样 | guest 里跑过 kbuild 且无 git | host 重跑 `host-build.sh release` 恢复，再走 1.2 |
 

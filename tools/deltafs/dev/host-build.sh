@@ -11,10 +11,16 @@ KROOT=$(cd "$SCRIPT_DIR/../../.." && pwd)
 J=$(nproc)
 
 # guest 里真正会用到的模块全集。启动所需驱动（virtio/ext4）全部内建，
-# 除此之外按需增长：哪个测试 modprobe 报缺，就把对应 .ko 加进这里。
+# 此处必须包含手工选定模块的完整模块依赖闭包。
 MINIMAL_MODULES=(
+	arch/x86/kernel/msr.ko
+	drivers/md/dm-multipath.ko
+	fs/autofs/autofs4.ko
+	fs/nls/nls_iso8859-1.ko
 	fs/overlayfs/overlay.ko
 	fs/xfs/xfs.ko
+	lib/libcrc32c.ko
+	fs/netfs/netfs.ko
 	fs/9p/9p.ko
 	net/9p/9pnet.ko
 	net/9p/9pnet_virtio.ko
@@ -34,6 +40,9 @@ EOF
 }
 
 cmd_release() {
+	echo "==> 检查最小模块依赖闭包"
+	"$SCRIPT_DIR/minimal-modules-test.sh"
+
 	echo "==> make -j$J bzImage"
 	make -C "$KROOT" -j"$J" bzImage
 
