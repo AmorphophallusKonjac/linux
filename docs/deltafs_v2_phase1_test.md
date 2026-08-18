@@ -39,6 +39,7 @@ do
 done
 rg -n "call_rcu|kfree_rcu|rcu_assign_pointer|synchronize_rcu" fs/overlayfs/
 make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs check-v2-fast-path
 ```
 
 `super.c` 和 `params.c` 是 upstream 6.8 文件，整文件 strict checkpatch 存在与本次

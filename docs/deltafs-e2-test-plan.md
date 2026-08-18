@@ -294,6 +294,10 @@ cluster bootstrap：先抽 independent run，再抽 run 内 sample，固定 10,0
     analysis/invalid.jsonl
     analysis/latency-vs-depth.png
 
+PNG 图使用 log2 request-depth 横轴和按 mean 数据范围自动取整的线性延迟纵轴，只展示
+mean，不绘制置信区间。Checkpoint 使用蓝色实线和圆形 marker，restore 使用橙色虚线
+和方形 marker；图题不重复实验编号。TSV 中继续保留 run-cluster bootstrap CI95 字段。
+
 通过条件为：计划样本数全部满足、invalid/failed 为 0、所有 oracle 成功、depth 128
 restore 成功、checkpoint@128 只得到一次计划内 `E2BIG`。论文数字仅作参考，不设绝对
 延迟硬门槛，也不因曲线结果调整样本或删除数据。
@@ -460,3 +464,60 @@ smoke 通过后，重新创建空 backing 目录并运行固定主实验：
 若残留 mount 阻止打包，先记录 `findmnt -J --target MERGED`，再只对该失败 sample 执行
 `umount MERGED`。generation/oracle 不一致、计划外 errno、reset 失败或任何 kernel
 sanitizer/lockdep/RCU 报告都使该 independent run 失败。
+
+## 10. fast workdir / static validation 回归
+
+本优化只改变 ioctl 构建路径的固定开销，不改变 v2 UAPI。宿主机先执行静态检查和
+构建：
+
+    make -C tools/deltafs check-v2-fast-path
+    make -C tools/deltafs clean all
+
+在内核源码树中按现有配置构建模块（未设置 `$KERNEL_BUILD` 时使用当前构建目录）：
+
+    cd /home/wangmingyu/repos/agentfs/fs/deltafs
+    make -C "${KERNEL_BUILD:-.}" M="$PWD/fs/overlayfs" modules
+
+QEMU 中用该 kernel 和测试 disk image 启动（`ROOTFS`、`DATA1`、`DATA2` 换成实际
+镜像，且不要对已挂载盘执行 `mkfs`）：
+
+    KERNEL=/home/wangmingyu/repos/agentfs/fs/deltafs/arch/x86/boot/bzImage
+    qemu-system-x86_64 -enable-kvm -cpu host -smp 4 -m 4096 -nographic \
+      -kernel "$KERNEL" \
+      -append 'root=/dev/vda1 rw console=ttyS0 nokaslr' \
+      -drive if=virtio,format=qcow2,file="$ROOTFS" \
+      -drive if=virtio,format=raw,file="$DATA1" \
+      -drive if=virtio,format=raw,file="$DATA2" \
+      -virtfs local,path=/home/wangmingyu/repos/agentfs/fs/deltafs,\
+      mount_tag=host,security_model=none
+
+Guest 中挂载 9p、数据盘和 debugfs 后，按 v2 phase-1/acceptance 的 mount 与
+controller 初始化命令执行完整功能矩阵：
+
+    mkdir -p /mnt/host /mnt/deltafs-test/{disk1,disk2}
+    mount -t 9p -o trans=virtio,version=9p2000.L host /mnt/host
+    mount /dev/vdb /mnt/deltafs-test/disk1
+    mount /dev/vdc /mnt/deltafs-test/disk2
+    mountpoint -q /sys/kernel/debug || mount -t debugfs debugfs /sys/kernel/debug
+    cd /mnt/host
+
+    make -C tools/deltafs all
+    make -C tools/deltafs check-v2-fast-path
+    tools/deltafs/deltafs_v2_phase1_test.sh \
+      --backing-root /mnt/deltafs-test/disk1/phase1-run
+    tools/deltafs/deltafs_v2_acceptance_test.sh \
+      --backing-root /mnt/deltafs-test/disk1/acceptance-run \
+      --extra-backing-root /mnt/deltafs-test/disk2/acceptance-run
+    tools/deltafs/deltafs_v2_checkpoint_callsite_test.sh \
+      fs/overlayfs/deltafs.o fs/overlayfs/deltafs.c auto
+
+预期 phase-1、acceptance 和 callsite 脚本均以 `PASS` 结束；再运行 E2 smoke/run
+并比较优化前后的 `checkpoint`/`restore` 截距。失败时保存：
+
+    dmesg -T > /mnt/host/deltafs-fast-dmesg.log
+    findmnt -J > /mnt/host/deltafs-fast-findmnt.json
+    cat /proc/mounts > /mnt/host/deltafs-fast-mounts.txt
+
+若 fast 前提（不同 superblock、idmapped mount、只读 remount 或非空/重叠目录）不满足，
+期望得到明确的 `-EXDEV`、`-EOPNOTSUPP`、`-EROFS`、`-ENOTEMPTY` 或 `-EINVAL`，且
+generation 和 active view 不发生变化。

@@ -405,10 +405,11 @@ def write_invalid(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
 
 
 class Canvas:
-    def __init__(self, width: int, height: int, color: tuple[int, int, int]) -> None:
+    def __init__(self, width: int, height: int,
+                 background: tuple[int, int, int] = (255, 255, 255)) -> None:
         self.width = width
         self.height = height
-        self.pixels = bytearray(color * (width * height))
+        self.pixels = bytearray(background * (width * height))
 
     def set(self, x: int, y: int, color: tuple[int, int, int]) -> None:
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -417,15 +418,12 @@ class Canvas:
 
     def line(self, x0: int, y0: int, x1: int, y1: int,
              color: tuple[int, int, int], width: int = 1) -> None:
-        dx = abs(x1 - x0)
-        sx = 1 if x0 < x1 else -1
-        dy = -abs(y1 - y0)
-        sy = 1 if y0 < y1 else -1
+        dx, sx = abs(x1 - x0), 1 if x0 < x1 else -1
+        dy, sy = -abs(y1 - y0), 1 if y0 < y1 else -1
         error = dx + dy
         while True:
-            radius = width // 2
-            for px in range(x0 - radius, x0 + radius + 1):
-                for py in range(y0 - radius, y0 + radius + 1):
+            for px in range(x0 - width // 2, x0 + width // 2 + 1):
+                for py in range(y0 - width // 2, y0 + width // 2 + 1):
                     self.set(px, py, color)
             if x0 == x1 and y0 == y1:
                 break
@@ -437,15 +435,60 @@ class Canvas:
                 error += dx
                 y0 += sy
 
-    def circle(self, center_x: int, center_y: int, radius: int,
-               color: tuple[int, int, int]) -> None:
-        for y in range(center_y - radius, center_y + radius + 1):
-            for x in range(center_x - radius, center_x + radius + 1):
-                if (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2:
-                    self.set(x, y, color)
+    def circle(self, x: int, y: int, radius: int, color: tuple[int, int, int]) -> None:
+        for py in range(y - radius, y + radius + 1):
+            for px in range(x - radius, x + radius + 1):
+                if (px - x) ** 2 + (py - y) ** 2 <= radius ** 2:
+                    self.set(px, py, color)
+
+    def fill_rect(self, x0: int, y0: int, x1: int, y1: int,
+                  color: tuple[int, int, int]) -> None:
+        for y in range(max(0, y0), min(self.height, y1 + 1)):
+            for x in range(max(0, x0), min(self.width, x1 + 1)):
+                self.set(x, y, color)
+
+    def dashed_line(self, x0: int, y0: int, x1: int, y1: int,
+                    color: tuple[int, int, int], width: int,
+                    dash: int, gap: int) -> None:
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length == 0:
+            self.circle(x0, y0, max(1, width // 2), color)
+            return
+        cursor = 0.0
+        while cursor < length:
+            end = min(cursor + dash, length)
+            start_ratio, end_ratio = cursor / length, end / length
+            self.line(
+                round(x0 + (x1 - x0) * start_ratio),
+                round(y0 + (y1 - y0) * start_ratio),
+                round(x0 + (x1 - x0) * end_ratio),
+                round(y0 + (y1 - y0) * end_ratio),
+                color, width,
+            )
+            cursor += dash + gap
+
+    def marker(self, x: int, y: int, radius: int, color: tuple[int, int, int],
+               shape: str, width: int = 2) -> None:
+        if shape == "circle":
+            outer, inner = radius ** 2, max(0, radius - width) ** 2
+            for py in range(y - radius, y + radius + 1):
+                for px in range(x - radius, x + radius + 1):
+                    distance = (px - x) ** 2 + (py - y) ** 2
+                    if inner <= distance <= outer:
+                        self.set(px, py, color)
+        elif shape == "square":
+            self.line(x - radius, y - radius, x + radius, y - radius, color, width)
+            self.line(x + radius, y - radius, x + radius, y + radius, color, width)
+            self.line(x + radius, y + radius, x - radius, y + radius, color, width)
+            self.line(x - radius, y + radius, x - radius, y - radius, color, width)
+        else:
+            self.line(x, y - radius, x + radius, y, color, width)
+            self.line(x + radius, y, x, y + radius, color, width)
+            self.line(x, y + radius, x - radius, y, color, width)
+            self.line(x - radius, y, x, y - radius, color, width)
 
     def text(self, x: int, y: int, value: str, color: tuple[int, int, int],
-             scale: int = 2) -> None:
+             scale: int = 1) -> None:
         for character in value.upper():
             glyph = FONT.get(character, FONT["?"])
             for row, bits in enumerate(glyph):
@@ -453,47 +496,33 @@ class Canvas:
                     if bits & (1 << (4 - column)):
                         for offset_y in range(scale):
                             for offset_x in range(scale):
-                                self.set(
-                                    x + column * scale + offset_x,
-                                    y + row * scale + offset_y,
-                                    color,
-                                )
+                                self.set(x + column * scale + offset_x,
+                                         y + row * scale + offset_y, color)
             x += 6 * scale
 
 
 FONT = {
-    " ": (0, 0, 0, 0, 0, 0, 0),
-    "-": (0, 0, 0, 31, 0, 0, 0),
-    ".": (0, 0, 0, 0, 0, 6, 6),
-    "?": (14, 17, 1, 2, 4, 0, 4),
-    "0": (14, 17, 19, 21, 25, 17, 14),
-    "1": (4, 12, 4, 4, 4, 4, 14),
-    "2": (14, 17, 1, 2, 4, 8, 31),
-    "3": (30, 1, 1, 14, 1, 1, 30),
-    "4": (2, 6, 10, 18, 31, 2, 2),
-    "5": (31, 16, 16, 30, 1, 1, 30),
-    "6": (14, 16, 16, 30, 17, 17, 14),
-    "7": (31, 1, 2, 4, 8, 8, 8),
-    "8": (14, 17, 17, 14, 17, 17, 14),
-    "9": (14, 17, 17, 15, 1, 1, 14),
-    "A": (14, 17, 17, 31, 17, 17, 17),
-    "C": (14, 17, 16, 16, 16, 17, 14),
-    "D": (30, 17, 17, 17, 17, 17, 30),
-    "E": (31, 16, 16, 30, 16, 16, 31),
-    "H": (17, 17, 17, 31, 17, 17, 17),
-    "I": (14, 4, 4, 4, 4, 4, 14),
-    "K": (17, 18, 20, 24, 20, 18, 17),
-    "L": (16, 16, 16, 16, 16, 16, 31),
-    "N": (17, 25, 21, 21, 19, 17, 17),
-    "O": (14, 17, 17, 17, 17, 17, 14),
-    "P": (30, 17, 17, 30, 16, 16, 16),
-    "Q": (14, 17, 17, 17, 21, 18, 13),
-    "R": (30, 17, 17, 30, 20, 18, 17),
-    "S": (15, 16, 16, 14, 1, 1, 30),
-    "T": (31, 4, 4, 4, 4, 4, 4),
-    "U": (17, 17, 17, 17, 17, 17, 14),
-    "W": (17, 17, 17, 21, 21, 21, 10),
-    "Y": (17, 17, 10, 4, 4, 4, 4),
+    " ": (0, 0, 0, 0, 0, 0, 0), "-": (0, 0, 0, 31, 0, 0, 0),
+    ".": (0, 0, 0, 0, 0, 6, 6), "/": (1, 2, 4, 8, 16, 0, 0),
+    "^": (4, 10, 17, 0, 0, 0, 0), "?": (14, 17, 1, 2, 4, 0, 4),
+    "0": (14, 17, 19, 21, 25, 17, 14), "1": (4, 12, 4, 4, 4, 4, 14),
+    "2": (14, 17, 1, 2, 4, 8, 31), "3": (30, 1, 1, 14, 1, 1, 30),
+    "4": (2, 6, 10, 18, 31, 2, 2), "5": (31, 16, 16, 30, 1, 1, 30),
+    "6": (14, 16, 16, 30, 17, 17, 14), "7": (31, 1, 2, 4, 8, 8, 8),
+    "8": (14, 17, 17, 14, 17, 17, 14), "9": (14, 17, 17, 15, 1, 1, 14),
+    "A": (14, 17, 17, 31, 17, 17, 17), "B": (30, 17, 17, 30, 17, 17, 30),
+    "C": (14, 17, 16, 16, 16, 17, 14), "D": (30, 17, 17, 17, 17, 17, 30),
+    "E": (31, 16, 16, 30, 16, 16, 31), "F": (31, 16, 16, 30, 16, 16, 16),
+    "G": (14, 17, 16, 23, 17, 17, 15), "H": (17, 17, 17, 31, 17, 17, 17),
+    "I": (14, 4, 4, 4, 4, 4, 14), "J": (7, 2, 2, 2, 2, 18, 12),
+    "K": (17, 18, 20, 24, 20, 18, 17), "L": (16, 16, 16, 16, 16, 16, 31),
+    "M": (17, 27, 21, 21, 17, 17, 17), "N": (17, 25, 21, 21, 19, 17, 17),
+    "O": (14, 17, 17, 17, 17, 17, 14), "P": (30, 17, 17, 30, 16, 16, 16),
+    "Q": (14, 17, 17, 17, 21, 18, 13), "R": (30, 17, 17, 30, 20, 18, 17),
+    "S": (15, 16, 16, 14, 1, 1, 30), "T": (31, 4, 4, 4, 4, 4, 4),
+    "U": (17, 17, 17, 17, 17, 17, 14), "V": (17, 17, 17, 17, 17, 10, 4),
+    "W": (17, 17, 17, 21, 21, 21, 10), "X": (17, 17, 10, 4, 10, 17, 17),
+    "Y": (17, 17, 10, 4, 4, 4, 4), "Z": (31, 1, 2, 4, 8, 16, 31),
 }
 
 
@@ -502,62 +531,134 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
 
 
+PLOT_TITLE = "SWITCH IOCTL LATENCY"
+PLOT_STYLES: dict[str, dict[str, Any]] = {
+    "checkpoint": {
+        "color": (0, 114, 178), "label": "CHECKPOINT", "marker": "circle",
+        "radius": 5, "width": 3, "dash": None,
+    },
+    "restore": {
+        "color": (213, 94, 0), "label": "RESTORE", "marker": "square",
+        "radius": 7, "width": 4, "dash": (13, 7),
+    },
+}
+
+
+def text_width(value: str, scale: int = 1) -> int:
+    return max(0, len(value) * 6 * scale - scale)
+
+
+def nice_number(value: float) -> float:
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    if fraction < 1.5:
+        nice = 1.0
+    elif fraction < 3.0:
+        nice = 2.0
+    elif fraction < 7.0:
+        nice = 5.0
+    else:
+        nice = 10.0
+    return nice * (10 ** exponent)
+
+
+def linear_plot_bounds(values: Iterable[float]) -> tuple[float, float, list[float]]:
+    finite = [value for value in values if math.isfinite(value)]
+    if not finite:
+        return 0.0, 1.0, [0.0, 0.5, 1.0]
+    low, high = min(finite), max(finite)
+    span = max(high - low, 1.0)
+    padded_low = max(0.0, low - span * 0.08)
+    padded_high = high + span * 0.08
+    step = nice_number(max((padded_high - padded_low) / 5.0, 1.0))
+    axis_low = math.floor(padded_low / step) * step
+    axis_high = math.ceil(padded_high / step) * step
+    if axis_low == axis_high:
+        axis_high = axis_low + step
+    count = int(round((axis_high - axis_low) / step))
+    ticks = [axis_low + index * step for index in range(count + 1)]
+    return axis_low, axis_high, ticks
+
+
+def format_latency_tick(value: float, step: float) -> str:
+    if step >= 1:
+        return str(round(value))
+    return f"{value:.1f}"
+
+
+def styled_line(canvas: Canvas, start: tuple[int, int], end: tuple[int, int],
+                style: dict[str, Any]) -> None:
+    if style["dash"] is None:
+        canvas.line(*start, *end, style["color"], style["width"])
+    else:
+        canvas.dashed_line(*start, *end, style["color"], style["width"], *style["dash"])
+
+
 def write_png(path: pathlib.Path, stats: list[GroupStats]) -> None:
-    width, height = 1000, 600
-    left, right, top, bottom = 90, 50, 50, 70
-    canvas = Canvas(width, height, (255, 255, 255))
-    axis = (45, 45, 45)
-    grid = (220, 224, 228)
-    colors = {"checkpoint": (20, 105, 170), "restore": (190, 60, 45)}
-    maximum = max((item.ci95_high for item in stats), default=1.0)
-    maximum = max(maximum, 1.0) * 1.08
-    plot_width = width - left - right
-    plot_height = height - top - bottom
-    for tick in range(6):
-        y = top + round(plot_height * tick / 5)
+    width, height = 1200, 720
+    left, right, top, bottom = 110, 55, 105, 110
+    canvas = Canvas(width, height, (248, 250, 252))
+    axis, muted = (31, 41, 55), (91, 105, 120)
+    grid, frame = (221, 227, 234), (183, 193, 204)
+    plot_background = (255, 255, 255)
+    plot_width, plot_height = width - left - right, height - top - bottom
+    values = [item.mean / 1000.0 for item in stats]
+    y_low, y_high, ticks = linear_plot_bounds(values)
+
+    def y_position(value: float) -> int:
+        return top + round((1.0 - (value - y_low) / (y_high - y_low)) * plot_height)
+
+    def x_position(depth: int) -> int:
+        ratio = math.log2(depth) / math.log2(MAX_LOWERS)
+        return left + round(ratio * plot_width)
+
+    canvas.fill_rect(left, top, width - right, height - bottom, plot_background)
+    for tick in ticks:
+        y = y_position(tick)
         canvas.line(left, y, width - right, y, grid)
-        tick_value = maximum * (5 - tick) / 5 / 1000.0
-        canvas.text(8, y - 7, f"{tick_value:.1f}", axis, 1)
+        label = format_latency_tick(tick, ticks[1] - ticks[0])
+        canvas.text(left - text_width(label) - 14, y - 4, label, muted)
+    canvas.line(left, top, width - right, top, frame)
+    canvas.line(width - right, top, width - right, height - bottom, frame)
     canvas.line(left, top, left, height - bottom, axis, 2)
     canvas.line(left, height - bottom, width - right, height - bottom, axis, 2)
-    canvas.text(left, 16, "E2 SWITCH IOCTL LATENCY", axis, 2)
-    canvas.text(8, top - 25, "LATENCY US", axis, 1)
-    canvas.text(width // 2 - 70, height - 25, "REQUEST DEPTH", axis, 1)
+    canvas.text(left, 18, PLOT_TITLE, axis, 2)
+    canvas.text(left, 51, "MEAN LATENCY", muted)
+    canvas.text(left, top - 24, "IOCTL LATENCY - MICROSECONDS", muted)
     for depth in (1, 2, 4, 8, 16, 32, 64, 128):
-        x_ratio = math.log2(depth) / math.log2(MAX_LOWERS)
-        x = left + round(x_ratio * plot_width)
-        canvas.line(x, height - bottom, x, height - bottom + 5, axis)
-        canvas.text(x - len(str(depth)) * 3, height - bottom + 10,
-                    str(depth), axis, 1)
-    legend_y = 20
-    canvas.line(width - 300, legend_y + 7, width - 265, legend_y + 7,
-                colors["checkpoint"], 3)
-    canvas.text(width - 255, legend_y, "CHECKPOINT", axis, 1)
-    canvas.line(width - 155, legend_y + 7, width - 120, legend_y + 7,
-                colors["restore"], 3)
-    canvas.text(width - 110, legend_y, "RESTORE", axis, 1)
+        x = x_position(depth)
+        canvas.line(x, height - bottom, x, height - bottom + 6, axis)
+        label = str(depth)
+        canvas.text(x - text_width(label) // 2, height - bottom + 14, label, axis)
+    x_caption = "REQUEST DEPTH - LOG2 SCALE"
+    canvas.text(left + (plot_width - text_width(x_caption)) // 2,
+                height - bottom + 42, x_caption, muted)
 
-    def point(item: GroupStats) -> tuple[int, int]:
-        x_ratio = math.log2(item.request_depth) / math.log2(MAX_LOWERS)
-        x = left + round(x_ratio * plot_width)
-        y = top + round((1.0 - item.mean / maximum) * plot_height)
-        return x, y
-
+    series_by_operation: dict[str, list[GroupStats]] = {}
+    for operation in PLOT_STYLES:
+        series_by_operation[operation] = sorted(
+            (item for item in stats if item.operation == operation),
+            key=lambda item: item.request_depth,
+        )
     for operation in ("checkpoint", "restore"):
-        series = sorted((item for item in stats if item.operation == operation),
-                        key=lambda item: item.request_depth)
-        previous = None
-        for item in series:
-            x, y = point(item)
-            low_y = top + round((1.0 - item.ci95_low / maximum) * plot_height)
-            high_y = top + round((1.0 - item.ci95_high / maximum) * plot_height)
-            canvas.line(x, high_y, x, low_y, colors[operation], 2)
-            canvas.line(x - 5, high_y, x + 5, high_y, colors[operation], 2)
-            canvas.line(x - 5, low_y, x + 5, low_y, colors[operation], 2)
-            if previous is not None:
-                canvas.line(previous[0], previous[1], x, y, colors[operation], 3)
-            canvas.circle(x, y, 5, colors[operation])
-            previous = (x, y)
+        style = PLOT_STYLES[operation]
+        points = [
+            (x_position(item.request_depth), y_position(item.mean / 1000.0))
+            for item in series_by_operation[operation]
+        ]
+        for start, end in zip(points, points[1:]):
+            styled_line(canvas, start, end, style)
+        for x, y in points:
+            canvas.marker(x, y, style["radius"], style["color"], style["marker"])
+
+    legend_x = width - 300
+    for index, operation in enumerate(("checkpoint", "restore")):
+        style = PLOT_STYLES[operation]
+        y = 22 + index * 22
+        styled_line(canvas, (legend_x, y), (legend_x + 48, y), style)
+        canvas.marker(legend_x + 24, y, style["radius"], style["color"], style["marker"])
+        canvas.text(legend_x + 62, y - 4, style["label"], axis)
+    canvas.text(left, height - 24, "POINTS SHOW MEAN LATENCY", muted)
     raw = b"".join(b"\x00" + bytes(canvas.pixels[y * width * 3:(y + 1) * width * 3])
                    for y in range(height))
     png = b"\x89PNG\r\n\x1a\n"

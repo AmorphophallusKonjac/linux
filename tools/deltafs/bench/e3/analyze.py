@@ -90,6 +90,16 @@ class GroupStats:
     ci95_high: float
 
 
+@dataclass(frozen=True)
+class AmplificationStats:
+    fs_config: str
+    file_size_before: int
+    logical_bytes_changed: int
+    metric: str
+    count: int
+    p50: float
+
+
 def is_plain_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -566,6 +576,38 @@ def calculate_stats(rows: list[dict[str, Any]],
     return result
 
 
+AMPLIFICATION_METRICS = (
+    "copyup_amplification",
+    "physical_write_amplification",
+)
+
+
+def calculate_amplification_stats(rows: list[dict[str, Any]]) -> list[AmplificationStats]:
+    grouped: dict[tuple[str, int, int, str], list[float]] = collections.defaultdict(list)
+    for row in rows:
+        if row["status"] != "ok":
+            continue
+        logical = int(row["logical_bytes_changed"])
+        if logical <= 0:
+            raise AnalysisError("amplification row has no logical write bytes")
+        values = {
+            "copyup_amplification": float(row["copyup_bytes"]) / logical,
+            "physical_write_amplification": float(row["physical_io_bytes"]) / logical,
+        }
+        for metric, value in values.items():
+            grouped[(row["fs_config"], int(row["file_size_before"]),
+                     logical, metric)].append(value)
+    result = []
+    for key in sorted(grouped, key=lambda item: (
+            FS_CONFIGS.index(item[0]), item[1], item[2],
+            AMPLIFICATION_METRICS.index(item[3]))):
+        values = grouped[key]
+        result.append(AmplificationStats(
+            *key, len(values), statistics.median(values),
+        ))
+    return result
+
+
 def paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     by_event: dict[str, dict[str, dict[str, Any]]] = collections.defaultdict(dict)
     errors_found: list[str] = []
@@ -735,11 +777,26 @@ def write_sensitivity(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("".join(lines), encoding="ascii")
 
 
+def write_amplification_summary(path: pathlib.Path,
+                                stats: list[AmplificationStats]) -> None:
+    lines = [
+        "fs_config\tfile_size_before\tlogical_bytes_changed\tmetric\tn\tp50\n",
+    ]
+    for item in stats:
+        lines.append("\t".join((
+            item.fs_config, str(item.file_size_before),
+            str(item.logical_bytes_changed), item.metric, str(item.count),
+            number(item.p50),
+        )) + "\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+
 class Canvas:
-    def __init__(self, width: int, height: int) -> None:
+    def __init__(self, width: int, height: int,
+                 background: tuple[int, int, int] = (255, 255, 255)) -> None:
         self.width = width
         self.height = height
-        self.pixels = bytearray((255, 255, 255) * (width * height))
+        self.pixels = bytearray(background * (width * height))
 
     def set(self, x: int, y: int, color: tuple[int, int, int]) -> None:
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -771,6 +828,56 @@ class Canvas:
                 if (px - x) ** 2 + (py - y) ** 2 <= radius ** 2:
                     self.set(px, py, color)
 
+    def fill_rect(self, x0: int, y0: int, x1: int, y1: int,
+                  color: tuple[int, int, int]) -> None:
+        for y in range(max(0, y0), min(self.height, y1 + 1)):
+            for x in range(max(0, x0), min(self.width, x1 + 1)):
+                self.set(x, y, color)
+
+    def dashed_line(self, x0: int, y0: int, x1: int, y1: int,
+                    color: tuple[int, int, int], width: int,
+                    dash: int, gap: int) -> None:
+        length = math.hypot(x1 - x0, y1 - y0)
+        if length == 0:
+            self.circle(x0, y0, max(1, width // 2), color)
+            return
+        cursor = 0.0
+        while cursor < length:
+            end = min(cursor + dash, length)
+            start_ratio = cursor / length
+            end_ratio = end / length
+            self.line(
+                round(x0 + (x1 - x0) * start_ratio),
+                round(y0 + (y1 - y0) * start_ratio),
+                round(x0 + (x1 - x0) * end_ratio),
+                round(y0 + (y1 - y0) * end_ratio),
+                color, width,
+            )
+            cursor += dash + gap
+
+    def marker(self, x: int, y: int, radius: int, color: tuple[int, int, int],
+               shape: str, width: int = 2) -> None:
+        if shape == "circle":
+            outer = radius ** 2
+            inner = max(0, radius - width) ** 2
+            for py in range(y - radius, y + radius + 1):
+                for px in range(x - radius, x + radius + 1):
+                    distance = (px - x) ** 2 + (py - y) ** 2
+                    if inner <= distance <= outer:
+                        self.set(px, py, color)
+        elif shape == "square":
+            self.line(x - radius, y - radius, x + radius, y - radius, color, width)
+            self.line(x + radius, y - radius, x + radius, y + radius, color, width)
+            self.line(x + radius, y + radius, x - radius, y + radius, color, width)
+            self.line(x - radius, y + radius, x - radius, y - radius, color, width)
+        elif shape == "diamond":
+            self.line(x, y - radius, x + radius, y, color, width)
+            self.line(x + radius, y, x, y + radius, color, width)
+            self.line(x, y + radius, x - radius, y, color, width)
+            self.line(x - radius, y, x, y - radius, color, width)
+        else:
+            raise ValueError(f"unknown marker shape: {shape}")
+
     def text(self, x: int, y: int, value: str, color: tuple[int, int, int],
              scale: int = 1) -> None:
         for character in value.upper():
@@ -799,12 +906,16 @@ FONT = {
     "E": (31, 16, 16, 30, 16, 16, 31), "F": (31, 16, 16, 30, 16, 16, 16),
     "G": (14, 17, 16, 23, 17, 17, 15), "H": (17, 17, 17, 31, 17, 17, 17),
     "I": (14, 4, 4, 4, 4, 4, 14), "K": (17, 18, 20, 24, 20, 18, 17),
+    "J": (7, 2, 2, 2, 2, 18, 12),
     "L": (16, 16, 16, 16, 16, 16, 31), "M": (17, 27, 21, 21, 17, 17, 17),
     "N": (17, 25, 21, 21, 19, 17, 17), "O": (14, 17, 17, 17, 17, 17, 14),
     "P": (30, 17, 17, 30, 16, 16, 16), "R": (30, 17, 17, 30, 20, 18, 17),
+    "Q": (14, 17, 17, 17, 21, 18, 13),
     "S": (15, 16, 16, 14, 1, 1, 30), "T": (31, 4, 4, 4, 4, 4, 4),
     "U": (17, 17, 17, 17, 17, 17, 14), "W": (17, 17, 17, 21, 21, 21, 10),
+    "V": (17, 17, 17, 17, 17, 10, 4),
     "X": (17, 17, 10, 4, 10, 17, 17), "Y": (17, 17, 10, 4, 4, 4, 4),
+    "Z": (31, 1, 2, 4, 8, 16, 31),
 }
 
 
@@ -813,52 +924,171 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload))
 
 
-def write_plot(path: pathlib.Path, stats: list[GroupStats], metric: str) -> None:
-    width, height = 1000, 600
-    left, right, top, bottom = 90, 50, 55, 70
-    canvas = Canvas(width, height)
-    axis, grid = (40, 40, 40), (220, 224, 228)
-    colors = {
-        "ext4_noreflink": (20, 105, 170),
-        "xfs_noreflink": (210, 130, 25),
-        "xfs_reflink": (35, 145, 85),
-    }
-    values = [item for item in stats if item.cache_mode == "warm" and item.metric == metric]
-    maximum = max((item.p50 for item in values), default=1.0)
-    maximum = max(maximum, 1.0)
-    log_max = max(1.0, math.log2(maximum))
-    plot_width, plot_height = width - left - right, height - top - bottom
-    for tick in range(6):
-        y = top + round(plot_height * tick / 5)
-        canvas.line(left, y, width - right, y, grid)
-        exponent = log_max * (5 - tick) / 5
-        canvas.text(12, y - 4, f"2^{exponent:.0f}", axis)
-    canvas.line(left, top, left, height - bottom, axis, 2)
-    canvas.line(left, height - bottom, width - right, height - bottom, axis, 2)
-    title = "E3 COPYUP BY SIZE" if metric == "copyup_bytes" else "E3 PHYSICAL IO BY SIZE"
+FILE_SIZE_STYLES: dict[int, dict[str, Any]] = {
+    4 * 1024: {
+        "color": (0, 114, 178), "label": "4K", "marker": "circle",
+        "radius": 4, "width": 2, "dash": None,
+    },
+    12 * 1024: {
+        "color": (213, 94, 0), "label": "12K", "marker": "square",
+        "radius": 4, "width": 2, "dash": None,
+    },
+    24 * 1024: {
+        "color": (0, 158, 115), "label": "24K", "marker": "diamond",
+        "radius": 4, "width": 2, "dash": None,
+    },
+    48 * 1024: {
+        "color": (204, 121, 167), "label": "48K", "marker": "circle",
+        "radius": 5, "width": 2, "dash": (10, 5),
+    },
+    96 * 1024: {
+        "color": (230, 159, 0), "label": "96K", "marker": "square",
+        "radius": 5, "width": 2, "dash": (10, 5),
+    },
+    192 * 1024: {
+        "color": (86, 97, 110), "label": "192K", "marker": "diamond",
+        "radius": 5, "width": 2, "dash": (10, 5),
+    },
+}
+FILE_SIZE_ORDER = tuple(size * 1024 for size in events.FILE_SIZES)
+WRITE_SIZE_ORDER = tuple(blocks * events.BLOCK_SIZE for blocks in events.DIRTY_BLOCKS)
+PANEL_TITLES = {
+    "ext4_noreflink": "EXT4 NO REFLINK",
+    "xfs_noreflink": "XFS NO REFLINK",
+    "xfs_reflink": "XFS REFLINK",
+}
+PLOT_TITLES = {
+    "copyup_amplification": "COPY-UP AMPLIFICATION BY LOGICAL WRITE SIZE",
+    "physical_write_amplification":
+        "PHYSICAL WRITE AMPLIFICATION BY LOGICAL WRITE SIZE",
+}
+PLOT_FILES = {
+    "copyup_amplification": "copyup-amplification-by-write-size.png",
+    "physical_write_amplification":
+        "physical-write-amplification-by-write-size.png",
+}
+LEGACY_PLOT_FILES = ("copyup-by-size.png", "physical-io-by-size.png")
+
+
+def text_width(value: str, scale: int = 1) -> int:
+    return max(0, len(value) * 6 * scale - scale)
+
+
+def log2_plot_bounds(values: Iterable[float]) -> tuple[float, float, list[int]]:
+    positive = [value for value in values if value > 0]
+    if not positive:
+        return -0.25, 1.15, [0, 1]
+    tick_low = math.floor(math.log2(min(positive)))
+    tick_high = math.ceil(math.log2(max(positive)))
+    if tick_low == tick_high:
+        tick_low -= 1
+        tick_high += 1
+    return tick_low - 0.25, tick_high + 0.15, list(range(tick_low, tick_high + 1))
+
+
+def format_amplification_tick(exponent: int) -> str:
+    if exponent >= 0:
+        return f"{1 << exponent}X"
+    return f"1/{1 << -exponent}X"
+
+
+def styled_line(canvas: Canvas, start: tuple[int, int], end: tuple[int, int],
+                style: dict[str, Any]) -> None:
+    dash = style["dash"]
+    if dash is None:
+        canvas.line(*start, *end, style["color"], style["width"])
+    else:
+        canvas.dashed_line(*start, *end, style["color"], style["width"], *dash)
+
+
+def write_plot(path: pathlib.Path, stats: list[AmplificationStats], metric: str) -> None:
+    width, height = 1440, 760
+    left, right, top, bottom = 88, 34, 148, 112
+    panel_gap = 28
+    canvas = Canvas(width, height, (248, 250, 252))
+    axis, muted = (31, 41, 55), (91, 105, 120)
+    grid = (221, 227, 234)
+    frame = (183, 193, 204)
+    plot_background = (255, 255, 255)
+    values = [item for item in stats if item.metric == metric]
+    if not values:
+        raise AnalysisError(f"plot has no amplification values: {metric}")
+    total_width = width - left - right
+    panel_width = (total_width - panel_gap * (len(FS_CONFIGS) - 1)) // len(FS_CONFIGS)
+    plot_height = height - top - bottom
+    log_low, log_high, ticks = log2_plot_bounds(item.p50 for item in values)
+
+    def y_position(value: float) -> int:
+        ratio = (math.log2(value) - log_low) / (log_high - log_low)
+        return top + round((1 - ratio) * plot_height)
+
+    title = PLOT_TITLES[metric]
     canvas.text(left, 18, title, axis, 2)
-    canvas.text(12, top - 18, "BYTES LOG2", axis)
-    for index, label in enumerate(("4K", "8-16K", "16-32K", "32-64K", "64-128K", "128-256K")):
-        x = left + round(index * plot_width / 5)
-        canvas.line(x, height - bottom, x, height - bottom + 6, axis)
-        canvas.text(x - len(label) * 3, height - bottom + 12, label, axis)
-    for config in FS_CONFIGS:
-        series = sorted(
-            (item for item in values if item.fs_config == config),
-            key=lambda item: list(events.SIZE_BINS.values()).index(item.size_bin),
-        )
-        previous = None
-        for index, item in enumerate(series):
-            x = left + round(index * plot_width / 5)
-            y = top + round((1 - math.log2(max(item.p50, 1.0)) / log_max) * plot_height)
-            if previous is not None:
-                canvas.line(previous[0], previous[1], x, y, colors[config], 3)
-            canvas.circle(x, y, 5, colors[config])
-            previous = (x, y)
-    for index, config in enumerate(FS_CONFIGS):
-        y = 18 + index * 12
-        canvas.line(width - 240, y, width - 200, y, colors[config], 4)
-        canvas.text(width - 190, y - 4, config.replace("_", "-"), axis)
+    canvas.text(left, 51, "PER-CELL MEDIAN - PANELS ARE FILESYSTEMS", muted)
+    canvas.text(left, 78, "FILE SIZE", muted)
+    legend_start = left + 86
+    legend_step = 152
+    for index, file_size in enumerate(FILE_SIZE_ORDER):
+        style = FILE_SIZE_STYLES[file_size]
+        x = legend_start + index * legend_step
+        y = 82
+        styled_line(canvas, (x, y), (x + 38, y), style)
+        canvas.marker(x + 19, y, style["radius"], style["color"], style["marker"])
+        canvas.text(x + 48, y - 4, style["label"], axis)
+
+    for panel_index, config in enumerate(FS_CONFIGS):
+        panel_left = left + panel_index * (panel_width + panel_gap)
+        panel_right = panel_left + panel_width
+        inner_left, inner_right = panel_left + 34, panel_right - 24
+        inner_width = inner_right - inner_left
+        canvas.fill_rect(panel_left, top, panel_right, height - bottom, plot_background)
+        for exponent in ticks:
+            y = y_position(2 ** exponent)
+            canvas.line(panel_left, y, panel_right, y, grid)
+            if panel_index == 0:
+                label = format_amplification_tick(exponent)
+                canvas.text(panel_left - text_width(label) - 12, y - 4, label, muted)
+        canvas.line(panel_left, top, panel_right, top, frame)
+        canvas.line(panel_right, top, panel_right, height - bottom, frame)
+        canvas.line(panel_left, top, panel_left, height - bottom, axis, 2)
+        canvas.line(panel_left, height - bottom, panel_right, height - bottom, axis, 2)
+        panel_title = PANEL_TITLES[config]
+        canvas.text(panel_left + (panel_width - text_width(panel_title)) // 2,
+                    top - 24, panel_title, axis)
+
+        def x_position(write_size: int) -> int:
+            index = WRITE_SIZE_ORDER.index(write_size)
+            return inner_left + round(index * inner_width / (len(WRITE_SIZE_ORDER) - 1))
+
+        for write_size in WRITE_SIZE_ORDER:
+            x = x_position(write_size)
+            label = f"{write_size // 1024}K"
+            canvas.line(x, height - bottom, x, height - bottom + 6, axis)
+            canvas.text(x - text_width(label) // 2, height - bottom + 14, label, axis)
+
+        for file_size in reversed(FILE_SIZE_ORDER):
+            style = FILE_SIZE_STYLES[file_size]
+            series = sorted(
+                (item for item in values if item.fs_config == config and
+                 item.file_size_before == file_size),
+                key=lambda item: item.logical_bytes_changed,
+            )
+            points = [
+                (x_position(item.logical_bytes_changed), y_position(item.p50))
+                for item in series
+            ]
+            for start, end in zip(points, points[1:]):
+                styled_line(canvas, start, end, style)
+            for x, y in points:
+                canvas.marker(x, y, style["radius"], style["color"], style["marker"])
+
+    x_caption = "LOGICAL WRITE REQUEST SIZE"
+    canvas.text(left + (total_width - text_width(x_caption)) // 2,
+                height - bottom + 43, x_caption, muted)
+    y_caption = "AMPLIFICATION RATIO - LOG2 SCALE"
+    canvas.text(left, top - 49, y_caption, muted)
+    footer = "OVERLAPPING FILE-SIZE SERIES SHARE THE SAME MEDIAN"
+    canvas.text(left, height - 24, footer, muted)
     raw = b"".join(
         b"\x00" + bytes(canvas.pixels[y * width * 3:(y + 1) * width * 3])
         for y in range(height)
@@ -889,12 +1119,16 @@ def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
     paired, pairing_errors = paired_rows(rows)
     errors_found.extend(pairing_errors)
     stats = calculate_stats(rows, replicates) if rows else []
+    amplification_stats = calculate_amplification_stats(rows) if rows else []
     regressions = regression(rows, replicates) if rows else []
     write_summary(analysis_dir / "summary.tsv", stats)
     write_paired(analysis_dir / "paired-benefit.tsv", paired)
     write_paired_summary(analysis_dir / "paired-benefit-summary.tsv", paired, replicates)
     write_regression(analysis_dir / "regression.tsv", regressions)
     write_sensitivity(analysis_dir / "noop-sensitivity.tsv", rows)
+    write_amplification_summary(
+        analysis_dir / "amplification-summary.tsv", amplification_stats,
+    )
     (analysis_dir / "pairing-errors.tsv").write_text(
         "error\n" + "".join(f"{error}\n" for error in errors_found), encoding="utf-8",
     )
@@ -906,8 +1140,11 @@ def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
                         json.dump({"artifact": kind, **row}, stream, sort_keys=True,
                                   separators=(",", ":"))
                         stream.write("\n")
-    write_plot(analysis_dir / "copyup-by-size.png", stats, "copyup_bytes")
-    write_plot(analysis_dir / "physical-io-by-size.png", stats, "physical_io_bytes")
+    for name in (*LEGACY_PLOT_FILES, *PLOT_FILES.values()):
+        (analysis_dir / name).unlink(missing_ok=True)
+    if amplification_stats:
+        for metric, name in PLOT_FILES.items():
+            write_plot(analysis_dir / name, amplification_stats, metric)
     summary = {
         "schema": SCHEMA, "passed": not errors_found,
         "preset": result_sets[0].manifest["preset"], "result_sets": len(result_sets),

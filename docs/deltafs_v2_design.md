@@ -839,3 +839,25 @@ v2 只有同时满足以下条件才可完成：
 8. 1..128 lower、cache、branch、故障注入和反复卸载通过 QEMU 总验收。
 9. 静态构建、sparse、checkpatch、userspace `-Werror` 全部通过。
 10. 文档明确保留 layer 嵌套、并发、旧 fd/mmap、在线回收和 GC 限制。
+
+## 15. v2 ioctl 固定开销优化
+
+checkpoint/restore 的每次请求会创建新的 upper/work view，但所有路径都
+必须位于初始 mount 已确认的同一 backing superblock。初始 mount 完成后，
+DeltaFS 保存 d_type、O_TMPFILE、RENAME_WHITEOUT、overlay xattr 和 file
+handle 的 capability snapshot，以及 `tmpfile`/`noxattr`/`nofh` 的最终结果。
+view 仍继承 active superblock 上可能已发生的运行时降级（例如
+`noxattr`），不会把动态 fallback 恢复成初始的乐观值。
+
+后续请求的 `ovl_make_workdir_fast()` 只获取新 upper mount 的写引用，在
+fresh work base 中创建内部 `work` 目录、建立该 view 独有的 workdir trap，
+并继承 snapshot；它不执行完整 `ovl_make_workdir()` 中的目录类型、临时
+文件、whiteout、xattr 或 file-handle 探测。初始 mount 仍使用完整 helper，
+因此 capability fallback 行为不变。fast path 的前提不满足时请求失败并
+保持原有 view，不伪造 capability。
+
+DeltaFS feature validation 也拆成两部分：mount-static 配置和 capability
+只在请求开始做 O(1) 检查；新 upper/work/lower 的目录、权限、idmap、递归
+OverlayFS、backing superblock、空目录和重叠关系仍按请求检查。prepare 与
+final revalidate 只比较 generation、layer-array 指针和 layer 数量，避免
+对已经封装在 immutable active view 中的旧 layer 再次逐项扫描。

@@ -387,10 +387,11 @@ Artifacts are:
     analysis/paired-benefit-summary.tsv
     analysis/regression.tsv
     analysis/noop-sensitivity.tsv
+    analysis/amplification-summary.tsv
     analysis/pairing-errors.tsv
     analysis/invalid.jsonl
-    analysis/copyup-by-size.png
-    analysis/physical-io-by-size.png
+    analysis/copyup-amplification-by-write-size.png
+    analysis/physical-write-amplification-by-write-size.png
     analysis/summary.json
 
 For each filesystem, cache mode, size bin, and metric, `summary.tsv` reports n,
@@ -405,9 +406,24 @@ For each filesystem/cache mode, ordinary least squares fits:
 
     log2(copyup_bytes) = alpha + beta * log2(file_size_before)
 
-and reports beta with a run-cluster bootstrap CI. The two fixed PNG plots use a
-logarithmic y axis and show p50 by size bin; the physical-I/O plot uses raw
-values and the sensitivity TSV carries corrected values.
+and reports beta with a run-cluster bootstrap CI. The two fixed PNG plots show
+write amplification rather than absolute bytes. Their x axis is the aligned
+logical write-request size (4, 8, 16, or 32 KiB) and their logarithmic y axis
+is respectively `copyup_bytes / logical_bytes_changed` and
+`physical_io_bytes / logical_bytes_changed`. Each figure has one panel per
+filesystem configuration and one series per pre-edit file size, so file size
+remains visible without being used as the primary x axis. Illegal cells are
+absent and are not connected across missing request sizes.
+
+The legacy warm/cold schedules are pooled within each exact
+`(filesystem, file size, logical write size)` cell for these figures because
+cache state is not a write-amplification dimension. The plots contain no cache
+label. Points show per-cell medians without confidence-interval whiskers; TSV
+artifacts continue to carry the original cache-separated distributions and
+run-cluster bootstrap confidence intervals. The physical-write plot uses raw
+device writes, while the sensitivity TSV carries no-op-corrected bytes.
+`amplification-summary.tsv` records the cache-neutral cell count and plotted
+median for both amplification metrics.
 
 Passing requires all 18 planned cells at their preset counts, all three
 filesystem configurations, exact event pairing, complete control triplets,

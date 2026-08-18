@@ -94,6 +94,34 @@ static __always_inline int ovl_deltafs_build_checkpoint(void)
 }
 #endif
 
+void ovl_deltafs_capture_caps(struct ovl_fs *ofs)
+{
+	unsigned int i;
+
+	/* Lower-only and read-only OverlayFS mounts are not DeltaFS targets. */
+	if (!ofs->config.upperdir || !ofs->workdir || !ofs->delta_backing_sb ||
+	    !ofs->layers || !ofs->numlayer)
+		return;
+
+	/* Initial layer construction is the one place that scans old layers. */
+	for (i = 0; i < ofs->numlayer; i++) {
+		const struct ovl_layer *layer = &ofs->layers[i];
+
+		if (!layer->delta_source_valid ||
+		    is_idmapped_mnt(layer->delta_source.mnt) ||
+		    layer->delta_source.mnt->mnt_sb->s_type == &ovl_fs_type ||
+		    layer->delta_source.mnt->mnt_sb != ofs->delta_backing_sb)
+			return;
+	}
+
+	ofs->delta_caps.tmpfile = ofs->tmpfile;
+	ofs->delta_caps.noxattr = ofs->noxattr;
+	ofs->delta_caps.nofh = ofs->nofh;
+	ofs->delta_caps.xattr = !ofs->noxattr;
+	ofs->delta_caps.file_handle = !ofs->nofh;
+	ofs->delta_caps.valid = true;
+}
+
 static int
 ovl_deltafs_validate_checkpoint_abi(const struct deltafs_ioc_checkpoint_v2 *req)
 {
@@ -335,19 +363,14 @@ static int ovl_deltafs_check_empty(const struct path *path)
 	return empty.empty ? 0 : -ENOTEMPTY;
 }
 
-static int ovl_deltafs_validate_features(struct super_block *sb,
-					 struct ovl_fs *ofs)
+static int ovl_deltafs_validate_mount_static(struct ovl_fs *ofs)
 {
-	unsigned int i;
-
 	if (!ofs->layers || !ofs->numlayer || !ovl_upper_mnt(ofs) ||
 	    !ofs->config.upperdir || !ofs->config.workdir ||
-	    !ofs->workbasedir || !ofs->workdir || !ofs->delta_backing_sb ||
-	    sb_rdonly(sb))
+	    !ofs->workbasedir || !ofs->workdir || !ofs->delta_backing_sb)
 		return -EROFS;
-
-	if (!ofs->upperdir_locked || !ofs->workdir_locked)
-		return -EBUSY;
+	if (!ofs->delta_caps.valid)
+		return -EOPNOTSUPP;
 
 	if (ofs->config.index || ofs->config.nfs_export ||
 	    ofs->config.metacopy || ofs->config.xino != OVL_XINO_OFF ||
@@ -356,15 +379,16 @@ static int ovl_deltafs_validate_features(struct super_block *sb,
 	    ofs->config.ovl_volatile || ofs->numdatalayer ||
 	    ofs->numfs != 1 || ofs->xino_mode != 0)
 		return -EOPNOTSUPP;
-	for (i = 0; i < ofs->numlayer; i++) {
-		const struct ovl_layer *layer = &ofs->layers[i];
 
-		if (!layer->delta_source_valid ||
-		    is_idmapped_mnt(layer->delta_source.mnt) ||
-		    layer->delta_source.mnt->mnt_sb->s_type == &ovl_fs_type ||
-		    layer->delta_source.mnt->mnt_sb != ofs->delta_backing_sb)
-			return -EOPNOTSUPP;
-	}
+	return 0;
+}
+
+static int ovl_deltafs_validate_active_view(struct super_block *sb, struct ovl_fs *ofs)
+{
+	if (sb_rdonly(sb) || !ofs->upperdir_locked || !ofs->workdir_locked)
+		return sb_rdonly(sb) ? -EROFS : -EBUSY;
+	if (__mnt_is_readonly(ovl_upper_mnt(ofs)))
+		return -EROFS;
 
 	return 0;
 }
@@ -661,7 +685,7 @@ static int ovl_deltafs_prepare_locked(struct file *file,
 		return err;
 	if (file_dentry(file) != sb->s_root)
 		return -ENOTTY;
-	err = ovl_deltafs_validate_features(sb, ofs);
+	err = ovl_deltafs_validate_active_view(sb, ofs);
 	if (err)
 		return err;
 
@@ -701,10 +725,6 @@ static int ovl_deltafs_prepare_locked(struct file *file,
 		const struct ovl_layer *layer = &ofs->layers[first_layer + i];
 		struct ovl_delta_snapshot_layer *input = &snapshot->layers[i];
 
-		if (!layer->delta_source_valid) {
-			err = -EOPNOTSUPP;
-			goto out_err;
-		}
 		input->source = layer->delta_source;
 		path_get(&input->source);
 		input->source_valid = true;
@@ -861,6 +881,11 @@ static void ovl_deltafs_init_work_view(struct ovl_fs *view,
 	view->config.userxattr = ofs->config.userxattr;
 	view->config.ovl_volatile = ofs->config.ovl_volatile;
 	view->xino_mode = ofs->xino_mode;
+	/* Preserve runtime fallbacks (notably noxattr) as well as the snapshot. */
+	view->tmpfile = ofs->tmpfile;
+	view->noxattr = ofs->noxattr;
+	view->nofh = ofs->nofh;
+	view->delta_caps = ofs->delta_caps;
 }
 
 static int ovl_deltafs_build_workdir(struct super_block *sb,
@@ -895,7 +920,11 @@ static int ovl_deltafs_build_workdir(struct super_block *sb,
 		return err;
 
 	ovl_deltafs_init_work_view(&view, ofs, state);
-	err = ovl_make_workdir(sb, &view, &paths->work.path, true);
+	if (view.delta_caps.valid)
+		err = ovl_make_workdir_fast(sb, &view, &paths->work.path, true);
+	else
+		/* Keep the complete helper as a conservative non-fast fallback. */
+		err = ovl_make_workdir(sb, &view, &paths->work.path, true);
 	state->workdir = view.workdir;
 	state->workdir_trap = view.workdir_trap;
 	if (err)
@@ -998,7 +1027,6 @@ ovl_deltafs_final_revalidate_locked(struct file *file,
 {
 	struct super_block *sb = file_inode(file)->i_sb;
 	struct ovl_fs *ofs = OVL_FS(sb);
-	unsigned int i;
 	int err;
 
 	err = ovl_deltafs_validate_generation(ofs, req->expected_generation);
@@ -1006,20 +1034,12 @@ ovl_deltafs_final_revalidate_locked(struct file *file,
 		return err;
 	if (file_dentry(file) != sb->s_root)
 		return -ENOTTY;
+	err = ovl_deltafs_validate_active_view(sb, ofs);
+	if (err)
+		return err;
 	if (ofs->layers != snapshot->active_layers ||
 	    ofs->numlayer != snapshot->current_numlayer)
 		return -ESTALE;
-	for (i = 0; i < snapshot->nr_layers; i++) {
-		const struct ovl_layer *layer =
-			&ofs->layers[snapshot->first_layer + i];
-		const struct path *source = &snapshot->layers[i].source;
-
-		if (layer->trap != snapshot->layers[i].trap)
-			return -ESTALE;
-		if (!ovl_deltafs_path_matches_layer(source, layer))
-			return -ESTALE;
-	}
-
 	if (req->cmd == DELTAFS_IOC_CHECKPOINT) {
 		if (snapshot->first_layer ||
 		    snapshot->nr_layers != ofs->numlayer)
@@ -1200,7 +1220,7 @@ long ovl_deltafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	mutex_lock(&ofs->delta_lock);
 	err = ovl_deltafs_validate_generation(ofs, req->expected_generation);
 	if (!err)
-		err = ovl_deltafs_validate_features(sb, ofs);
+		err = ovl_deltafs_validate_mount_static(ofs);
 	mutex_unlock(&ofs->delta_lock);
 	if (err)
 		goto out_paths;

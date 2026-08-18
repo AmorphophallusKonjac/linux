@@ -6,6 +6,7 @@ import hashlib
 import json
 import pathlib
 import statistics
+import string
 import sys
 import tempfile
 import unittest
@@ -117,6 +118,44 @@ def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> 
 
 
 class AnalyzeTests(unittest.TestCase):
+    def test_plot_font_and_log_scale_cover_amplification_charts(self) -> None:
+        self.assertFalse(set(string.ascii_uppercase) - set(analyze.FONT))
+        low, high, ticks = analyze.log2_plot_bounds([1, 85])
+        self.assertLess(low, 0)
+        self.assertGreater(high, 7)
+        self.assertEqual(ticks, list(range(0, 8)))
+        self.assertEqual(analyze.format_amplification_tick(0), "1X")
+        self.assertEqual(analyze.format_amplification_tick(3), "8X")
+        self.assertEqual(analyze.format_amplification_tick(-1), "1/2X")
+        self.assertEqual(set(analyze.FILE_SIZE_STYLES), set(analyze.FILE_SIZE_ORDER))
+        self.assertEqual(len({
+            style["label"] for style in analyze.FILE_SIZE_STYLES.values()
+        }), len(analyze.FILE_SIZE_ORDER))
+        self.assertTrue(all("AMPLIFICATION" in title and "WRITE SIZE" in title
+                            for title in analyze.PLOT_TITLES.values()))
+        self.assertTrue(all("WARM" not in title and "CACHE" not in title
+                            for title in analyze.PLOT_TITLES.values()))
+
+    def test_amplification_stats_pool_cache_modes_by_exact_cell(self) -> None:
+        rows = [
+            {
+                "status": "ok", "fs_config": "xfs_reflink",
+                "file_size_before": 12288, "logical_bytes_changed": 4096,
+                "copyup_bytes": 4096, "physical_io_bytes": physical,
+            }
+            for physical in (8192, 12288)
+        ]
+        stats = analyze.calculate_amplification_stats(rows)
+        self.assertEqual(len(stats), 2)
+        copyup = next(item for item in stats
+                      if item.metric == "copyup_amplification")
+        physical = next(item for item in stats
+                        if item.metric == "physical_write_amplification")
+        self.assertEqual(copyup.count, 2)
+        self.assertEqual(copyup.p50, 1.0)
+        self.assertEqual(physical.count, 2)
+        self.assertEqual(physical.p50, 2.5)
+
     def test_percentile_and_bootstrap(self) -> None:
         self.assertEqual(analyze.percentile([1, 2, 3, 4], 0.5), 2.5)
         rows = [{"run": 1, "value": value} for value in (1, 2, 3)]
@@ -161,14 +200,22 @@ class AnalyzeTests(unittest.TestCase):
             expected = {
                 "summary.tsv", "paired-benefit.tsv", "paired-benefit-summary.tsv",
                 "regression.tsv", "noop-sensitivity.tsv", "pairing-errors.tsv",
-                "invalid.jsonl", "copyup-by-size.png", "physical-io-by-size.png",
-                "summary.json",
+                "amplification-summary.tsv", "invalid.jsonl",
+                "copyup-amplification-by-write-size.png",
+                "physical-write-amplification-by-write-size.png", "summary.json",
             }
             self.assertEqual({path.name for path in analysis_dir.iterdir()}, expected)
             self.assertTrue(json.loads(
                 (analysis_dir / "summary.json").read_text(encoding="utf-8")
             )["passed"])
-            self.assertGreater((analysis_dir / "copyup-by-size.png").stat().st_size, 1000)
+            self.assertGreater(
+                (analysis_dir / "copyup-amplification-by-write-size.png").stat().st_size,
+                1000,
+            )
+            header = (analysis_dir / "amplification-summary.tsv").read_text(
+                encoding="ascii",
+            ).splitlines()[0]
+            self.assertNotIn("cache_mode", header)
 
     def test_event_hash_mismatch_is_rejected(self) -> None:
         event_values = events.generate_events("smoke")

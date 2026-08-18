@@ -716,6 +716,7 @@ int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 		goto out;
 
 	d_type = err;
+	ofs->delta_caps.d_type = d_type;
 	if (!d_type)
 		pr_warn("upper fs needs to support d_type.\n");
 
@@ -734,6 +735,7 @@ int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 		goto out;
 
 	rename_whiteout = err;
+	ofs->delta_caps.rename_whiteout = rename_whiteout;
 	if (!rename_whiteout)
 		pr_warn("upper fs does not support RENAME_WHITEOUT.\n");
 
@@ -774,6 +776,8 @@ int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	} else {
 		ovl_removexattr(ofs, ofs->workdir, OVL_XATTR_OPAQUE);
 	}
+	ofs->delta_caps.xattr = !ofs->noxattr;
+	ofs->delta_caps.noxattr = ofs->noxattr;
 
 	/*
 	 * We allowed sub-optimal upper fs configuration and don't want to break
@@ -810,12 +814,62 @@ int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	/* Check if upper fs has 32bit inode numbers */
 	if (fh_type != FILEID_INO32_GEN)
 		ofs->xino_mode = -1;
+	ofs->delta_caps.tmpfile = ofs->tmpfile;
+	ofs->delta_caps.file_handle = !!fh_type;
+	ofs->delta_caps.nofh = ofs->nofh;
 
 	/* NFS export of r/w mount depends on index */
 	if (ofs->config.nfs_export && !ofs->config.index) {
 		pr_warn("NFS export requires \"index=on\", falling back to nfs_export=off.\n");
 		ofs->config.nfs_export = false;
 	}
+out:
+	mnt_drop_write(mnt);
+	return err;
+}
+
+/*
+ * Create the per-view work directory without repeating the initial mount's
+ * backing-filesystem feature probes.  The caller has already validated that
+ * @workpath belongs to the same, writable backing mount as the view upper.
+ */
+int ovl_make_workdir_fast(struct super_block *sb, struct ovl_fs *ofs,
+			  const struct path *workpath, bool strict)
+{
+	struct vfsmount *mnt = ovl_upper_mnt(ofs);
+	struct dentry *workdir;
+	int create_err = 0;
+	int err;
+
+	if (!workpath || !ofs->delta_caps.valid)
+		return -EOPNOTSUPP;
+	if (__mnt_is_readonly(workpath->mnt) || __mnt_is_readonly(mnt))
+		return -EROFS;
+	if (workpath->mnt->mnt_sb != mnt->mnt_sb)
+		return -EXDEV;
+	if (is_idmapped_mnt(workpath->mnt) ||
+	    workpath->mnt->mnt_sb->s_type == &ovl_fs_type)
+		return -EOPNOTSUPP;
+
+	err = mnt_want_write(mnt);
+	if (err)
+		return err;
+
+	workdir = ovl_workdir_create(ofs, OVL_WORKDIR_NAME, false, strict,
+				     &create_err);
+	err = PTR_ERR(workdir);
+	if (IS_ERR_OR_NULL(workdir)) {
+		if (!workdir && strict)
+			err = create_err ?: -EINVAL;
+		goto out;
+	}
+
+	ofs->workdir = workdir;
+	err = ovl_setup_trap(sb, ofs->workdir, &ofs->workdir_trap,
+				     "workdir");
+	if (err)
+		goto out;
+
 out:
 	mnt_drop_write(mnt);
 	return err;
@@ -1513,6 +1567,7 @@ int ovl_fill_super(struct super_block *sb, struct fs_context *fc)
 		goto out_free_oe;
 
 	sb->s_root = root_dentry;
+	ovl_deltafs_capture_caps(ofs);
 
 	return 0;
 

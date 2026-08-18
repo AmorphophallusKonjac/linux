@@ -4,6 +4,7 @@ import copy
 import errno
 import json
 import pathlib
+import string
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,18 @@ def write_run(root: pathlib.Path, rows: list[dict]) -> None:
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_plot_style_uses_clean_title_and_readable_axes(self):
+        self.assertNotIn("E2", analyze.PLOT_TITLE)
+        self.assertFalse(set(string.ascii_uppercase) - set(analyze.FONT))
+        low, high, ticks = analyze.linear_plot_bounds([35.0, 205.0])
+        self.assertLessEqual(low, 35.0)
+        self.assertGreaterEqual(high, 205.0)
+        self.assertTrue(all(float(value).is_integer() for value in ticks))
+        self.assertNotEqual(
+            analyze.PLOT_STYLES["checkpoint"]["marker"],
+            analyze.PLOT_STYLES["restore"]["marker"],
+        )
+
     def test_complete_smoke_generates_all_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)

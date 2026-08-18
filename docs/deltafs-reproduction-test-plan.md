@@ -502,17 +502,21 @@ Latin square，且一次只运行一个配置，避免温度/设备后台行为�
 
 ### 10.2 主图
 
-复刻 Fig. 9 的两幅 log-y 图：
+输出两幅 log-y 写放大图：
 
-- x：六个 `file_size_before` 桶。
-- y(a)：`copyup_bytes`，每桶中位数。
-- y(b)：`physical_io_bytes`，每桶中位数。
-- 三条线：ext4-no-reflink、XFS-no-reflink、XFS+reflink。
-- error bar：95% run-cluster bootstrap CI；固定 synthetic schedule 内的 event 不重复
-  伪装为第二层独立随机样本。
-- 阴影：论文典型 12-65 KiB 范围。
+- x：`logical_bytes_changed`，即 4、8、16、32 KiB 逻辑写请求。
+- y(a)：`copyup_bytes / logical_bytes_changed`。
+- y(b)：`physical_io_bytes / logical_bytes_changed`。
+- 每幅图按 ext4-no-reflink、XFS-no-reflink、XFS+reflink 分为三个 panel。
+- panel 内按 `file_size_before` 绘制六条序列，不能把不同文件大小隐藏在同一个
+  请求大小聚合值中。
+- 现有 warm/cold 样本在完全相同的文件系统、文件大小和请求大小 cell 内合并，
+  图中不显示缓存标签；缓存状态不是写放大维度。
+- 点表示 cell 中位数；固定 synthetic schedule 内的 event 不重复伪装为第二层独立
+  随机样本。
 
-同时输出每桶 n、p25、p50、p75、p95；论文未给误差条和 n，本复现应补齐。
+同时输出 cache-neutral 的 amplification cell TSV，并保留原始字节统计和每桶 n、
+p25、p50、p75、p95，方便审计放大率的分子。
 
 ### 10.3 机制分解
 
@@ -738,8 +742,8 @@ bench/
 2. 正确性矩阵和压力测试统计。
 3. checkpoint/restore ioctl 与 wrapper latency 表。
 4. latency-vs-layer-depth、latency-vs-rollback-distance。
-5. 复刻 Fig. 9(a) copy-up bytes/edit。
-6. 复刻 Fig. 9(b) physical I/O bytes/edit。
+5. copy-up amplification vs logical write-request size。
+6. physical-write amplification vs logical write-request size。
 7. 每桶样本量/IQR/CI 表。
 8. synthetic dirty-block sweep。
 9. DeltaFS-only SWE-bench replay 分组表。

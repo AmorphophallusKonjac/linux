@@ -58,6 +58,22 @@ struct ovl_entry {
 };
 
 /*
+ * Capability results discovered by the initial OverlayFS mount.  DeltaFS
+ * views are restricted to one backing superblock, so these results can be
+ * inherited by a fresh workdir instead of being rediscovered on every ioctl.
+ */
+struct ovl_delta_caps {
+	bool valid;
+	bool d_type;
+	bool tmpfile;
+	bool rename_whiteout;
+	bool xattr;
+	bool file_handle;
+	bool nofh;
+	bool noxattr;
+};
+
+/*
  * A completely owned DeltaFS view.  During build every non-NULL field belongs
  * to this object.  After commit the same shape owns a retired view until
  * unmount, so partial-build and retired teardown share one release path.
@@ -131,6 +147,7 @@ struct ovl_fs {
 	errseq_t errseq;
 	/* DeltaFS v2 runtime state. */
 	u64 delta_generation;
+	struct ovl_delta_caps delta_caps;
 	/* Serializes target snapshots and view commits. */
 	struct mutex delta_lock;
 	struct list_head delta_retired;
