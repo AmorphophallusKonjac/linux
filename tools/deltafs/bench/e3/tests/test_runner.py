@@ -70,7 +70,7 @@ class RunnerTests(unittest.TestCase):
     def test_one_full_workload_has_fixed_counts(self) -> None:
         counts = events.expected_counts("run")
         self.assertEqual(sum(counts.values()), 11_700)
-        workload = sum(count for (workload_index, _, _), count in counts.items()
+        workload = sum(count for (workload_index, _, _, _), count in counts.items()
                        if workload_index == 4)
         self.assertEqual(workload, 2340)
         batches = (workload + 19) // 20
@@ -118,6 +118,30 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(target.stat().st_mode & 0o777, 0o644)
             self.assertEqual(run.sha256_file(target), event["expected_before_sha256"])
             self.assertFalse((sample / "generation-2" / "upper" / "edit.bin").exists())
+
+    def test_depth_sample_and_upper_tree_oracle(self) -> None:
+        event = next(
+            value for value in events.generate_events("depth-smoke")
+            if value["directory_depth"] == 16
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = pathlib.Path(temporary) / "sample"
+            original_syncfs = run.syncfs
+            run.syncfs = lambda _path: None
+            try:
+                run.create_sample(sample, event)
+            finally:
+                run.syncfs = original_syncfs
+            source = sample / "generation-1" / "upper" / event["relative_path"]
+            self.assertTrue(source.is_file())
+            destination = sample / "generation-2" / "upper" / event["relative_path"]
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(source.read_bytes())
+            self.assertEqual(run.verify_upper_tree(sample, event), 16)
+            extra = sample / "generation-2" / "upper" / "extra"
+            extra.mkdir()
+            with self.assertRaises(run.E3Error):
+                run.verify_upper_tree(sample, event)
 
     def test_checkpoint_freezes_generation_one_and_uses_v2_helper(self) -> None:
         class RecordingLogs:

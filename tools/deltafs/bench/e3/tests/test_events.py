@@ -17,7 +17,9 @@ import events  # noqa: E402
 
 class EventTests(unittest.TestCase):
     def test_run_is_five_cache_neutral_workloads(self) -> None:
-        self.assertEqual(events.PRESETS["run"], {"samples": 130, "workloads": 5})
+        self.assertEqual(events.PRESETS["run"], {
+            "experiment": "copyup_matrix", "samples": 130, "workloads": 5,
+        })
         self.assertNotIn("cache_mode", events.EVENT_FIELDS)
         self.assertNotIn("cache_mode", events.generate_events("smoke")[0])
 
@@ -42,6 +44,30 @@ class EventTests(unittest.TestCase):
     def test_run_count(self) -> None:
         self.assertEqual(sum(events.expected_counts("run").values()), 11_700)
 
+    def test_depth_presets_are_matched_and_complete(self) -> None:
+        smoke = events.generate_events("depth-smoke")
+        self.assertEqual(len(smoke), 24)
+        self.assertEqual(sum(events.expected_counts("depth-run").values()), 7_800)
+        self.assertEqual(events.DIRECTORY_DEPTHS, (0, 1, 2, 4, 8, 16))
+        by_case: dict[str, list[dict]] = {}
+        for event in smoke:
+            by_case.setdefault(event["case_id"], []).append(event)
+        self.assertEqual(len(by_case), 4)
+        for variants in by_case.values():
+            self.assertEqual(
+                {event["directory_depth"] for event in variants},
+                set(events.DIRECTORY_DEPTHS),
+            )
+            self.assertEqual(len({
+                (event["file_size_before"], event["offset"], event["payload_seed"],
+                 event["expected_before_sha256"], event["expected_after_sha256"])
+                for event in variants
+            }), 1)
+            self.assertEqual(
+                {event["relative_path"] for event in variants},
+                {events.relative_path(depth) for depth in events.DIRECTORY_DEPTHS},
+            )
+
     def test_hashes_match_images(self) -> None:
         event = events.generate_events("smoke")[0]
         before, after = events.event_images(event)
@@ -55,8 +81,8 @@ class EventTests(unittest.TestCase):
     def test_cross_language_byte_stream_vector(self) -> None:
         self.assertEqual(
             events.byte_stream(17, 40).hex(),
-            "3b9e197a0a7142ec361f7ae5cb39f26ceb98698417e75712b4c656732c2c6127"
-            "36bec476acb8432a",
+            "bde616ca82f068d32bd9ff69b4d76938b5e144f0ddab43cbd1375b937356a526"
+            "011a35e077b7e268",
         )
 
     def test_path_traversal_and_hash_are_rejected(self) -> None:

@@ -30,10 +30,13 @@ def write_jsonl(path: pathlib.Path, values: list[dict]) -> None:
     ), encoding="ascii")
 
 
-def manifest(config: str, event_hash: str, event_count: int) -> dict:
+def manifest(config: str, event_hash: str, event_count: int,
+             preset: str = "smoke") -> dict:
     fs_type = "ext4" if config.startswith("ext4") else "xfs"
+    configuration = events.PRESETS[preset]
     return {
-        "schema": events.SCHEMA, "preset": "smoke", "seed": events.SEED,
+        "schema": events.SCHEMA, "preset": preset,
+        "experiment": configuration["experiment"], "seed": events.SEED,
         "event_file": "events.jsonl", "event_file_sha256": event_hash,
         "event_count": event_count, "git_commit": "test", "kernel_release": "test",
         "kernel_config_sha256": "", "fs_type": fs_type, "fs_config": config,
@@ -48,22 +51,32 @@ def manifest(config: str, event_hash: str, event_count: int) -> dict:
         "checkpoint_generation": run.CHECKPOINT_GENERATION,
         "copyup_source": run.COPYUP_SOURCE,
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
-        "samples_per_cell": 2,
-        "independent_workloads": 1, "noop_interval": 20, "noop_repetitions": 3,
+        "experiment_cells": [[size * 1024, dirty, depth]
+                             for size, dirty, depth in events.experiment_cells(preset)],
+        "directory_depths": list(events.DIRECTORY_DEPTHS
+                                 if configuration["experiment"] == "path_depth" else (0,)),
+        "samples_per_cell": configuration["samples"],
+        "independent_workloads": configuration["workloads"],
+        "noop_interval": 20, "noop_repetitions": 3,
         "settle_interval_ms": 100, "settle_stable_comparisons": 3,
         "settle_timeout_ms": 10000,
     }
 
 
-def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> None:
+def create_result(root: pathlib.Path, config: str, event_values: list[dict],
+                  preset: str = "smoke") -> None:
     directory = root / config
     fiemap_dir = directory / "fiemap"
     fiemap_dir.mkdir(parents=True)
     event_data = events.canonical_jsonl(event_values)
     (directory / "events.jsonl").write_bytes(event_data)
     write_json(directory / "manifest.json", manifest(
-        config, hashlib.sha256(event_data).hexdigest(), len(event_values),
+        config, hashlib.sha256(event_data).hexdigest(), len(event_values), preset,
     ))
+    batches = run.planned_batches(event_values)
+    event_batches = {
+        event["event_id"]: batch for _workload, batch, group in batches for event in group
+    }
     rows = []
     for number, event in enumerate(event_values, start=1):
         fiemap_name = f"sample-{number:03d}.json"
@@ -74,17 +87,23 @@ def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> 
                          "length": event["file_size_before"], "flags": 1}],
         })
         rows.append({
-            "schema": events.SCHEMA, "workload": event["workload"], "sample": number,
+            "schema": events.SCHEMA, "experiment": event["experiment"],
+            "workload": event["workload"], "sample": number,
             "sample_id": f"sample-{number:03d}", "sample_kind": "edit",
-            "control_batch": (number - 1) // run.NOOP_INTERVAL + 1,
+            "control_batch": event_batches[event["event_id"]],
             "fs_config": config, "event_id": event["event_id"],
+            "case_id": event["case_id"], "relative_path": event["relative_path"],
+            "directory_depth": event["directory_depth"],
             "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
             "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
             "dirty_blocks": event["dirty_blocks"],
             "copyup_bytes": event["file_size_before"], "shared_bytes": 0,
             "allocated_bytes_total": event["file_size_before"],
             "copyup_amplification": event["file_size_before"] / event["write_bytes"],
-            "sectors_before": 1000, "sectors_after": 1008, "physical_io_bytes": 4096,
+            "copied_up_parent_dirs": event["directory_depth"],
+            "sectors_before": 1000,
+            "sectors_after": 1008 + event["directory_depth"] * 8,
+            "physical_io_bytes": 4096 + event["directory_depth"] * 4096,
             "settle_timeout": False, "pre_sha256": event["expected_before_sha256"],
             "post_sha256": event["expected_after_sha256"],
             "upper_sha256": event["expected_after_sha256"],
@@ -95,21 +114,27 @@ def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> 
     write_jsonl(directory / "raw.jsonl", rows)
     controls = []
     sample = 0
-    for batch in range(1, 3):
+    for workload, batch, group in batches:
+        template = group[0]
         for replica in range(1, 4):
             sample += 1
             controls.append({
-                "schema": events.SCHEMA, "workload": 1, "sample": sample,
+                "schema": events.SCHEMA, "experiment": template["experiment"],
+                "workload": workload, "sample": sample,
                 "sample_id": f"control-{batch}-{replica}",
                 "sample_kind": "control",
-                "fs_config": config, "control_batch": batch, "replica": replica,
+                "fs_config": config, "template_event_id": template["event_id"],
+                "case_id": template["case_id"],
+                "relative_path": template["relative_path"],
+                "directory_depth": template["directory_depth"],
+                "control_batch": batch, "replica": replica,
                 "sectors_before": 2000, "sectors_after": 2002,
                 "physical_io_bytes": 1024, "settle_timeout": False,
                 "status": "ok", "errno": 0, "invalid_reason": None,
             })
     write_jsonl(directory / "controls.jsonl", controls)
     write_json(directory / "summary.json", {
-        "schema": events.SCHEMA, "preset": "smoke", "completed": True, "passed": True,
+        "schema": events.SCHEMA, "preset": preset, "completed": True, "passed": True,
         "counts": {"ok": len(rows), "invalid": 0, "failed": 0},
         "control_counts": {"ok": len(controls), "invalid": 0, "failed": 0},
         "planned_edits": len(rows), "planned_controls": len(controls),
@@ -216,6 +241,37 @@ class AnalyzeTests(unittest.TestCase):
                 encoding="ascii",
             ).splitlines()[0]
             self.assertNotIn("cache_mode", header)
+
+    def test_end_to_end_depth_smoke_artifacts(self) -> None:
+        event_values = events.generate_events("depth-smoke")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values, "depth-smoke")
+            stats, errors_found = analyze.analyze(root, replicates=20)
+            self.assertEqual(stats, [])
+            self.assertFalse(errors_found)
+            analysis_dir = root / "analysis"
+            expected = {
+                "depth-summary.tsv", "depth-paired.tsv", "depth-paired-summary.tsv",
+                "depth-slope.tsv", "noop-sensitivity.tsv", "pairing-errors.tsv",
+                "invalid.jsonl", "path-depth-physical-write-amplification.png",
+                "path-depth-copyup-amplification.png", "summary.json",
+            }
+            self.assertEqual({path.name for path in analysis_dir.iterdir()}, expected)
+            summary = json.loads(
+                (analysis_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["passed"])
+            self.assertTrue(summary["depth_hypothesis_supported"])
+            self.assertTrue(summary["copyup_depth_invariant"])
+            self.assertEqual(summary["experiment"], "path_depth")
+            paired = (analysis_dir / "depth-paired.tsv").read_text(encoding="ascii")
+            self.assertIn("physical_io_bytes_corrected", paired)
+            self.assertGreater(
+                (analysis_dir / "path-depth-physical-write-amplification.png").stat().st_size,
+                1000,
+            )
 
     def test_event_hash_mismatch_is_rejected(self) -> None:
         event_values = events.generate_events("smoke")

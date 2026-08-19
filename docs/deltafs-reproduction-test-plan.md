@@ -471,6 +471,8 @@ E3 已实现为独立固定 preset benchmark。公开入口仅为：
 ```text
 sudo python3 tools/deltafs/bench/e3/run.py smoke BACKING_DIR DEVICE_STAT OUT_DIR
 sudo python3 tools/deltafs/bench/e3/run.py run BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e3/run.py depth-smoke BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e3/run.py depth-run BACKING_DIR DEVICE_STAT OUT_DIR
 python3 tools/deltafs/bench/e3/analyze.py RESULTS_ROOT
 ```
 
@@ -478,7 +480,7 @@ runner 自动生成 immutable synthetic event、逐样本创建 fresh OverlayFS 
 FIEMAP/sector counter/hash/no-op control，并保留失败现场。full run 的单次调用在一个
 测试对象上串行执行 5 个 independent workload；分析器要求三个 filesystem 结果完整且
 event hash 一致。接口、18 个合法 size/dirty-block cell、raw schema、
-统计口径及完整 QEMU 命令以
+统计口径、path-depth 实验及完整 QEMU 命令以
 [deltafs-e3-test-plan.md](deltafs-e3-test-plan.md) 为唯一权威定义。
 
 ### 10.1 主矩阵
@@ -547,6 +549,19 @@ log2(copyup_bytes) = alpha + beta * log2(file_size_before)
 5. 所有对比使用相同 edit event，post-edit 内容完全一致。
 
 若 exact trace 不可得，不要求逐点数值一致；应同时报告方向是否一致、效应量和 CI，而不是根据目测把图中点手工当作 ground truth。
+
+### 10.5 父目录深度实验
+
+独立的 `path_depth` preset 固定 4-KiB aligned write，使用 4-KiB 和
+192-KiB 文件，并交叉目录深度 0、1、2、4、8、16。同一个 `case_id` 的六个
+深度变体共享文件内容、payload 和 offset，父目录只存在于 checkpoint 后的冻结
+generation-1 layer。每个成功样本必须证明 fresh upper 中恰好 materialize 了声明
+数量的父目录。
+
+主结果是同一 filesystem/case 相对 depth 0 的 corrected physical-I/O 配对增量及
+bytes-per-directory slope；文件 FIEMAP `copyup_bytes` 是不应随深度变化的负对照。
+分析单独报告 artifact correctness 和 `depth_hypothesis_supported`，不得因趋势不符合
+预期而删除或重跑样本。完整 preset 数量、分析产物和 QEMU 命令以 E3 详细设计为准。
 
 ## 11. 实验 E4：任意历史点回滚与层深扩展
 

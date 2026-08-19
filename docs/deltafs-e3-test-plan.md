@@ -2,7 +2,7 @@
 
 > E3 measures one copy-up edit after a native DeltaFS v2 checkpoint. It is
 > independent of the E2 ioctl-latency benchmark and does not use `deltafsctl`.
-> Its synthetic-event schema is version 2, independent
+> Its synthetic-event schema is version 3, independent
 > of the DeltaFS kernel ABI version recorded in the manifest. Every sample must
 > prove a generation 1 to generation 2 checkpoint with the current v2 request;
 > stock OverlayFS and the removed v1 ABI are rejected before measurement.
@@ -19,13 +19,17 @@ E3 compares three backing filesystem configurations:
 - `xfs_noreflink` (`mkfs.xfs -m reflink=0`);
 - `xfs_reflink` (`mkfs.xfs -m reflink=1`).
 
-For each immutable edit event it measures:
+E3 contains two fixed experiments. `copyup_matrix` retains the original
+file-size/dirty-range matrix. `path_depth` isolates the cost of copying parent
+directories into the fresh upper after checkpoint. For each immutable edit
+event it measures:
 
 1. logical bytes changed by one aligned `pwrite`;
 2. upper-file bytes mapped to shared and unshared FIEMAP extents after
    `fsync`/`syncfs`;
 3. backing-device sectors written between stable counter readings;
 4. preimage, merged postimage, upper, and lower SHA-256 oracles.
+5. the number of parent directories materialized in generation-2 upper.
 
 `copyup_bytes` means upper-file unshared FIEMAP bytes. It is not the same as
 physical device traffic. `physical_io_bytes` means the delta of field 7 in the
@@ -45,6 +49,12 @@ E3 deliberately follows E2's fixed-preset interface. Users run only:
     sudo python3 tools/deltafs/bench/e3/run.py \
       run BACKING_DIR DEVICE_STAT OUT_DIR
 
+    sudo python3 tools/deltafs/bench/e3/run.py \
+      depth-smoke BACKING_DIR DEVICE_STAT OUT_DIR
+
+    sudo python3 tools/deltafs/bench/e3/run.py \
+      depth-run BACKING_DIR DEVICE_STAT OUT_DIR
+
     python3 tools/deltafs/bench/e3/analyze.py RESULTS_ROOT
 
 `BACKING_DIR` is an empty dedicated directory on ext4 or XFS and may be a
@@ -52,12 +62,13 @@ subdirectory below the filesystem mount point. `DEVICE_STAT` is
 the explicit `/sys/dev/.../stat` file for the exact device containing
 `BACKING_DIR`. `OUT_DIR` must not exist or must be empty and must be outside
 `BACKING_DIR` on a different device, so result logging cannot enter the measured
-`syncfs` traffic. For smoke and full run, `RESULTS_ROOT` contains one successful
-output directory per filesystem. Analysis is written to
+`syncfs` traffic. For any one preset, `RESULTS_ROOT` contains one successful
+output directory per filesystem. Results from different presets must not share
+one root. Analysis is written to
 `RESULTS_ROOT/analysis`.
 
-Each `run` invocation owns one backing test object and executes all five
-independent workloads serially. There is no public run-index shard parameter,
+Each `run` or `depth-run` invocation owns one backing test object and executes
+all five independent workloads serially. There is no public run-index shard parameter,
 manifest, reset hook, event file, sample count, seed, bootstrap count, cache
 mode, mount option, or filesystem label parameter.
 Changing the event schedule or measured settings requires an event-schema
@@ -111,14 +122,17 @@ analysis. E3 does not import E2 code or artifacts.
 
 ### 4.1 Event schema
 
-`OUT_DIR/events.jsonl` contains one canonical compact schema-2 JSON object per
+`OUT_DIR/events.jsonl` contains one canonical compact schema-3 JSON object per
 line:
 
     {
-      "schema": 2,
-      "event_id": "e3-r01-f004-d01-n000",
+      "schema": 3,
+      "experiment": "copyup_matrix",
+      "event_id": "e3-w01-f004-d01-n000",
+      "case_id": "e3-w01-f004-d01-n000",
       "workload": 1,
       "relative_path": "edit.bin",
+      "directory_depth": 0,
       "file_size_before": 4096,
       "offset": 0,
       "write_bytes": 4096,
@@ -130,17 +144,20 @@ line:
     }
 
 Validation rejects unknown or missing fields, non-integer numeric fields,
-schema mismatch, duplicate IDs, absolute or non-normal relative paths, `.` or
-`..`, NUL, unknown size bin, non-4-KiB alignment, zero values, range
+schema/experiment mismatch, duplicate event IDs, inconsistent case IDs,
+absolute or non-normal relative paths, `.` or `..`, NUL, a path whose parent
+count differs from `directory_depth`, unknown size bin, non-4-KiB alignment, zero values, range
 overflow, writes beyond the preimage, inconsistent size bins, and a hash that
 does not match regenerated deterministic bytes.
 
 The byte stream is defined as concatenated SHA-256 digests of:
 
-    "deltafs-e3-v2\0" || little_endian_u64(seed) || little_endian_u64(counter)
+    "deltafs-e3-v3\0" || little_endian_u64(seed) || little_endian_u64(counter)
 
 The preimage seed is the low little-endian 64 bits of
-`SHA256("deltafs-e3-preimage\0" || event_id)`. The fixed benchmark seed 14857
+`SHA256("deltafs-e3-preimage\0" || case_id)`. Depth variants share one
+`case_id`, preimage, payload, and offset; only `event_id`, `relative_path`, and
+`directory_depth` differ. The fixed benchmark seed 14857
 feeds a specified SplitMix64 generator for payload seeds, offsets, and
 Fisher-Yates ordering. This avoids depending on Python's PRNG implementation.
 
@@ -169,17 +186,45 @@ example an 8-block in-place write cannot fit in a 4-KiB file. E3 v2 treats the
 18 legal cells, rather than 24 impossible combinations, as the completeness
 gate.
 
-### 4.3 Presets and ordering
+### 4.3 Path-depth cells
+
+The `path_depth` experiment fixes the write to one aligned 4-KiB block and
+crosses two file sizes, 4 KiB and 192 KiB, with these directory depths:
+
+    0, 1, 2, 4, 8, 16
+
+Depth is the number of parent directories between the merged root and
+`edit.bin`; the merged root itself is not counted. Paths are canonical prefixes:
+
+    depth 0:  edit.bin
+    depth 1:  dir-01/edit.bin
+    depth 2:  dir-01/dir-02/edit.bin
+    depth 16: dir-01/.../dir-16/edit.bin
+
+Every parent and the file initially exist only in generation-1 upper, which is
+then frozen as `layers/g1`. Base and generation-2 upper are empty. Therefore an
+edit can succeed only after OverlayFS materializes the full parent chain in the
+fresh upper. This produces 12 fixed depth cells. The 4-KiB file exposes a
+metadata-dominated case; the 192-KiB file retains the large-file/small-edit
+copy-up case.
+
+### 4.4 Presets and ordering
 
 | preset | events per cell/workload | independent workloads |
 |---|---:|---:|
 | `smoke` | 2 | 1 |
 | `run` | 130 | 5 |
+| `depth-smoke` | 2 | 1 |
+| `depth-run` | 130 | 5 |
 
-Each workload has a distinct number and the same fixed matrix. Cells are
-deterministically shuffled within each workload and the same order is reproduced
-for every filesystem. A `run` invocation contains all five workloads: 11,700
-edits and 1,755 no-op controls per filesystem.
+Each workload has a distinct number and the same experiment-specific fixed
+matrix. Main-matrix cells are deterministically shuffled. For `path_depth`, a
+matched case block contains all six depth variants; case blocks and their
+internal depth order are deterministically shuffled. The same order is
+reproduced for every filesystem. A `run` invocation contains 11,700 edits and
+1,755 controls per filesystem. A `depth-run` invocation contains 7,800 edits
+and 1,170 controls per filesystem. Smoke counts are respectively 36 and 24
+edits; both have 6 controls.
 
 Filesystem configurations are executed serially so their device-sector counters
 cannot interfere. The five workloads for one filesystem stay in one runner
@@ -190,9 +235,10 @@ Cache state is not an E3 variable. The helper does not issue
 the same cache-neutral protocol.
 
 After each group of at most 20 edit samples the schedule runs three fresh
-no-op controls. A control performs the same mount, rename, v2 checkpoint,
+no-op controls. A control uses the first event in its batch to create the same
+frozen file and parent tree, then performs the same mount, rename, v2 checkpoint,
 pre-window `syncfs`, stable-counter, measured no-op `syncfs`, and stable-counter
-lifecycle but no file edit. Its
+lifecycle but no file edit. Generation-2 upper must remain empty. Its
 triplicate median is the fixed batch baseline for sensitivity analysis. Raw
 physical I/O is always preserved; the corrected value is
 `max(0, raw - no_op_median)`.
@@ -203,7 +249,7 @@ Each attempt exclusively uses:
 
     BACKING_DIR/.e3-work/<sample-id>/
       base/
-      generation-1/upper/edit.bin
+      generation-1/upper/<relative-path>
       generation-1/work/
       generation-2/upper/
       generation-2/work/
@@ -211,9 +257,10 @@ Each attempt exclusively uses:
       merged/
       helper-result.json
 
-Before an edit sample, the runner regenerates the exact preimage in
-`generation-1/upper`, checks its SHA-256, `fsync`s it, calls `syncfs` on the
-backing filesystem, and verifies that the generation-2 upper has no `edit.bin`.
+Before an edit sample, the runner creates the event's canonical parent chain,
+regenerates the exact preimage at `generation-1/upper/<relative-path>`, fixes
+directory modes/timestamps, checks its SHA-256, `fsync`s it, calls `syncfs` on
+the backing filesystem, and verifies that generation-2 upper is empty.
 It mounts generation 1 with:
 
     lowerdir=base,upperdir=generation-1/upper,workdir=generation-1/work,
@@ -236,7 +283,7 @@ the run.
 
 The edit helper then performs this fixed sequence:
 
-1. confirm frozen `layers/g1/edit.bin` exists, generation-2 upper does not, and
+1. confirm frozen `layers/g1/<relative-path>` exists, generation-2 upper does not, and
    merged/frozen paths are regular files;
 2. hash frozen/merged and verify size and expected preimage;
 3. call `syncfs` on the merged root to drain checkpoint and precheck writes;
@@ -249,11 +296,14 @@ The edit helper then performs this fixed sequence:
 7. collect upper FIEMAP with `FIEMAP_FLAG_SYNC`;
 8. hash merged, generation-2 upper, and frozen generation-1 upper and apply all
    postimage oracles;
-9. atomically write helper JSON and the separate FIEMAP JSON dump.
+9. atomically write helper JSON and the separate FIEMAP JSON dump;
+10. verify generation-2 upper contains exactly the target file and its declared
+    parent chain, and record `copied_up_parent_dirs=directory_depth`.
 
-No-op controls execute the same generation-1 mount, rename, v2 checkpoint, and
+No-op controls execute the same event-shaped generation-1 mount, rename, v2 checkpoint, and
 pre-window `syncfs`, then steps 4--6 without opening or modifying an edit file.
-Setup, checkpoint, precheck, and unmount I/O occur outside the counter interval.
+They verify the merged/frozen preimage is unchanged and generation-2 upper has
+no entries. Setup, checkpoint, precheck, and unmount I/O occur outside the counter interval.
 
 ## 6. FIEMAP contract
 
@@ -316,27 +366,30 @@ Each output directory contains:
     dmesg-after.log
     fiemap/<sample-id>.json
 
-The manifest records schema/preset/seed, event path/hash/count, git
+The manifest records schema/preset/experiment/seed, event path/hash/count, git
 commit, kernel release/config hash, filesystem type/config/UUID/source/options,
 `xfs_info`, explicit and canonical device-stat paths, OverlayFS options,
 `deltafs_abi_version=2`, initial/checkpoint generations `1` and `2`, copy-up
-source `checkpoint_frozen_upper`, start time, legal matrix, samples per cell,
+source `checkpoint_frozen_upper`, start time, experiment cells and directory
+depths, samples per cell,
 independent workload count, no-op interval/repetitions, and settle constants. Analysis
 requires these exact v2 lifecycle values, so it cannot mix legacy plain-
 OverlayFS E3 artifacts with current results.
 
 Every edit raw row contains:
 
-    schema, workload, sample, sample_id, sample_kind, control_batch,
-    fs_config, event_id, file_size_before, size_bin,
-    offset, logical_bytes_changed, dirty_blocks, copyup_bytes,
+    schema, experiment, workload, sample, sample_id, sample_kind, control_batch,
+    fs_config, event_id, case_id, relative_path, directory_depth,
+    file_size_before, size_bin, offset, logical_bytes_changed, dirty_blocks, copyup_bytes,
     shared_bytes, allocated_bytes_total, copyup_amplification,
+    copied_up_parent_dirs,
     sectors_before, sectors_after, physical_io_bytes, settle_timeout,
     pre_sha256, post_sha256, upper_sha256, lower_sha256,
     fiemap_path, fiemap_block_size, status, errno, invalid_reason
 
-Control rows use a separate `controls.jsonl` schema with workload, sample,
-sample/control IDs, batch, replica, sector values, physical bytes,
+Control rows use a separate `controls.jsonl` schema with experiment, workload,
+sample, sample/control IDs, template event/case/path/depth, batch, replica,
+sector values, physical bytes,
 settle timeout, status, errno, and reason. Status is `ok`, `invalid`, or
 `failed`. Only `status=ok` edit rows enter statistics. No row or failed FIEMAP
 dump is deleted.
@@ -353,7 +406,7 @@ makes the run fail even if all sample rows are otherwise valid.
 ## 9. Analysis contract
 
 `analyze.py RESULTS_ROOT` recursively discovers E3 manifests outside its own
-analysis directory. Smoke and full run each require exactly one passed result
+analysis directory. Every preset requires exactly one passed result
 set for each filesystem. Every result set must share preset/schema/seed and the
 three filesystems must share one event hash and complete edit/control schedules.
 
@@ -368,7 +421,7 @@ resamples paired event deltas with the same workload clustering. This does not t
 the deterministic within-workload synthetic schedule as a second independent random
 sample. No values are winsorized and no outlier is silently removed.
 
-Artifacts are:
+For `copyup_matrix`, artifacts are:
 
     analysis/summary.tsv
     analysis/paired-benefit.tsv
@@ -410,7 +463,34 @@ while the sensitivity TSV carries no-op-corrected bytes.
 `amplification-summary.tsv` records the cache-neutral cell count and plotted
 median for both amplification metrics.
 
-Passing requires all 18 planned cells at their preset counts, all three
+For `path_depth`, analysis instead emits:
+
+    analysis/depth-summary.tsv
+    analysis/depth-paired.tsv
+    analysis/depth-paired-summary.tsv
+    analysis/depth-slope.tsv
+    analysis/noop-sensitivity.tsv
+    analysis/pairing-errors.tsv
+    analysis/invalid.jsonl
+    analysis/path-depth-physical-write-amplification.png
+    analysis/path-depth-copyup-amplification.png
+    analysis/summary.json
+
+`depth-summary.tsv` groups raw and corrected physical bytes plus copy-up bytes
+by filesystem, file size, and directory depth. `depth-paired.tsv` joins all six
+depth variants of each `case_id` within one filesystem and reports the delta
+and ratio against depth 0. `depth-slope.tsv` reports the median within-case OLS
+slope in bytes per additional parent directory with workload-cluster bootstrap
+CI95. The two depth plots use directory depth on the x axis and one series per
+file size. The corrected physical-write plot is the primary result;
+copy-up amplification is a negative control because file FIEMAP does not
+include parent-directory metadata. `copyup_depth_invariant` reports whether
+the median depth-16 minus depth-0 copy-up byte delta is zero in all six
+filesystem/file-size groups. Analysis summary records, separately from
+artifact validity, whether the paired depth-16 corrected physical-I/O CI is
+strictly above zero for every filesystem/file-size group.
+
+Passing requires every experiment-specific planned cell at its preset count, all three
 filesystem configurations, exact event pairing, complete control triplets,
 zero invalid/failed/hash/FIEMAP/block-stat/dmesg errors, and successful artifact
 generation. Paper values and trends are references, not numeric pass gates.
@@ -603,7 +683,48 @@ unrelated services off the measured devices.
 The exact successful runner counts are
 `ok=11700 invalid=0 failed=0 controls=1755`.
 
-### 11.6 Failure collection
+### 11.6 Path-depth smoke and full run
+
+Use new empty backing directories and separate result roots:
+
+    mkdir -p /var/tmp/e3-results/depth-smoke /var/tmp/e3-results/depth-run
+
+    run_depth_e3() {
+      PRESET=$1 FS=$2 ROOT=$3
+      case "$FS" in
+        ext4_noreflink) BACKING=/mnt/e3/ext4 STAT=/sys/block/vdb/stat ;;
+        xfs_noreflink) BACKING=/mnt/e3/xfs-noreflink STAT=/sys/block/vdc/stat ;;
+        xfs_reflink)   BACKING=/mnt/e3/xfs-reflink STAT=/sys/block/vdd/stat ;;
+        *) return 2 ;;
+      esac
+      WORK="$BACKING/e3-$PRESET"
+      mkdir "$WORK"
+      python3 tools/deltafs/bench/e3/run.py "$PRESET" "$WORK" "$STAT" "$ROOT/$FS"
+    }
+
+    for FS in ext4_noreflink xfs_noreflink xfs_reflink; do
+      run_depth_e3 depth-smoke "$FS" /var/tmp/e3-results/depth-smoke
+    done
+    python3 tools/deltafs/bench/e3/analyze.py /var/tmp/e3-results/depth-smoke
+
+Expected per filesystem: `ok=24 invalid=0 failed=0 controls=6`. Every raw row
+must have `copied_up_parent_dirs == directory_depth`; each case must have all
+six depths, and analysis must generate both path-depth PNGs plus the four depth
+TSVs without pairing errors.
+
+After smoke passes, reboot or use new disposable filesystems/directories, then:
+
+    for FS in ext4_noreflink xfs_noreflink xfs_reflink; do
+      run_depth_e3 depth-run "$FS" /var/tmp/e3-results/depth-run
+    done
+    python3 tools/deltafs/bench/e3/analyze.py /var/tmp/e3-results/depth-run
+
+Expected per filesystem: `ok=7800 invalid=0 failed=0 controls=1170`. Inspect
+`analysis/summary.json` for `depth_hypothesis_supported`; a false value does not
+invalidate artifact correctness, but means the run did not demonstrate the
+pre-registered positive depth effect and must be reported as such.
+
+### 11.7 Failure collection
 
 On any failure, do not delete `.e3-work`, result JSONL, or FIEMAP dumps. Replace
 `R` and `DEV` with the failing output and measured device:

@@ -28,6 +28,7 @@ DELTAFS_ABI_VERSION = 2
 INITIAL_GENERATION = 1
 CHECKPOINT_GENERATION = 2
 COPYUP_SOURCE = "checkpoint_frozen_upper"
+SYNTHETIC_MTIME_NS = 946684800 * 1_000_000_000
 MOUNT_FEATURES = (
     "index=off", "nfs_export=off", "metacopy=off", "xino=off",
     "uuid=off", "redirect_dir=nofollow",
@@ -327,6 +328,7 @@ def build_manifest(preset: str, event_path: pathlib.Path,
     return {
         "schema": SCHEMA,
         "preset": preset,
+        "experiment": configuration["experiment"],
         "seed": events.SEED,
         "event_file": event_path.name,
         "event_file_sha256": sha256_file(event_path),
@@ -349,6 +351,14 @@ def build_manifest(preset: str, event_path: pathlib.Path,
         "copyup_source": COPYUP_SOURCE,
         "started_at": utc_now(),
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
+        "experiment_cells": [
+            [size * 1024, dirty, depth]
+            for size, dirty, depth in events.experiment_cells(preset)
+        ],
+        "directory_depths": list(
+            events.DIRECTORY_DEPTHS
+            if configuration["experiment"] == "path_depth" else (0,)
+        ),
         "samples_per_cell": configuration["samples"],
         "independent_workloads": configuration["workloads"],
         "noop_interval": NOOP_INTERVAL,
@@ -388,8 +398,19 @@ def create_sample(sample_dir: pathlib.Path, event: dict[str, Any] | None) -> Non
     if event is not None:
         before, _ = events.event_images(event)
         target = sample_dir / "generation-1" / "upper" / event["relative_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        upper = sample_dir / "generation-1" / "upper"
+        for parent in target.parents:
+            if parent == upper:
+                break
+            parent.chmod(0o755)
         target.write_bytes(before)
         target.chmod(0o644)
+        os.utime(target, ns=(SYNTHETIC_MTIME_NS, SYNTHETIC_MTIME_NS))
+        for parent in target.parents:
+            if parent == upper:
+                break
+            os.utime(parent, ns=(SYNTHETIC_MTIME_NS, SYNTHETIC_MTIME_NS))
         with target.open("rb") as stream:
             os.fsync(stream.fileno())
         if sha256_file(target) != event["expected_before_sha256"]:
@@ -454,15 +475,20 @@ def raw_base(event: dict[str, Any], number: int, identity: str,
              fs_config: str, batch: int, fiemap: pathlib.Path,
              out_dir: pathlib.Path) -> dict[str, Any]:
     return {
-        "schema": SCHEMA, "workload": event["workload"], "sample": number,
+        "schema": SCHEMA, "experiment": event["experiment"],
+        "workload": event["workload"], "sample": number,
         "sample_id": identity, "sample_kind": "edit", "control_batch": batch,
         "fs_config": fs_config,
-        "event_id": event["event_id"], "file_size_before": event["file_size_before"],
+        "event_id": event["event_id"], "case_id": event["case_id"],
+        "relative_path": event["relative_path"],
+        "directory_depth": event["directory_depth"],
+        "file_size_before": event["file_size_before"],
         "size_bin": event["size_bin"], "offset": event["offset"],
         "logical_bytes_changed": event["write_bytes"],
         "dirty_blocks": event["dirty_blocks"], "copyup_bytes": 0,
         "shared_bytes": 0, "allocated_bytes_total": 0,
-        "copyup_amplification": 0.0, "sectors_before": 0, "sectors_after": 0,
+        "copyup_amplification": 0.0, "copied_up_parent_dirs": 0,
+        "sectors_before": 0, "sectors_after": 0,
         "physical_io_bytes": 0, "settle_timeout": False, "pre_sha256": "",
         "post_sha256": "", "upper_sha256": "", "lower_sha256": "",
         "fiemap_path": str(fiemap.relative_to(out_dir)), "fiemap_block_size": 0,
@@ -488,6 +514,46 @@ def exception_reason(stage: str, error: BaseException) -> str:
     return f"{stage}: {str(error).replace(chr(10), ' ')}"[:1000]
 
 
+def verify_upper_tree(sample_dir: pathlib.Path, event: dict[str, Any]) -> int:
+    upper = sample_dir / "generation-2" / "upper"
+    target = upper / event["relative_path"]
+    relative = pathlib.PurePosixPath(event["relative_path"])
+    expected = {relative.as_posix()}
+    current = relative.parent
+    while current != pathlib.PurePosixPath("."):
+        expected.add(current.as_posix())
+        current = current.parent
+    actual = {path.relative_to(upper).as_posix() for path in upper.rglob("*")}
+    if actual != expected:
+        raise E3Error(
+            f"generation-2 upper tree mismatch: expected={sorted(expected)} "
+            f"actual={sorted(actual)}"
+        )
+    if not target.is_file() or target.is_symlink():
+        raise E3Error("generation-2 upper target is not a regular file")
+    parents = []
+    for path in target.parents:
+        if path == upper:
+            break
+        parents.append(path)
+    if len(parents) != event["directory_depth"] or any(
+            not path.is_dir() or path.is_symlink() for path in parents):
+        raise E3Error("generation-2 upper parent chain differs from directory_depth")
+    return len(parents)
+
+
+def verify_control_tree(sample_dir: pathlib.Path, event: dict[str, Any]) -> None:
+    upper = sample_dir / "generation-2" / "upper"
+    if any(upper.iterdir()):
+        raise E3Error("no-op control materialized generation-2 upper entries")
+    relative = event["relative_path"]
+    frozen = sample_dir / "layers" / "g1" / relative
+    merged = sample_dir / "merged" / relative
+    if sha256_file(frozen) != event["expected_before_sha256"] or \
+            sha256_file(merged) != event["expected_before_sha256"]:
+        raise E3Error("no-op control changed the event preimage")
+
+
 def run_edit(backing: pathlib.Path, helper: pathlib.Path,
              checkpoint_helper: pathlib.Path, out_dir: pathlib.Path,
              raw_path: pathlib.Path, logs: Logs, device: pathlib.Path,
@@ -509,11 +575,12 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path,
         stage = "checkpoint_sample"
         checkpoint_sample(sample_dir, checkpoint_helper, logs)
         stage = "run_helper"
+        relative = event["relative_path"]
         command = [
             str(helper), "edit", "--merged", str(sample_dir / "merged"),
-            "--target", str(sample_dir / "merged" / "edit.bin"),
-            "--upper", str(sample_dir / "generation-2" / "upper" / "edit.bin"),
-            "--lower", str(sample_dir / "layers" / "g1" / "edit.bin"),
+            "--target", str(sample_dir / "merged" / relative),
+            "--upper", str(sample_dir / "generation-2" / "upper" / relative),
+            "--lower", str(sample_dir / "layers" / "g1" / relative),
             "--device-stat", str(device), "--file-size", str(event["file_size_before"]),
             "--offset", str(event["offset"]), "--write-bytes", str(event["write_bytes"]),
             "--payload-seed", str(event["payload_seed"]),
@@ -527,6 +594,8 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path,
         merge_edit_result(row, result)
         if process.returncode or result["status"] != "ok":
             raise E3Error(f"copyup_bench returned {result['status']}")
+        stage = "verify_upper_tree"
+        row["copied_up_parent_dirs"] = verify_upper_tree(sample_dir, event)
         stage = "unmount_sample"
         unmount_sample(sample_dir, logs)
         mounted = False
@@ -561,14 +630,20 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path,
 
 def run_control(backing: pathlib.Path, helper: pathlib.Path,
                 checkpoint_helper: pathlib.Path, controls_path: pathlib.Path,
-                logs: Logs, device: pathlib.Path, fs_config: str, workload: int,
-                sample: int, batch: int, replica: int) -> dict[str, Any]:
+                logs: Logs, device: pathlib.Path, fs_config: str,
+                event: dict[str, Any], sample: int, batch: int,
+                replica: int) -> dict[str, Any]:
+    workload = event["workload"]
     identity = f"w{workload:02d}-b{batch:04d}-control-{replica}"
     sample_dir = backing / ".e3-work" / identity
     result_path = sample_dir / "helper-result.json"
     row = {
-        "schema": SCHEMA, "workload": workload, "sample": sample, "sample_id": identity,
+        "schema": SCHEMA, "experiment": event["experiment"],
+        "workload": workload, "sample": sample, "sample_id": identity,
         "sample_kind": "control", "fs_config": fs_config,
+        "template_event_id": event["event_id"], "case_id": event["case_id"],
+        "relative_path": event["relative_path"],
+        "directory_depth": event["directory_depth"],
         "control_batch": batch, "replica": replica, "sectors_before": 0,
         "sectors_after": 0, "physical_io_bytes": 0, "settle_timeout": False,
         "status": "failed", "errno": 0, "invalid_reason": None,
@@ -577,7 +652,7 @@ def run_control(backing: pathlib.Path, helper: pathlib.Path,
     preserve = True
     stage = "prepare_control"
     try:
-        create_sample(sample_dir, None)
+        create_sample(sample_dir, event)
         stage = "mount_control"
         mount_sample(sample_dir, logs)
         mounted = True
@@ -594,6 +669,8 @@ def run_control(backing: pathlib.Path, helper: pathlib.Path,
             row[key] = result[key]
         if process.returncode or result["status"] != "ok":
             raise E3Error(f"control helper returned {result['status']}")
+        stage = "verify_control_tree"
+        verify_control_tree(sample_dir, event)
         stage = "unmount_control"
         unmount_sample(sample_dir, logs)
         mounted = False
@@ -661,7 +738,7 @@ def summarize(manifest: dict[str, Any], rows: list[dict[str, Any]],
               completed: bool) -> dict[str, Any]:
     counts = collections.Counter(row["status"] for row in rows)
     control_counts = collections.Counter(row["status"] for row in controls)
-    cells = len(events.legal_cells())
+    cells = len(events.experiment_cells(manifest["preset"]))
     planned_batches_per_workload = (
         cells * manifest["samples_per_cell"] + NOOP_INTERVAL - 1
     ) // NOOP_INTERVAL
@@ -758,7 +835,7 @@ def run_benchmark(preset: str, backing: pathlib.Path,
                 control_number += 1
                 control = run_control(
                     backing, helper, checkpoint_helper, controls_path, logs,
-                    device, fs_config, workload, control_number, batch, replica,
+                    device, fs_config, group[0], control_number, batch, replica,
                 )
                 controls.append(control)
                 if control["status"] != "ok":
@@ -810,9 +887,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Measure DeltaFS v2 post-checkpoint copy-up and device I/O",
     )
     subparsers = parser.add_subparsers(dest="preset", required=True)
-    smoke = subparsers.add_parser("smoke", help="run two samples per legal cell")
-    full = subparsers.add_parser("run", help="run all five independent workloads")
-    for subparser in (smoke, full):
+    smoke = subparsers.add_parser("smoke", help="run two samples per copy-up cell")
+    full = subparsers.add_parser("run", help="run the full copy-up matrix")
+    depth_smoke = subparsers.add_parser(
+        "depth-smoke", help="run two samples per path-depth cell",
+    )
+    depth_full = subparsers.add_parser(
+        "depth-run", help="run the full path-depth experiment",
+    )
+    for subparser in (smoke, full, depth_smoke, depth_full):
         subparser.add_argument("backing_dir", type=pathlib.Path, metavar="BACKING_DIR")
         subparser.add_argument("device_stat", type=pathlib.Path, metavar="DEVICE_STAT")
         subparser.add_argument("out_dir", type=pathlib.Path, metavar="OUT_DIR")

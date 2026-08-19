@@ -31,17 +31,20 @@ BOOTSTRAP_REPLICATES = 10_000
 FS_CONFIGS = ("ext4_noreflink", "xfs_noreflink", "xfs_reflink")
 METRICS = ("copyup_bytes", "physical_io_bytes", "physical_io_bytes_corrected")
 RAW_FIELDS = frozenset((
-    "schema", "workload", "sample", "sample_id", "sample_kind", "control_batch",
-    "fs_config", "event_id", "file_size_before", "size_bin",
+    "schema", "experiment", "workload", "sample", "sample_id", "sample_kind",
+    "control_batch", "fs_config", "event_id", "case_id", "relative_path",
+    "directory_depth", "file_size_before", "size_bin",
     "offset", "logical_bytes_changed", "dirty_blocks", "copyup_bytes",
     "shared_bytes", "allocated_bytes_total", "copyup_amplification",
+    "copied_up_parent_dirs",
     "sectors_before", "sectors_after", "physical_io_bytes", "settle_timeout",
     "pre_sha256", "post_sha256", "upper_sha256", "lower_sha256",
     "fiemap_path", "fiemap_block_size", "status", "errno", "invalid_reason",
 ))
 CONTROL_FIELDS = frozenset((
-    "schema", "workload", "sample", "sample_id", "sample_kind",
-    "fs_config", "control_batch", "replica", "sectors_before", "sectors_after",
+    "schema", "experiment", "workload", "sample", "sample_id", "sample_kind",
+    "fs_config", "template_event_id", "case_id", "relative_path",
+    "directory_depth", "control_batch", "replica", "sectors_before", "sectors_after",
     "physical_io_bytes", "settle_timeout", "status", "errno", "invalid_reason",
 ))
 SUMMARY_FIELDS = frozenset((
@@ -49,14 +52,14 @@ SUMMARY_FIELDS = frozenset((
     "planned_edits", "planned_controls", "dmesg_failures", "finished_at",
 ))
 MANIFEST_FIELDS = frozenset((
-    "schema", "preset", "seed", "event_file", "event_file_sha256",
+    "schema", "preset", "experiment", "seed", "event_file", "event_file_sha256",
     "event_count",
     "git_commit", "kernel_release", "kernel_config_sha256", "fs_type", "fs_config",
     "fs_uuid", "backing_source", "backing_mount_options", "xfs_info",
     "device_stat", "canonical_device_stat", "overlay_mount_options", "started_at",
     "deltafs_abi_version", "initial_generation", "checkpoint_generation",
     "copyup_source",
-    "legal_cells", "samples_per_cell",
+    "legal_cells", "experiment_cells", "directory_depths", "samples_per_cell",
     "independent_workloads", "noop_interval", "noop_repetitions", "settle_interval_ms",
     "settle_stable_comparisons", "settle_timeout_ms",
 ))
@@ -97,6 +100,21 @@ class AmplificationStats:
     metric: str
     count: int
     p50: float
+
+
+@dataclass(frozen=True)
+class DepthStats:
+    fs_config: str
+    file_size_before: int
+    directory_depth: int
+    metric: str
+    count: int
+    p25: float
+    p50: float
+    p75: float
+    p95: float
+    ci95_low: float
+    ci95_high: float
 
 
 def is_plain_int(value: Any) -> bool:
@@ -149,8 +167,17 @@ def validate_manifest(value: dict[str, Any]) -> None:
         raise AnalysisError("manifest does not describe the E3 DeltaFS v2 lifecycle")
     configuration = events.PRESETS[value["preset"]]
     expected = {
+        "experiment": configuration["experiment"],
         "event_count": sum(events.expected_counts(value["preset"]).values()),
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
+        "experiment_cells": [
+            [size * 1024, dirty, depth]
+            for size, dirty, depth in events.experiment_cells(value["preset"])
+        ],
+        "directory_depths": list(
+            events.DIRECTORY_DEPTHS
+            if configuration["experiment"] == "path_depth" else (0,)
+        ),
         "samples_per_cell": configuration["samples"],
         "independent_workloads": configuration["workloads"],
         "noop_interval": 20,
@@ -175,7 +202,8 @@ def validate_raw_shape(row: dict[str, Any], fs_config: str, line_number: int) ->
     if set(row) != RAW_FIELDS:
         raise AnalysisError(f"raw schema mismatch at line {line_number}")
     integer_fields = (
-        "schema", "workload", "sample", "control_batch", "file_size_before", "offset",
+        "schema", "workload", "sample", "control_batch", "directory_depth",
+        "copied_up_parent_dirs", "file_size_before", "offset",
         "logical_bytes_changed", "dirty_blocks", "copyup_bytes", "shared_bytes",
         "allocated_bytes_total", "sectors_before", "sectors_after",
         "physical_io_bytes", "fiemap_block_size", "errno",
@@ -184,6 +212,9 @@ def validate_raw_shape(row: dict[str, Any], fs_config: str, line_number: int) ->
         raise AnalysisError(f"raw numeric type mismatch at line {line_number}")
     if row["schema"] != SCHEMA or row["sample_kind"] != "edit" or \
             row["fs_config"] != fs_config or \
+            row["experiment"] not in ("copyup_matrix", "path_depth") or \
+            any(not isinstance(row[field], str) or not row[field]
+                for field in ("case_id", "relative_path")) or \
             row["status"] not in ("ok", "invalid", "failed") or \
             not isinstance(row["settle_timeout"], bool) or \
             not isinstance(row["copyup_amplification"], (int, float)) or \
@@ -197,13 +228,16 @@ def validate_control_shape(row: dict[str, Any], fs_config: str, line_number: int
     if set(row) != CONTROL_FIELDS:
         raise AnalysisError(f"control schema mismatch at line {line_number}")
     integer_fields = (
-        "schema", "workload", "sample", "control_batch", "replica", "sectors_before",
+        "schema", "workload", "sample", "directory_depth", "control_batch", "replica", "sectors_before",
         "sectors_after", "physical_io_bytes", "errno",
     )
     if any(not is_plain_int(row[field]) for field in integer_fields):
         raise AnalysisError(f"control numeric type mismatch at line {line_number}")
     if row["schema"] != SCHEMA or row["sample_kind"] != "control" or \
             row["fs_config"] != fs_config or \
+            row["experiment"] not in ("copyup_matrix", "path_depth") or \
+            any(not isinstance(row[field], str) or not row[field] for field in
+                ("template_event_id", "case_id", "relative_path")) or \
             row["status"] not in ("ok", "invalid", "failed") or \
             not isinstance(row["settle_timeout"], bool):
         raise AnalysisError(f"control categorical mismatch at line {line_number}")
@@ -274,7 +308,9 @@ def validate_result_set(result: ResultSet) -> list[str]:
         sample_ids.add(row["sample_id"])
         fiemap_paths.add(row["fiemap_path"])
         expected = {
-            "workload": event["workload"],
+            "experiment": event["experiment"], "workload": event["workload"],
+            "case_id": event["case_id"], "relative_path": event["relative_path"],
+            "directory_depth": event["directory_depth"],
             "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
             "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
             "dirty_blocks": event["dirty_blocks"],
@@ -289,6 +325,7 @@ def validate_result_set(result: ResultSet) -> list[str]:
         if row["status"] == "ok":
             if row["errno"] or row["settle_timeout"] or row["invalid_reason"] is not None or \
                     row["copyup_bytes"] <= 0 or row["allocated_bytes_total"] <= 0 or \
+                    row["copied_up_parent_dirs"] != row["directory_depth"] or \
                     row["sectors_after"] < row["sectors_before"] or \
                     (row["sectors_after"] - row["sectors_before"]) * 512 != row["physical_io_bytes"] or \
                     row["copyup_bytes"] + row["shared_bytes"] != row["allocated_bytes_total"] or \
@@ -325,11 +362,14 @@ def validate_result_set(result: ResultSet) -> list[str]:
         errors_found.append(f"{result.manifest['fs_config']}: raw event set is incomplete")
 
     expected_controls: set[tuple[int, int, int]] = set()
+    control_templates: dict[tuple[int, int], dict[str, Any]] = {}
     grouped = collections.defaultdict(list)
     for event in result.events:
         grouped[event["workload"]].append(event)
     for workload, group in grouped.items():
         for batch in range(1, math.ceil(len(group) / result.manifest["noop_interval"]) + 1):
+            start = (batch - 1) * result.manifest["noop_interval"]
+            control_templates[(workload, batch)] = group[start]
             for replica in range(1, result.manifest["noop_repetitions"] + 1):
                 expected_controls.add((workload, batch, replica))
     actual_controls: set[tuple[int, int, int]] = set()
@@ -343,7 +383,15 @@ def validate_result_set(result: ResultSet) -> list[str]:
         if key in actual_controls:
             errors_found.append(f"{result.manifest['fs_config']}: duplicate control {key}")
         actual_controls.add(key)
+        template = control_templates.get((control["workload"], control["control_batch"]))
+        template_mismatch = template is None or any(control[field] != template[source]
+            for field, source in (
+                ("experiment", "experiment"), ("template_event_id", "event_id"),
+                ("case_id", "case_id"), ("relative_path", "relative_path"),
+                ("directory_depth", "directory_depth"),
+            ))
         if control["sample"] != line_number or control["status"] != "ok" or \
+                template_mismatch or \
                 control["errno"] or control["settle_timeout"] or \
                 control["invalid_reason"] is not None or \
                 control["sectors_after"] < control["sectors_before"] or \
@@ -589,6 +637,109 @@ def calculate_amplification_stats(rows: list[dict[str, Any]]) -> list[Amplificat
     return result
 
 
+DEPTH_METRICS = ("copyup_bytes", "physical_io_bytes", "physical_io_bytes_corrected")
+
+
+def calculate_depth_stats(rows: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATES
+                          ) -> list[DepthStats]:
+    grouped: dict[tuple[str, int, int, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        if row["status"] == "ok" and row["experiment"] == "path_depth":
+            for metric in DEPTH_METRICS:
+                grouped[(row["fs_config"], row["file_size_before"],
+                         row["directory_depth"], metric)].append(row)
+    result = []
+    for key in sorted(grouped, key=lambda item: (
+            FS_CONFIGS.index(item[0]), item[1], events.DIRECTORY_DEPTHS.index(item[2]),
+            DEPTH_METRICS.index(item[3]))):
+        group = grouped[key]
+        values = [float(row[key[3]]) for row in group]
+        low, high = cluster_bootstrap_median(
+            group, key[3], (*map(str, key), "depth"), replicates,
+        )
+        result.append(DepthStats(
+            key[0], key[1], key[2], key[3], len(group), percentile(values, .25),
+            percentile(values, .5), percentile(values, .75), percentile(values, .95),
+            low, high,
+        ))
+    return result
+
+
+def depth_paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    by_case: dict[tuple[str, str], dict[int, dict[str, Any]]] = collections.defaultdict(dict)
+    errors_found: list[str] = []
+    for row in rows:
+        if row.get("experiment") != "path_depth" or row.get("status") != "ok":
+            continue
+        key = (row["fs_config"], row["case_id"])
+        depth = row["directory_depth"]
+        if depth in by_case[key]:
+            errors_found.append(f"duplicate depth pair: {key} {depth}")
+        by_case[key][depth] = row
+    result = []
+    for (config, case_id), variants in sorted(by_case.items()):
+        missing = sorted(set(events.DIRECTORY_DEPTHS) - set(variants))
+        if missing:
+            errors_found.append(f"{config}/{case_id}: missing depths={missing}")
+            continue
+        baseline = variants[0]
+        for depth in events.DIRECTORY_DEPTHS[1:]:
+            target = variants[depth]
+            for metric in DEPTH_METRICS:
+                source = float(baseline[metric])
+                value = float(target[metric])
+                result.append({
+                    "fs_config": config, "workload": baseline["workload"],
+                    "file_size_before": baseline["file_size_before"],
+                    "case_id": case_id, "directory_depth": depth, "metric": metric,
+                    "depth0_bytes": source, "depth_bytes": value,
+                    "bytes_delta": value - source,
+                    "ratio": value / source if source else (math.inf if value else 1.0),
+                })
+    return result, errors_found
+
+
+def depth_slopes(paired: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATES
+                 ) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in paired:
+        grouped[(row["fs_config"], row["file_size_before"], row["metric"])].append(row)
+    result = []
+    for key, group in sorted(grouped.items()):
+        by_case: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+        for row in group:
+            by_case[row["case_id"]].append(row)
+        slope_rows = []
+        for case_rows in by_case.values():
+            points = [(0.0, 0.0)] + [
+                (float(row["directory_depth"]), float(row["bytes_delta"]))
+                for row in case_rows
+            ]
+            x_mean = statistics.mean(x for x, _ in points)
+            y_mean = statistics.mean(y for _, y in points)
+            denominator = sum((x - x_mean) ** 2 for x, _ in points)
+            numerator = sum((x - x_mean) * (y - y_mean) for x, y in points)
+            if denominator:
+                slope_rows.append({
+                    "workload": case_rows[0]["workload"],
+                    "slope": numerator / denominator,
+                })
+        if not slope_rows:
+            continue
+        low, high = cluster_bootstrap(
+            slope_rows,
+            lambda row: row["slope"], statistics.median,
+            (*map(str, key), "slope"), replicates,
+        )
+        result.append({
+            "fs_config": key[0], "file_size_before": key[1], "metric": key[2],
+            "n": len(slope_rows),
+            "p50_slope": statistics.median(row["slope"] for row in slope_rows),
+            "ci95_low": low, "ci95_high": high,
+        })
+    return result
+
+
 def paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
     by_event: dict[str, dict[str, dict[str, Any]]] = collections.defaultdict(dict)
     errors_found: list[str] = []
@@ -769,6 +920,86 @@ def write_amplification_summary(path: pathlib.Path,
             str(item.logical_bytes_changed), item.metric, str(item.count),
             number(item.p50),
         )) + "\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+
+def write_depth_summary(path: pathlib.Path, stats: list[DepthStats]) -> None:
+    fields = (
+        "fs_config", "file_size_before", "directory_depth", "metric", "n",
+        "p25", "p50", "p75", "p95", "ci95_low", "ci95_high",
+    )
+    lines = ["\t".join(fields) + "\n"]
+    for item in stats:
+        lines.append("\t".join((
+            item.fs_config, str(item.file_size_before), str(item.directory_depth),
+            item.metric, str(item.count), number(item.p25), number(item.p50),
+            number(item.p75), number(item.p95), number(item.ci95_low),
+            number(item.ci95_high),
+        )) + "\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+
+def write_depth_paired(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    fields = (
+        "fs_config", "workload", "file_size_before", "case_id",
+        "directory_depth", "metric", "depth0_bytes", "depth_bytes",
+        "bytes_delta", "ratio",
+    )
+    lines = ["\t".join(fields) + "\n"]
+    for row in rows:
+        lines.append("\t".join(
+            str(row[field]) if not isinstance(row[field], float) else number(row[field])
+            for field in fields
+        ) + "\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+
+def depth_paired_summary(rows: list[dict[str, Any]], replicates: int
+                         ) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, int, int, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    for row in rows:
+        grouped[(row["fs_config"], row["file_size_before"],
+                 row["directory_depth"], row["metric"])].append(row)
+    result = []
+    for key, group in sorted(grouped.items()):
+        low, high = cluster_bootstrap_median(
+            group, "bytes_delta", (*map(str, key), "depth-paired"), replicates,
+        )
+        result.append({
+            "fs_config": key[0], "file_size_before": key[1],
+            "directory_depth": key[2], "metric": key[3], "n": len(group),
+            "p50_bytes_delta": statistics.median(row["bytes_delta"] for row in group),
+            "ci95_low": low, "ci95_high": high,
+            "p50_ratio": statistics.median(row["ratio"] for row in group),
+        })
+    return result
+
+
+def write_depth_paired_summary(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    fields = (
+        "fs_config", "file_size_before", "directory_depth", "metric", "n",
+        "p50_bytes_delta", "ci95_low", "ci95_high", "p50_ratio",
+    )
+    lines = ["\t".join(fields) + "\n"]
+    for row in rows:
+        lines.append("\t".join(
+            str(row[field]) if not isinstance(row[field], float) else number(row[field])
+            for field in fields
+        ) + "\n")
+    path.write_text("".join(lines), encoding="ascii")
+
+
+def write_depth_slopes(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
+    fields = (
+        "fs_config", "file_size_before", "metric", "n", "p50_slope",
+        "ci95_low", "ci95_high",
+    )
+    lines = ["\t".join(fields) + "\n"]
+    for row in rows:
+        lines.append("\t".join(
+            str(row[field]) if not isinstance(row[field], float) else number(row[field])
+            for field in fields
+        ) + "\n")
     path.write_text("".join(lines), encoding="ascii")
 
 
@@ -1081,6 +1312,95 @@ def write_plot(path: pathlib.Path, stats: list[AmplificationStats], metric: str)
     path.write_bytes(png)
 
 
+DEPTH_PLOT_FILES = {
+    "physical_io_bytes_corrected": "path-depth-physical-write-amplification.png",
+    "copyup_bytes": "path-depth-copyup-amplification.png",
+}
+
+
+def write_depth_plot(path: pathlib.Path, stats: list[DepthStats], metric: str) -> None:
+    width, height = 1440, 760
+    left, right, top, bottom = 88, 34, 132, 112
+    panel_gap = 28
+    canvas = Canvas(width, height, (248, 250, 252))
+    axis, muted, grid, frame = (31, 41, 55), (91, 105, 120), (221, 227, 234), (183, 193, 204)
+    values = [item for item in stats if item.metric == metric]
+    if not values:
+        raise AnalysisError(f"depth plot has no values: {metric}")
+    maximum = max(item.p50 / events.BLOCK_SIZE for item in values)
+    y_high = max(1.0, maximum * 1.1)
+    total_width = width - left - right
+    panel_width = (total_width - panel_gap * 2) // 3
+    plot_height = height - top - bottom
+    title = (
+        "PATH DEPTH PHYSICAL WRITE AMPLIFICATION - NO-OP CORRECTED"
+        if metric == "physical_io_bytes_corrected"
+        else "PATH DEPTH COPY-UP AMPLIFICATION - FILE FIEMAP"
+    )
+    canvas.text(left, 18, title, axis, 2)
+    canvas.text(left, 52, "PER-CELL MEDIAN - DEPTH 0 IS THE MATCHED BASELINE", muted)
+    for index, file_size in enumerate((4 * 1024, 192 * 1024)):
+        style = FILE_SIZE_STYLES[file_size]
+        x = left + 90 + index * 190
+        styled_line(canvas, (x, 88), (x + 42, 88), style)
+        canvas.marker(x + 21, 88, style["radius"], style["color"], style["marker"])
+        canvas.text(x + 52, 84, style["label"], axis)
+
+    for panel_index, config in enumerate(FS_CONFIGS):
+        panel_left = left + panel_index * (panel_width + panel_gap)
+        panel_right = panel_left + panel_width
+        inner_left, inner_right = panel_left + 28, panel_right - 22
+        canvas.fill_rect(panel_left, top, panel_right, height - bottom, (255, 255, 255))
+        for fraction in (0, .25, .5, .75, 1):
+            y = top + round((1 - fraction) * plot_height)
+            canvas.line(panel_left, y, panel_right, y, grid)
+            if panel_index == 0:
+                label = number(y_high * fraction)
+                canvas.text(panel_left - text_width(label) - 10, y - 4, label, muted)
+        canvas.line(panel_left, top, panel_right, top, frame)
+        canvas.line(panel_left, top, panel_left, height - bottom, axis, 2)
+        canvas.line(panel_left, height - bottom, panel_right, height - bottom, axis, 2)
+        panel_title = PANEL_TITLES[config]
+        canvas.text(panel_left + (panel_width - text_width(panel_title)) // 2,
+                    top - 24, panel_title, axis)
+
+        def x_position(depth: int) -> int:
+            return inner_left + round(depth * (inner_right - inner_left) /
+                                      max(events.DIRECTORY_DEPTHS))
+
+        def y_position(amplification: float) -> int:
+            return top + round((1 - amplification / y_high) * plot_height)
+
+        for depth in events.DIRECTORY_DEPTHS:
+            x = x_position(depth)
+            label = str(depth)
+            canvas.line(x, height - bottom, x, height - bottom + 6, axis)
+            canvas.text(x - text_width(label) // 2, height - bottom + 14, label, axis)
+        for file_size in (4 * 1024, 192 * 1024):
+            style = FILE_SIZE_STYLES[file_size]
+            series = sorted((item for item in values if item.fs_config == config and
+                             item.file_size_before == file_size),
+                            key=lambda item: item.directory_depth)
+            points = [(x_position(item.directory_depth),
+                       y_position(item.p50 / events.BLOCK_SIZE)) for item in series]
+            for start, end in zip(points, points[1:]):
+                styled_line(canvas, start, end, style)
+            for x, y in points:
+                canvas.marker(x, y, style["radius"], style["color"], style["marker"])
+    canvas.text(left + (total_width - text_width("PARENT DIRECTORY DEPTH")) // 2,
+                height - bottom + 44, "PARENT DIRECTORY DEPTH", muted)
+    canvas.text(left, top - 48, "AMPLIFICATION RATIO", muted)
+    raw = b"".join(
+        b"\x00" + bytes(canvas.pixels[y * width * 3:(y + 1) * width * 3])
+        for y in range(height)
+    )
+    png = b"\x89PNG\r\n\x1a\n"
+    png += png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+    png += png_chunk(b"IDAT", zlib.compress(raw, 9))
+    png += png_chunk(b"IEND", b"")
+    path.write_bytes(png)
+
+
 def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
             ) -> tuple[list[GroupStats], list[str]]:
     result_sets = discover(root)
@@ -1097,19 +1417,71 @@ def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
         except AnalysisError as exc:
             errors_found.append(str(exc))
             rows = []
+    experiment = result_sets[0].manifest["experiment"]
     paired, pairing_errors = paired_rows(rows)
     errors_found.extend(pairing_errors)
-    stats = calculate_stats(rows, replicates) if rows else []
-    amplification_stats = calculate_amplification_stats(rows) if rows else []
-    regressions = regression(rows, replicates) if rows else []
-    write_summary(analysis_dir / "summary.tsv", stats)
-    write_paired(analysis_dir / "paired-benefit.tsv", paired)
-    write_paired_summary(analysis_dir / "paired-benefit-summary.tsv", paired, replicates)
-    write_regression(analysis_dir / "regression.tsv", regressions)
-    write_sensitivity(analysis_dir / "noop-sensitivity.tsv", rows)
-    write_amplification_summary(
-        analysis_dir / "amplification-summary.tsv", amplification_stats,
+    stale = (
+        "summary.tsv", "paired-benefit.tsv", "paired-benefit-summary.tsv",
+        "regression.tsv", "amplification-summary.tsv", "depth-summary.tsv",
+        "depth-paired.tsv", "depth-paired-summary.tsv", "depth-slope.tsv",
+        *LEGACY_PLOT_FILES, *PLOT_FILES.values(), *DEPTH_PLOT_FILES.values(),
     )
+    for name in stale:
+        (analysis_dir / name).unlink(missing_ok=True)
+    depth_hypothesis_supported: bool | None = None
+    copyup_depth_invariant: bool | None = None
+    if experiment == "copyup_matrix":
+        stats = calculate_stats(rows, replicates) if rows else []
+        amplification_stats = calculate_amplification_stats(rows) if rows else []
+        regressions = regression(rows, replicates) if rows else []
+        write_summary(analysis_dir / "summary.tsv", stats)
+        write_paired(analysis_dir / "paired-benefit.tsv", paired)
+        write_paired_summary(analysis_dir / "paired-benefit-summary.tsv", paired, replicates)
+        write_regression(analysis_dir / "regression.tsv", regressions)
+        write_amplification_summary(
+            analysis_dir / "amplification-summary.tsv", amplification_stats,
+        )
+        if amplification_stats:
+            for metric, name in PLOT_FILES.items():
+                write_plot(analysis_dir / name, amplification_stats, metric)
+        statistics_groups = len(stats)
+    else:
+        stats = []
+        depth_stats = calculate_depth_stats(rows, replicates) if rows else []
+        depth_paired, depth_errors = depth_paired_rows(rows)
+        errors_found.extend(depth_errors)
+        depth_summary = depth_paired_summary(depth_paired, replicates) \
+            if depth_paired else []
+        slopes = depth_slopes(depth_paired, replicates) if depth_paired else []
+        write_depth_summary(analysis_dir / "depth-summary.tsv", depth_stats)
+        write_depth_paired(analysis_dir / "depth-paired.tsv", depth_paired)
+        write_depth_paired_summary(
+            analysis_dir / "depth-paired-summary.tsv", depth_summary,
+        )
+        write_depth_slopes(analysis_dir / "depth-slope.tsv", slopes)
+        if depth_stats:
+            for metric, name in DEPTH_PLOT_FILES.items():
+                write_depth_plot(analysis_dir / name, depth_stats, metric)
+        hypothesis_groups = [
+            item for item in depth_summary
+            if item["directory_depth"] == max(events.DIRECTORY_DEPTHS) and
+            item["metric"] == "physical_io_bytes_corrected"
+        ]
+        depth_hypothesis_supported = (
+            len(hypothesis_groups) == len(FS_CONFIGS) * len(events.DEPTH_FILE_SIZES)
+            and all(item["ci95_low"] > 0 for item in hypothesis_groups)
+        )
+        copyup_groups = [
+            item for item in depth_summary
+            if item["directory_depth"] == max(events.DIRECTORY_DEPTHS) and
+            item["metric"] == "copyup_bytes"
+        ]
+        copyup_depth_invariant = (
+            len(copyup_groups) == len(FS_CONFIGS) * len(events.DEPTH_FILE_SIZES)
+            and all(item["p50_bytes_delta"] == 0 for item in copyup_groups)
+        )
+        statistics_groups = len(depth_stats)
+    write_sensitivity(analysis_dir / "noop-sensitivity.tsv", rows)
     (analysis_dir / "pairing-errors.tsv").write_text(
         "error\n" + "".join(f"{error}\n" for error in errors_found), encoding="utf-8",
     )
@@ -1121,16 +1493,14 @@ def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
                         json.dump({"artifact": kind, **row}, stream, sort_keys=True,
                                   separators=(",", ":"))
                         stream.write("\n")
-    for name in (*LEGACY_PLOT_FILES, *PLOT_FILES.values()):
-        (analysis_dir / name).unlink(missing_ok=True)
-    if amplification_stats:
-        for metric, name in PLOT_FILES.items():
-            write_plot(analysis_dir / name, amplification_stats, metric)
     summary = {
         "schema": SCHEMA, "passed": not errors_found,
         "preset": result_sets[0].manifest["preset"], "result_sets": len(result_sets),
         "paired_events": len({row["event_id"] for row in paired}),
-        "statistics_groups": len(stats), "errors": errors_found,
+        "experiment": experiment, "statistics_groups": statistics_groups,
+        "depth_hypothesis_supported": depth_hypothesis_supported,
+        "copyup_depth_invariant": copyup_depth_invariant,
+        "errors": errors_found,
     }
     (analysis_dir / "summary.json").write_text(
         json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8",

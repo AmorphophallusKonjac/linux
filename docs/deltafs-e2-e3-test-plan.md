@@ -11,11 +11,11 @@ E2 和 E3 现在是两个互不依赖的 benchmark。它们有各自的 runner�
 | bench | 研究问题 | 设计文档 | 计划实现目录 |
 |---|---|---|---|
 | E2 | DeltaFS checkpoint/restore ioctl 延迟 | [deltafs-e2-test-plan.md](deltafs-e2-test-plan.md) | `tools/deltafs/bench/e2/` |
-| E3 | reflink 对 copy-up 和物理 I/O 的影响 | [deltafs-e3-test-plan.md](deltafs-e3-test-plan.md) | `tools/deltafs/bench/e3/` |
+| E3 | reflink 对 copy-up/物理 I/O 的影响，以及深层父目录的物理写放大 | [deltafs-e3-test-plan.md](deltafs-e3-test-plan.md) | `tools/deltafs/bench/e3/` |
 
 E2 和 E3 均有独立实现。E2 按 v2 checkpoint/restore request、`keep_bottom` 和 prefix
 语义只测 ioctl latency，不用 `deltafsctl` 整条命令耗时冒充该指标。E3 使用固定
-`smoke|run` preset，自动管理 synthetic event、fresh sample mount、generation-1 upper
+`smoke|run|depth-smoke|depth-run` preset，自动管理 synthetic event、fresh sample mount、generation-1 upper
 冻结、v2 checkpoint、FIEMAP、block-stat、no-op control 和工件。E3 的 checkpoint 在
 计数区间外，只是建立被测 v2 layer stack，不是 E2 latency 样本；两者当前权威契约及
 QEMU 交接见各自详细设计文档。
