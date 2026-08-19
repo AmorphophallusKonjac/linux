@@ -214,10 +214,10 @@ def overlay_mounts() -> list[str]:
     return result
 
 
-def xfs_configuration(backing: pathlib.Path, mount: dict[str, str]) -> tuple[str, str]:
+def xfs_configuration(mount: dict[str, str]) -> tuple[str, str]:
     if mount["fstype"] == "ext4":
         return "ext4_noreflink", ""
-    output = command_output(["xfs_info", str(backing)])
+    output = command_output(["xfs_info", mount["target"]])
     matches = re.findall(r"(?:^|\s)reflink=([01])(?:\s|$)", output)
     if len(matches) != 1:
         raise E3Error("xfs_info did not report exactly one reflink=0/1 value")
@@ -284,7 +284,7 @@ def validate_environment(backing_arg: pathlib.Path, device_arg: pathlib.Path,
             filesystem_magic(backing) != FILESYSTEM_MAGICS[mount["fstype"]]:
         raise E3Error("BACKING_DIR must be on matching ext4 or XFS")
     device = validate_device_stat(backing, device_arg)
-    fs_config, xfs_info = xfs_configuration(backing, mount)
+    fs_config, xfs_info = xfs_configuration(mount)
     out_dir = validate_output_dir(out_arg)
     if out_dir.stat().st_dev == backing.stat().st_dev:
         raise E3Error("OUT_DIR must be on a different device from BACKING_DIR")
@@ -319,7 +319,7 @@ def git_commit() -> str:
     return process.stdout.strip() if process.returncode == 0 else "unknown"
 
 
-def build_manifest(preset: str, run_index: int, event_path: pathlib.Path,
+def build_manifest(preset: str, event_path: pathlib.Path,
                    values: list[dict[str, Any]],
                    mount: dict[str, str], fs_config: str, xfs_info: str,
                    device_arg: pathlib.Path, device: pathlib.Path) -> dict[str, Any]:
@@ -327,7 +327,6 @@ def build_manifest(preset: str, run_index: int, event_path: pathlib.Path,
     return {
         "schema": SCHEMA,
         "preset": preset,
-        "run_index": run_index,
         "seed": events.SEED,
         "event_file": event_path.name,
         "event_file_sha256": sha256_file(event_path),
@@ -350,9 +349,8 @@ def build_manifest(preset: str, run_index: int, event_path: pathlib.Path,
         "copyup_source": COPYUP_SOURCE,
         "started_at": utc_now(),
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
-        "warm_count_per_cell": configuration["warm"],
-        "cold_count_per_cell": configuration["cold"],
-        "independent_runs": configuration["runs"],
+        "samples_per_cell": configuration["samples"],
+        "independent_workloads": configuration["workloads"],
         "noop_interval": NOOP_INTERVAL,
         "noop_repetitions": NOOP_REPETITIONS,
         "settle_interval_ms": 100,
@@ -376,7 +374,7 @@ def syncfs(path: pathlib.Path) -> None:
 
 
 def sample_id(event: dict[str, Any], sample_number: int) -> str:
-    return f"r{event['run']:02d}-{event['cache_mode']}-s{sample_number:05d}-{event['event_id']}"
+    return f"w{event['workload']:02d}-s{sample_number:05d}-{event['event_id']}"
 
 
 def create_sample(sample_dir: pathlib.Path, event: dict[str, Any] | None) -> None:
@@ -456,9 +454,9 @@ def raw_base(event: dict[str, Any], number: int, identity: str,
              fs_config: str, batch: int, fiemap: pathlib.Path,
              out_dir: pathlib.Path) -> dict[str, Any]:
     return {
-        "schema": SCHEMA, "run": event["run"], "sample": number,
+        "schema": SCHEMA, "workload": event["workload"], "sample": number,
         "sample_id": identity, "sample_kind": "edit", "control_batch": batch,
-        "cache_mode": event["cache_mode"], "fs_config": fs_config,
+        "fs_config": fs_config,
         "event_id": event["event_id"], "file_size_before": event["file_size_before"],
         "size_bin": event["size_bin"], "offset": event["offset"],
         "logical_bytes_changed": event["write_bytes"],
@@ -521,7 +519,7 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path,
             "--payload-seed", str(event["payload_seed"]),
             "--expected-before", event["expected_before_sha256"],
             "--expected-after", event["expected_after_sha256"],
-            "--cache-mode", event["cache_mode"], "--fiemap-out", str(fiemap),
+            "--fiemap-out", str(fiemap),
             "--out", str(result_path),
         ]
         process = logs.subprocess(command, check=False)
@@ -563,15 +561,14 @@ def run_edit(backing: pathlib.Path, helper: pathlib.Path,
 
 def run_control(backing: pathlib.Path, helper: pathlib.Path,
                 checkpoint_helper: pathlib.Path, controls_path: pathlib.Path,
-                logs: Logs, device: pathlib.Path, fs_config: str, run: int,
-                cache_mode: str, sample: int, batch: int,
-                replica: int) -> dict[str, Any]:
-    identity = f"r{run:02d}-{cache_mode}-b{batch:04d}-control-{replica}"
+                logs: Logs, device: pathlib.Path, fs_config: str, workload: int,
+                sample: int, batch: int, replica: int) -> dict[str, Any]:
+    identity = f"w{workload:02d}-b{batch:04d}-control-{replica}"
     sample_dir = backing / ".e3-work" / identity
     result_path = sample_dir / "helper-result.json"
     row = {
-        "schema": SCHEMA, "run": run, "sample": sample, "sample_id": identity,
-        "sample_kind": "control", "cache_mode": cache_mode, "fs_config": fs_config,
+        "schema": SCHEMA, "workload": workload, "sample": sample, "sample_id": identity,
+        "sample_kind": "control", "fs_config": fs_config,
         "control_batch": batch, "replica": replica, "sectors_before": 0,
         "sectors_after": 0, "physical_io_bytes": 0, "settle_timeout": False,
         "status": "failed", "errno": 0, "invalid_reason": None,
@@ -627,13 +624,13 @@ def run_control(backing: pathlib.Path, helper: pathlib.Path,
     return row
 
 
-def planned_batches(values: list[dict[str, Any]]) -> list[tuple[int, str, int, list[dict[str, Any]]]]:
+def planned_batches(values: list[dict[str, Any]]) -> list[tuple[int, int, list[dict[str, Any]]]]:
     result = []
-    for (run, cache), group_iterator in itertools.groupby(
-            values, key=lambda value: (value["run"], value["cache_mode"])):
+    for workload, group_iterator in itertools.groupby(
+            values, key=lambda value: value["workload"]):
         group = list(group_iterator)
         for start in range(0, len(group), NOOP_INTERVAL):
-            result.append((run, cache, start // NOOP_INTERVAL + 1,
+            result.append((workload, start // NOOP_INTERVAL + 1,
                            group[start:start + NOOP_INTERVAL]))
     return result
 
@@ -665,9 +662,11 @@ def summarize(manifest: dict[str, Any], rows: list[dict[str, Any]],
     counts = collections.Counter(row["status"] for row in rows)
     control_counts = collections.Counter(row["status"] for row in controls)
     cells = len(events.legal_cells())
-    planned_batches_count = sum(
-        (cells * manifest[field] + NOOP_INTERVAL - 1) // NOOP_INTERVAL
-        for field in ("warm_count_per_cell", "cold_count_per_cell")
+    planned_batches_per_workload = (
+        cells * manifest["samples_per_cell"] + NOOP_INTERVAL - 1
+    ) // NOOP_INTERVAL
+    planned_batches_count = (
+        planned_batches_per_workload * manifest["independent_workloads"]
     )
     planned_controls = planned_batches_count * NOOP_REPETITIONS
     passed = (
@@ -687,7 +686,7 @@ def summarize(manifest: dict[str, Any], rows: list[dict[str, Any]],
     }
 
 
-def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
+def run_benchmark(preset: str, backing: pathlib.Path,
                   device: pathlib.Path,
                   device_arg: pathlib.Path, out_dir: pathlib.Path,
                   mount: dict[str, str], fs_config: str, xfs_info: str) -> int:
@@ -697,10 +696,10 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
     event_path = out_dir / "events.jsonl"
     raw_path = out_dir / "raw.jsonl"
     controls_path = out_dir / "controls.jsonl"
-    values = events.generate_events(preset, run_index)
+    values = events.generate_events(preset)
     atomic_write_bytes(event_path, events.canonical_jsonl(values))
     manifest = build_manifest(
-        preset, run_index, event_path, values, mount, fs_config, xfs_info,
+        preset, event_path, values, mount, fs_config, xfs_info,
         device_arg, device,
     )
     atomic_write_json(out_dir / "manifest.json", manifest)
@@ -722,21 +721,26 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
         atomic_write_bytes(out_dir / "dmesg-before.log", dmesg_before.encode())
         edit_number = 0
         control_number = 0
-        current_run = 0
+        current_workload = 0
         run_failed = False
-        for run, cache_mode, batch, group in planned_batches(values):
-            if run != current_run:
-                if current_run:
+        for workload, batch, group in planned_batches(values):
+            if workload != current_workload:
+                if current_workload:
                     after = read_dmesg(logs)
                     delta = new_dmesg(dmesg_cursor, after)
                     match = DMESG_FAILURE.search(delta)
                     if match:
-                        dmesg_failures.append({"run": current_run, "keyword": match.group(0)})
+                        dmesg_failures.append({
+                            "workload": current_workload, "keyword": match.group(0),
+                        })
                         completed = False
                         break
                     dmesg_cursor = after
-                current_run = run
-                logs.info(f"E3: independent run {run}/{events.PRESETS[preset]['runs']}")
+                current_workload = workload
+                logs.info(
+                    f"E3: independent workload {workload}/"
+                    f"{events.PRESETS[preset]['workloads']}"
+                )
             for event in group:
                 edit_number += 1
                 row = run_edit(
@@ -754,8 +758,7 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
                 control_number += 1
                 control = run_control(
                     backing, helper, checkpoint_helper, controls_path, logs,
-                    device, fs_config, run, cache_mode, control_number, batch,
-                    replica,
+                    device, fs_config, workload, control_number, batch, replica,
                 )
                 controls.append(control)
                 if control["status"] != "ok":
@@ -766,11 +769,13 @@ def run_benchmark(preset: str, run_index: int, backing: pathlib.Path,
                 break
         after = read_dmesg(logs)
         atomic_write_bytes(out_dir / "dmesg-after.log", after.encode())
-        if current_run and not dmesg_failures:
+        if current_workload and not dmesg_failures:
             delta = new_dmesg(dmesg_cursor, after)
             match = DMESG_FAILURE.search(delta)
             if match:
-                dmesg_failures.append({"run": current_run, "keyword": match.group(0)})
+                dmesg_failures.append({
+                    "workload": current_workload, "keyword": match.group(0),
+                })
                 completed = False
         if overlay_mounts():
             completed = False
@@ -805,18 +810,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         description="Measure DeltaFS v2 post-checkpoint copy-up and device I/O",
     )
     subparsers = parser.add_subparsers(dest="preset", required=True)
-    smoke = subparsers.add_parser("smoke", help="run one sample per legal cell")
-    full = subparsers.add_parser("run", help="run one indexed full-result shard")
-    full.add_argument("run_index", type=int, metavar="RUN_INDEX")
+    smoke = subparsers.add_parser("smoke", help="run two samples per legal cell")
+    full = subparsers.add_parser("run", help="run all five independent workloads")
     for subparser in (smoke, full):
         subparser.add_argument("backing_dir", type=pathlib.Path, metavar="BACKING_DIR")
         subparser.add_argument("device_stat", type=pathlib.Path, metavar="DEVICE_STAT")
         subparser.add_argument("out_dir", type=pathlib.Path, metavar="OUT_DIR")
     parsed = parser.parse_args(argv)
-    if parsed.preset == "smoke":
-        parsed.run_index = 1
-    elif not 1 <= parsed.run_index <= events.PRESETS["run"]["runs"]:
-        full.error("RUN_INDEX must be an integer from 1 to 5")
     return parsed
 
 
@@ -832,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
     backing, device, out_dir, mount, fs_config, xfs_info = environment
     try:
         return run_benchmark(
-            arguments.preset, arguments.run_index, backing, device, arguments.device_stat,
+            arguments.preset, backing, device, arguments.device_stat,
             out_dir, mount, fs_config, xfs_info,
         )
     except (E3Error, OSError, events.EventError) as error:

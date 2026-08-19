@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define BENCH_SHA256_HEX_SIZE 65
+#define BENCH_SCHEMA 2U
 #define BENCH_SETTLE_INTERVAL_MS 100U
 #define BENCH_SETTLE_STABLE_COMPARISONS 3U
 #define BENCH_SETTLE_MAX_COMPARISONS 100U
@@ -52,4 +53,3 @@ int bench_fiemap_path(const char *path, const char *dump_path,
 		      struct bench_fiemap_summary *summary);
 
 #endif
-

@@ -16,6 +16,11 @@ import events  # noqa: E402
 
 
 class EventTests(unittest.TestCase):
+    def test_run_is_five_cache_neutral_workloads(self) -> None:
+        self.assertEqual(events.PRESETS["run"], {"samples": 130, "workloads": 5})
+        self.assertNotIn("cache_mode", events.EVENT_FIELDS)
+        self.assertNotIn("cache_mode", events.generate_events("smoke")[0])
+
     def test_legal_matrix_has_eighteen_cells(self) -> None:
         cells = events.legal_cells()
         self.assertEqual(len(cells), 18)
@@ -36,9 +41,6 @@ class EventTests(unittest.TestCase):
 
     def test_run_count(self) -> None:
         self.assertEqual(sum(events.expected_counts("run").values()), 11_700)
-        self.assertEqual(sum(events.expected_counts("run", 3).values()), 2340)
-        with self.assertRaises(events.EventError):
-            events.generate_events("run", 6)
 
     def test_hashes_match_images(self) -> None:
         event = events.generate_events("smoke")[0]
@@ -53,8 +55,8 @@ class EventTests(unittest.TestCase):
     def test_cross_language_byte_stream_vector(self) -> None:
         self.assertEqual(
             events.byte_stream(17, 40).hex(),
-            "63fc2ec0a7af6412ee3c15b8bce5f6e0940d731d2b309d7cf6a3978a055d4f70"
-            "d435fd17ace7be8e",
+            "3b9e197a0a7142ec361f7ae5cb39f26ceb98698417e75712b4c656732c2c6127"
+            "36bec476acb8432a",
         )
 
     def test_path_traversal_and_hash_are_rejected(self) -> None:

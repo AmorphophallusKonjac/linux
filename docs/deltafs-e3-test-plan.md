@@ -1,8 +1,8 @@
-# DeltaFS E3 v2 copy-up benchmark detailed design
+# DeltaFS E3 cache-neutral copy-up benchmark detailed design
 
 > E3 measures one copy-up edit after a native DeltaFS v2 checkpoint. It is
 > independent of the E2 ioctl-latency benchmark and does not use `deltafsctl`.
-> Its synthetic-event schema remains version 1, but that schema is independent
+> Its synthetic-event schema is version 2, independent
 > of the DeltaFS kernel ABI version recorded in the manifest. Every sample must
 > prove a generation 1 to generation 2 checkpoint with the current v2 request;
 > stock OverlayFS and the removed v1 ABI are rejected before measurement.
@@ -43,28 +43,29 @@ E3 deliberately follows E2's fixed-preset interface. Users run only:
       smoke BACKING_DIR DEVICE_STAT OUT_DIR
 
     sudo python3 tools/deltafs/bench/e3/run.py \
-      run RUN_INDEX BACKING_DIR DEVICE_STAT OUT_DIR
+      run BACKING_DIR DEVICE_STAT OUT_DIR
 
     python3 tools/deltafs/bench/e3/analyze.py RESULTS_ROOT
 
-`BACKING_DIR` is an empty dedicated directory on ext4 or XFS. `DEVICE_STAT` is
+`BACKING_DIR` is an empty dedicated directory on ext4 or XFS and may be a
+subdirectory below the filesystem mount point. `DEVICE_STAT` is
 the explicit `/sys/dev/.../stat` file for the exact device containing
 `BACKING_DIR`. `OUT_DIR` must not exist or must be empty and must be outside
 `BACKING_DIR` on a different device, so result logging cannot enter the measured
-`syncfs` traffic. For smoke, `RESULTS_ROOT` contains one successful output
-directory per filesystem; full run contains five indexed shards per filesystem.
-Analysis is written to `RESULTS_ROOT/analysis`.
+`syncfs` traffic. For smoke and full run, `RESULTS_ROOT` contains one successful
+output directory per filesystem. Analysis is written to
+`RESULTS_ROOT/analysis`.
 
-For `run`, `RUN_INDEX` is one integer from 1 through 5. Each invocation owns one
-independent-run shard, so the QEMU driver can interleave filesystem order without
-running measured devices concurrently. There is no public manifest, reset hook,
-event file, sample count, seed,
-bootstrap count, cache mode, mount option, or filesystem label parameter.
+Each `run` invocation owns one backing test object and executes all five
+independent workloads serially. There is no public run-index shard parameter,
+manifest, reset hook, event file, sample count, seed, bootstrap count, cache
+mode, mount option, or filesystem label parameter.
 Changing the event schedule or measured settings requires an event-schema
 revision; the DeltaFS lifecycle is identified independently by mandatory
 manifest ABI/generation fields. The runner automatically:
 
-- recognizes ext4/XFS and obtains XFS `reflink=0/1` from `xfs_info`;
+- recognizes ext4/XFS and obtains XFS `reflink=0/1` by passing the `findmnt`
+  mount target, rather than `BACKING_DIR`, to `xfs_info`;
 - verifies that `DEVICE_STAT` resolves to `/sys/dev/block/MAJOR:MINOR/stat` for
   `BACKING_DIR`;
 - generates and saves the immutable preset event JSONL;
@@ -110,13 +111,13 @@ analysis. E3 does not import E2 code or artifacts.
 
 ### 4.1 Event schema
 
-`OUT_DIR/events.jsonl` contains one canonical compact JSON object per line:
+`OUT_DIR/events.jsonl` contains one canonical compact schema-2 JSON object per
+line:
 
     {
-      "schema": 1,
-      "event_id": "e3-r01-warm-f004-d01-n000",
-      "run": 1,
-      "cache_mode": "warm",
+      "schema": 2,
+      "event_id": "e3-r01-f004-d01-n000",
+      "workload": 1,
       "relative_path": "edit.bin",
       "file_size_before": 4096,
       "offset": 0,
@@ -130,23 +131,22 @@ analysis. E3 does not import E2 code or artifacts.
 
 Validation rejects unknown or missing fields, non-integer numeric fields,
 schema mismatch, duplicate IDs, absolute or non-normal relative paths, `.` or
-`..`, NUL, unknown cache mode/bin, non-4-KiB alignment, zero values, range
+`..`, NUL, unknown size bin, non-4-KiB alignment, zero values, range
 overflow, writes beyond the preimage, inconsistent size bins, and a hash that
 does not match regenerated deterministic bytes.
 
 The byte stream is defined as concatenated SHA-256 digests of:
 
-    "deltafs-e3-v1\0" || little_endian_u64(seed) || little_endian_u64(counter)
+    "deltafs-e3-v2\0" || little_endian_u64(seed) || little_endian_u64(counter)
 
 The preimage seed is the low little-endian 64 bits of
 `SHA256("deltafs-e3-preimage\0" || event_id)`. The fixed benchmark seed 14857
 feeds a specified SplitMix64 generator for payload seeds, offsets, and
 Fisher-Yates ordering. This avoids depending on Python's PRNG implementation.
 
-Each runner independently generates the canonical event shard for its preset
-and `RUN_INDEX`. The manifest records its SHA-256. Analysis requires
-byte-identical event hashes across all three filesystems for each run index
-before pairing by `event_id`.
+Each runner independently generates the complete canonical event set for its
+preset. The manifest records its SHA-256. Analysis requires byte-identical event
+hashes across all three filesystems before pairing by `event_id`.
 
 ### 4.2 Legal experiment cells
 
@@ -165,45 +165,34 @@ The resulting 18 cells are normative:
 | 192 KiB | 1, 2, 4, 8 | `128-256KiB` |
 
 The rough 6-by-4 matrix was internally inconsistent for small files: for
-example an 8-block in-place write cannot fit in a 4-KiB file. E3 v1 treats the
+example an 8-block in-place write cannot fit in a 4-KiB file. E3 v2 treats the
 18 legal cells, rather than 24 impossible combinations, as the completeness
 gate.
 
 ### 4.3 Presets and ordering
 
-| preset | warm events per cell/run | cold events per cell/run | independent runs |
-|---|---:|---:|---:|
-| `smoke` | 1 | 1 | 1 |
-| `run` | 100 | 30 | 5 shards (`RUN_INDEX=1..5`) |
+| preset | events per cell/workload | independent workloads |
+|---|---:|---:|
+| `smoke` | 2 | 1 |
+| `run` | 130 | 5 |
 
-Warm and cold events have distinct IDs but identical fixed matrices. Within
-each `(independent run, cache mode)`, cells are deterministically shuffled.
-The same order is reproduced for every filesystem. A `run` invocation contains
-2,340 edits (1,800 warm and 540 cold) and 351 no-op controls; all five shards
-together contain 11,700 edits per filesystem.
+Each workload has a distinct number and the same fixed matrix. Cells are
+deterministically shuffled within each workload and the same order is reproduced
+for every filesystem. A `run` invocation contains all five workloads: 11,700
+edits and 1,755 no-op controls per filesystem.
 
-Filesystem execution order is a fixed-seed Latin square, executed serially to
-avoid sector-counter interference:
+Filesystem configurations are executed serially so their device-sector counters
+cannot interfere. The five workloads for one filesystem stay in one runner
+invocation and one artifact directory.
 
-| run index | filesystem order |
-|---:|---|
-| 1 | `xfs_noreflink`, `xfs_reflink`, `ext4_noreflink` |
-| 2 | `xfs_reflink`, `ext4_noreflink`, `xfs_noreflink` |
-| 3 | `ext4_noreflink`, `xfs_noreflink`, `xfs_reflink` |
-| 4 | same as run 1 |
-| 5 | same as run 2 |
-
-This order is derived by shuffling the three configurations with E3 SplitMix64
-seed `14857 ^ 0xe3`, then rotating one place per run.
-
-Cold sensitivity uses `posix_fadvise(..., POSIX_FADV_DONTNEED)` on the lower and
-merged target after the preimage hash and before the first stable block-stat
-reading. It does not write `/proc/sys/vm/drop_caches`. Warm samples retain the
-cache populated by the preimage hash. Cold and warm rows are never pooled.
+Cache state is not an E3 variable. The helper does not issue
+`POSIX_FADV_DONTNEED` or write `/proc/sys/vm/drop_caches`; every event follows
+the same cache-neutral protocol.
 
 After each group of at most 20 edit samples the schedule runs three fresh
 no-op controls. A control performs the same mount, rename, v2 checkpoint,
-stable-counter, `syncfs`, and stable-counter lifecycle but no file edit. Its
+pre-window `syncfs`, stable-counter, measured no-op `syncfs`, and stable-counter
+lifecycle but no file edit. Its
 triplicate median is the fixed batch baseline for sensitivity analysis. Raw
 physical I/O is always preserved; the corrected value is
 `max(0, raw - no_op_median)`.
@@ -250,8 +239,9 @@ The edit helper then performs this fixed sequence:
 1. confirm frozen `layers/g1/edit.bin` exists, generation-2 upper does not, and
    merged/frozen paths are regular files;
 2. hash frozen/merged and verify size and expected preimage;
-3. apply cold-cache advice when requested;
-4. wait for the explicit sectors-written counter to stabilize;
+3. call `syncfs` on the merged root to drain checkpoint and precheck writes;
+4. wait for the explicit sectors-written counter to stabilize and record
+   `sectors_before`;
 5. open merged, issue exactly one complete positional write, `fsync` the file,
    and `syncfs` the merged root;
 6. wait for the counter to stabilize again and reject counter regression or
@@ -261,9 +251,9 @@ The edit helper then performs this fixed sequence:
    postimage oracles;
 9. atomically write helper JSON and the separate FIEMAP JSON dump.
 
-No-op controls execute the same generation-1 mount, rename, and v2 checkpoint,
-then steps 4--6 without opening or modifying an edit file. Setup, checkpoint,
-and unmount I/O occur outside the counter interval.
+No-op controls execute the same generation-1 mount, rename, v2 checkpoint, and
+pre-window `syncfs`, then steps 4--6 without opening or modifying an edit file.
+Setup, checkpoint, precheck, and unmount I/O occur outside the counter interval.
 
 ## 6. FIEMAP contract
 
@@ -326,27 +316,27 @@ Each output directory contains:
     dmesg-after.log
     fiemap/<sample-id>.json
 
-The manifest records schema/preset/run-index/seed, event path/hash/count, git
+The manifest records schema/preset/seed, event path/hash/count, git
 commit, kernel release/config hash, filesystem type/config/UUID/source/options,
 `xfs_info`, explicit and canonical device-stat paths, OverlayFS options,
 `deltafs_abi_version=2`, initial/checkpoint generations `1` and `2`, copy-up
-source `checkpoint_frozen_upper`, start time, legal matrix, cache counts,
-independent runs, no-op interval/repetitions, and settle constants. Analysis
+source `checkpoint_frozen_upper`, start time, legal matrix, samples per cell,
+independent workload count, no-op interval/repetitions, and settle constants. Analysis
 requires these exact v2 lifecycle values, so it cannot mix legacy plain-
 OverlayFS E3 artifacts with current results.
 
 Every edit raw row contains:
 
-    schema, run, sample, sample_id, sample_kind, control_batch,
-    cache_mode, fs_config, event_id, file_size_before, size_bin,
+    schema, workload, sample, sample_id, sample_kind, control_batch,
+    fs_config, event_id, file_size_before, size_bin,
     offset, logical_bytes_changed, dirty_blocks, copyup_bytes,
     shared_bytes, allocated_bytes_total, copyup_amplification,
     sectors_before, sectors_after, physical_io_bytes, settle_timeout,
     pre_sha256, post_sha256, upper_sha256, lower_sha256,
     fiemap_path, fiemap_block_size, status, errno, invalid_reason
 
-Control rows use a separate `controls.jsonl` schema with run, sample,
-sample/control IDs, cache mode, batch, replica, sector values, physical bytes,
+Control rows use a separate `controls.jsonl` schema with workload, sample,
+sample/control IDs, batch, replica, sector values, physical bytes,
 settle timeout, status, errno, and reason. Status is `ok`, `invalid`, or
 `failed`. Only `status=ok` edit rows enter statistics. No row or failed FIEMAP
 dump is deleted.
@@ -354,7 +344,7 @@ dump is deleted.
 An edit is valid only when both settle operations and FIEMAP succeed, merged
 preimage matches the event, merged/upper postimages match the event, upper and
 merged match each other, lower remains unchanged, and physical counter math is
-valid. A helper or oracle error stops the current independent run. Reset/mount
+valid. A helper or oracle error stops the current independent workload. Reset/mount
 failure stops the entire benchmark and preserves the sandbox.
 
 New dmesg `BUG`, `WARNING`, KASAN, KFENCE, UBSAN, lockdep, or RCU failure text
@@ -363,21 +353,19 @@ makes the run fail even if all sample rows are otherwise valid.
 ## 9. Analysis contract
 
 `analyze.py RESULTS_ROOT` recursively discovers E3 manifests outside its own
-analysis directory. Smoke requires one passed shard for each filesystem. Full
-run requires exactly 15 passed shards covering each `(filesystem, run index)`
-combination. Every shard must share preset/schema/seed, the three filesystems
-must share an event hash at each run index, and edit/control schedules must be
-complete.
+analysis directory. Smoke and full run each require exactly one passed result
+set for each filesystem. Every result set must share preset/schema/seed and the
+three filesystems must share one event hash and complete edit/control schedules.
 
 It first performs an exact `event_id` join across all three configurations.
 Missing/duplicate/status-invalid events are written to pairing/invalid reports
 and make analysis fail. It is forbidden to subtract independent medians.
 
 Fixed bootstrap count and seed are 10,000 and 14857. The independent unit is a
-run shard: each replicate resamples run clusters with replacement and includes
-the complete fixed event schedule from every selected run. Paired benefit
-resamples paired event deltas with the same run clustering. This does not treat
-the deterministic within-run synthetic schedule as a second independent random
+workload: each replicate resamples workload clusters with replacement and includes
+the complete fixed event schedule from every selected workload. Paired benefit
+resamples paired event deltas with the same workload clustering. This does not treat
+the deterministic within-workload synthetic schedule as a second independent random
 sample. No values are winsorized and no outlier is silently removed.
 
 Artifacts are:
@@ -394,7 +382,7 @@ Artifacts are:
     analysis/physical-write-amplification-by-write-size.png
     analysis/summary.json
 
-For each filesystem, cache mode, size bin, and metric, `summary.tsv` reports n,
+For each filesystem, size bin, and metric, `summary.tsv` reports n,
 p25, p50, p75, p95, and the median CI95. Physical I/O is reported raw and
 no-op-corrected. Paired outputs first compute two per-event mechanism deltas:
 `xfs_metadata` is `ext4_noreflink - xfs_noreflink`; `reflink` is
@@ -402,11 +390,11 @@ no-op-corrected. Paired outputs first compute two per-event mechanism deltas:
 target ratio, then aggregate the paired deltas. A direct subtraction of
 independent medians is forbidden.
 
-For each filesystem/cache mode, ordinary least squares fits:
+For each filesystem, ordinary least squares fits:
 
     log2(copyup_bytes) = alpha + beta * log2(file_size_before)
 
-and reports beta with a run-cluster bootstrap CI. The two fixed PNG plots show
+and reports beta with a workload-cluster bootstrap CI. The two fixed PNG plots show
 write amplification rather than absolute bytes. Their x axis is the aligned
 logical write-request size (4, 8, 16, or 32 KiB) and their logarithmic y axis
 is respectively `copyup_bytes / logical_bytes_changed` and
@@ -415,13 +403,10 @@ filesystem configuration and one series per pre-edit file size, so file size
 remains visible without being used as the primary x axis. Illegal cells are
 absent and are not connected across missing request sizes.
 
-The legacy warm/cold schedules are pooled within each exact
-`(filesystem, file size, logical write size)` cell for these figures because
-cache state is not a write-amplification dimension. The plots contain no cache
-label. Points show per-cell medians without confidence-interval whiskers; TSV
-artifacts continue to carry the original cache-separated distributions and
-run-cluster bootstrap confidence intervals. The physical-write plot uses raw
-device writes, while the sensitivity TSV carries no-op-corrected bytes.
+Cache state is absent from the event and artifact schemas because it is not a
+write-amplification dimension. Points show per-cell medians without
+confidence-interval whiskers. The physical-write plot uses raw device writes,
+while the sensitivity TSV carries no-op-corrected bytes.
 `amplification-summary.tsv` records the cache-neutral cell count and plotted
 median for both amplification metrics.
 
@@ -572,57 +557,51 @@ backing filesystem:
 Each runner must log a successful native `checkpoint: generation 1 -> 2` for
 every edit and control, end with `PASS: E3 smoke ... invalid=0 failed=0`, and
 analysis must end with `PASS: E3 analysis completed`. There are 36 edit events
-per filesystem (18 warm and 18 cold), complete no-op triplets, one raw row and
-one FIEMAP dump per event, and no pairing errors. Every manifest must contain
+per filesystem in smoke (18 cells with two samples), complete no-op triplets,
+one raw row and one FIEMAP dump per event, and no pairing errors. Every manifest
+must contain
 `"deltafs_abi_version": 2`, `"initial_generation": 1`,
 `"checkpoint_generation": 2`, and
 `"copyup_source": "checkpoint_frozen_upper"`.
 
+The exact successful runner counts are `ok=36 invalid=0 failed=0 controls=6`.
+
 ### 11.5 Full E3 run
 
-Use new empty directories per filesystem/run shard; do not reuse smoke or prior
-run directories. The following function maps each filesystem to its backing and
-stat file, then the explicit schedule implements the fixed Latin square:
+Use one new empty directory per filesystem; do not reuse smoke or prior run
+directories. The following function maps each filesystem to its backing and stat
+file:
 
     mkdir -p /var/tmp/e3-results/run
 
-    run_e3_shard() {
-      RUN=$1 FS=$2
+    run_e3() {
+      FS=$1
       case "$FS" in
         ext4_noreflink) BACKING=/mnt/e3/ext4 STAT=/sys/block/vdb/stat ;;
         xfs_noreflink) BACKING=/mnt/e3/xfs-noreflink STAT=/sys/block/vdc/stat ;;
         xfs_reflink)   BACKING=/mnt/e3/xfs-reflink STAT=/sys/block/vdd/stat ;;
         *) return 2 ;;
       esac
-      WORK="$BACKING/e3-run-$RUN"
-      OUT="/var/tmp/e3-results/run/$FS-run-$RUN"
+      WORK="$BACKING/e3-run"
+      OUT="/var/tmp/e3-results/run/$FS"
       mkdir "$WORK"
-      python3 tools/deltafs/bench/e3/run.py run "$RUN" "$WORK" "$STAT" "$OUT"
+      python3 tools/deltafs/bench/e3/run.py run "$WORK" "$STAT" "$OUT"
     }
 
-    run_e3_shard 1 xfs_noreflink
-    run_e3_shard 1 xfs_reflink
-    run_e3_shard 1 ext4_noreflink
-    run_e3_shard 2 xfs_reflink
-    run_e3_shard 2 ext4_noreflink
-    run_e3_shard 2 xfs_noreflink
-    run_e3_shard 3 ext4_noreflink
-    run_e3_shard 3 xfs_noreflink
-    run_e3_shard 3 xfs_reflink
-    run_e3_shard 4 xfs_noreflink
-    run_e3_shard 4 xfs_reflink
-    run_e3_shard 4 ext4_noreflink
-    run_e3_shard 5 xfs_reflink
-    run_e3_shard 5 ext4_noreflink
-    run_e3_shard 5 xfs_noreflink
+    run_e3 xfs_noreflink
+    run_e3 xfs_reflink
+    run_e3 ext4_noreflink
 
     python3 tools/deltafs/bench/e3/analyze.py /var/tmp/e3-results/run
 
-Each shard must end with 2,340 valid edits and 351 valid controls. Each
-filesystem totals 9,000 warm and 2,700 cold valid edits: 18 cells times 100/30
-samples times 5 independent runs. Analysis must find all 15 shards, all six
-bins, 18 complete cells, zero invalid/failed rows, complete paired IDs, and the
-fixed PNG/TSV artifacts. Keep unrelated services off the measured devices.
+Each filesystem run must end with 11,700 valid edits and 1,755 valid controls:
+18 cells times 130 samples times 5 independent workloads. Analysis must find
+all three filesystem outputs, all six bins, 18 complete cells, zero
+invalid/failed rows, complete paired IDs, and the fixed PNG/TSV artifacts. Keep
+unrelated services off the measured devices.
+
+The exact successful runner counts are
+`ok=11700 invalid=0 failed=0 controls=1755`.
 
 ### 11.6 Failure collection
 

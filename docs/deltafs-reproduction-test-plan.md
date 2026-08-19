@@ -283,10 +283,9 @@ Linux block stat 的 sector 单位按 512 bytes 解释；同时记录内核文�
 
 ### 6.4 cache 规范
 
-- 主实验采用 warm page cache，符合连续 agent 轨迹行为。
-- 每个配置开始前执行相同的 warm-up 轨迹。
-- 不在每个 edit 之间全局 `drop_caches`，因为它会引入额外 I/O 和非真实 agent 行为。
-- 另做 cold-cache sensitivity run，每个大小桶至少 30 个样本，并单独作图。
+cache state is not an E3 write-amplification dimension. The single schedule is
+cache-neutral: it does not issue per-edit `POSIX_FADV_DONTNEED`, write
+`/proc/sys/vm/drop_caches`, or produce a separate cold-cache sensitivity run.
 
 ### 6.5 结果记录格式
 
@@ -471,14 +470,14 @@ E3 已实现为独立固定 preset benchmark。公开入口仅为：
 
 ```text
 sudo python3 tools/deltafs/bench/e3/run.py smoke BACKING_DIR DEVICE_STAT OUT_DIR
-sudo python3 tools/deltafs/bench/e3/run.py run RUN_INDEX BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e3/run.py run BACKING_DIR DEVICE_STAT OUT_DIR
 python3 tools/deltafs/bench/e3/analyze.py RESULTS_ROOT
 ```
 
 runner 自动生成 immutable synthetic event、逐样本创建 fresh OverlayFS mount、采集
-FIEMAP/sector counter/hash/no-op control，并保留失败现场。full run 用 `RUN_INDEX=1..5`
-分片，按固定 Latin square 串行调度三种 filesystem；分析器要求 15 个 shard 完整且每个
-run index 的三份 event hash 一致。接口、18 个合法 size/dirty-block cell、raw schema、
+FIEMAP/sector counter/hash/no-op control，并保留失败现场。full run 的单次调用在一个
+测试对象上串行执行 5 个 independent workload；分析器要求三个 filesystem 结果完整且
+event hash 一致。接口、18 个合法 size/dirty-block cell、raw schema、
 统计口径及完整 QEMU 命令以
 [deltafs-e3-test-plan.md](deltafs-e3-test-plan.md) 为唯一权威定义。
 
@@ -489,7 +488,7 @@ run index 的三份 event hash 一致。接口、18 个合法 size/dirty-block c
 1. 恢复相同的 pre-edit base tree。
 2. 创建空的新 upper/workdir。
 3. mount 或 checkpoint 到该 upper。
-4. 等待 loop device 静默并读取 block stat。
+4. 在 checkpoint 和 precheck 后执行 `syncfs`，等待 loop device 静默并读取 block stat。
 5. 执行原始 edit。
 6. `fsync(target)` + `syncfs(mount)`，等待静默。
 7. 读取 block stat。
@@ -510,8 +509,8 @@ Latin square，且一次只运行一个配置，避免温度/设备后台行为�
 - 每幅图按 ext4-no-reflink、XFS-no-reflink、XFS+reflink 分为三个 panel。
 - panel 内按 `file_size_before` 绘制六条序列，不能把不同文件大小隐藏在同一个
   请求大小聚合值中。
-- 现有 warm/cold 样本在完全相同的文件系统、文件大小和请求大小 cell 内合并，
-  图中不显示缓存标签；缓存状态不是写放大维度。
+- cache state is absent from the event and artifact schemas; each exact
+  filesystem/file-size/request-size cell is analyzed directly.
 - 点表示 cell 中位数；固定 synthetic schedule 内的 event 不重复伪装为第二层独立
   随机样本。
 

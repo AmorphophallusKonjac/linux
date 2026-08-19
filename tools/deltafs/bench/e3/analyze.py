@@ -31,8 +31,8 @@ BOOTSTRAP_REPLICATES = 10_000
 FS_CONFIGS = ("ext4_noreflink", "xfs_noreflink", "xfs_reflink")
 METRICS = ("copyup_bytes", "physical_io_bytes", "physical_io_bytes_corrected")
 RAW_FIELDS = frozenset((
-    "schema", "run", "sample", "sample_id", "sample_kind", "control_batch",
-    "cache_mode", "fs_config", "event_id", "file_size_before", "size_bin",
+    "schema", "workload", "sample", "sample_id", "sample_kind", "control_batch",
+    "fs_config", "event_id", "file_size_before", "size_bin",
     "offset", "logical_bytes_changed", "dirty_blocks", "copyup_bytes",
     "shared_bytes", "allocated_bytes_total", "copyup_amplification",
     "sectors_before", "sectors_after", "physical_io_bytes", "settle_timeout",
@@ -40,7 +40,7 @@ RAW_FIELDS = frozenset((
     "fiemap_path", "fiemap_block_size", "status", "errno", "invalid_reason",
 ))
 CONTROL_FIELDS = frozenset((
-    "schema", "run", "sample", "sample_id", "sample_kind", "cache_mode",
+    "schema", "workload", "sample", "sample_id", "sample_kind",
     "fs_config", "control_batch", "replica", "sectors_before", "sectors_after",
     "physical_io_bytes", "settle_timeout", "status", "errno", "invalid_reason",
 ))
@@ -49,15 +49,15 @@ SUMMARY_FIELDS = frozenset((
     "planned_edits", "planned_controls", "dmesg_failures", "finished_at",
 ))
 MANIFEST_FIELDS = frozenset((
-    "schema", "preset", "run_index", "seed", "event_file", "event_file_sha256",
+    "schema", "preset", "seed", "event_file", "event_file_sha256",
     "event_count",
     "git_commit", "kernel_release", "kernel_config_sha256", "fs_type", "fs_config",
     "fs_uuid", "backing_source", "backing_mount_options", "xfs_info",
     "device_stat", "canonical_device_stat", "overlay_mount_options", "started_at",
     "deltafs_abi_version", "initial_generation", "checkpoint_generation",
     "copyup_source",
-    "legal_cells", "warm_count_per_cell", "cold_count_per_cell",
-    "independent_runs", "noop_interval", "noop_repetitions", "settle_interval_ms",
+    "legal_cells", "samples_per_cell",
+    "independent_workloads", "noop_interval", "noop_repetitions", "settle_interval_ms",
     "settle_stable_comparisons", "settle_timeout_ms",
 ))
 
@@ -78,7 +78,6 @@ class ResultSet:
 @dataclass(frozen=True)
 class GroupStats:
     fs_config: str
-    cache_mode: str
     size_bin: str
     metric: str
     count: int
@@ -149,17 +148,11 @@ def validate_manifest(value: dict[str, Any]) -> None:
             value["copyup_source"] != COPYUP_SOURCE:
         raise AnalysisError("manifest does not describe the E3 DeltaFS v2 lifecycle")
     configuration = events.PRESETS[value["preset"]]
-    if not is_plain_int(value["run_index"]) or \
-            not 1 <= value["run_index"] <= configuration["runs"]:
-        raise AnalysisError("manifest run_index is invalid")
     expected = {
-        "event_count": sum(events.expected_counts(
-            value["preset"], value["run_index"],
-        ).values()),
+        "event_count": sum(events.expected_counts(value["preset"]).values()),
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
-        "warm_count_per_cell": configuration["warm"],
-        "cold_count_per_cell": configuration["cold"],
-        "independent_runs": configuration["runs"],
+        "samples_per_cell": configuration["samples"],
+        "independent_workloads": configuration["workloads"],
         "noop_interval": 20,
         "noop_repetitions": 3,
         "settle_interval_ms": 100,
@@ -182,7 +175,7 @@ def validate_raw_shape(row: dict[str, Any], fs_config: str, line_number: int) ->
     if set(row) != RAW_FIELDS:
         raise AnalysisError(f"raw schema mismatch at line {line_number}")
     integer_fields = (
-        "schema", "run", "sample", "control_batch", "file_size_before", "offset",
+        "schema", "workload", "sample", "control_batch", "file_size_before", "offset",
         "logical_bytes_changed", "dirty_blocks", "copyup_bytes", "shared_bytes",
         "allocated_bytes_total", "sectors_before", "sectors_after",
         "physical_io_bytes", "fiemap_block_size", "errno",
@@ -190,7 +183,7 @@ def validate_raw_shape(row: dict[str, Any], fs_config: str, line_number: int) ->
     if any(not is_plain_int(row[field]) for field in integer_fields):
         raise AnalysisError(f"raw numeric type mismatch at line {line_number}")
     if row["schema"] != SCHEMA or row["sample_kind"] != "edit" or \
-            row["fs_config"] != fs_config or row["cache_mode"] not in ("warm", "cold") or \
+            row["fs_config"] != fs_config or \
             row["status"] not in ("ok", "invalid", "failed") or \
             not isinstance(row["settle_timeout"], bool) or \
             not isinstance(row["copyup_amplification"], (int, float)) or \
@@ -204,13 +197,13 @@ def validate_control_shape(row: dict[str, Any], fs_config: str, line_number: int
     if set(row) != CONTROL_FIELDS:
         raise AnalysisError(f"control schema mismatch at line {line_number}")
     integer_fields = (
-        "schema", "run", "sample", "control_batch", "replica", "sectors_before",
+        "schema", "workload", "sample", "control_batch", "replica", "sectors_before",
         "sectors_after", "physical_io_bytes", "errno",
     )
     if any(not is_plain_int(row[field]) for field in integer_fields):
         raise AnalysisError(f"control numeric type mismatch at line {line_number}")
     if row["schema"] != SCHEMA or row["sample_kind"] != "control" or \
-            row["fs_config"] != fs_config or row["cache_mode"] not in ("warm", "cold") or \
+            row["fs_config"] != fs_config or \
             row["status"] not in ("ok", "invalid", "failed") or \
             not isinstance(row["settle_timeout"], bool):
         raise AnalysisError(f"control categorical mismatch at line {line_number}")
@@ -252,9 +245,9 @@ def validate_result_set(result: ResultSet) -> list[str]:
     errors_found: list[str] = []
     event_by_id = {value["event_id"]: value for value in result.events}
     expected_batch: dict[str, int] = {}
-    grouped_events: dict[tuple[int, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped_events: dict[int, list[dict[str, Any]]] = collections.defaultdict(list)
     for event_value in result.events:
-        grouped_events[(event_value["run"], event_value["cache_mode"])].append(event_value)
+        grouped_events[event_value["workload"]].append(event_value)
     for group in grouped_events.values():
         for index, event_value in enumerate(group):
             expected_batch[event_value["event_id"]] = index // result.manifest["noop_interval"] + 1
@@ -281,7 +274,7 @@ def validate_result_set(result: ResultSet) -> list[str]:
         sample_ids.add(row["sample_id"])
         fiemap_paths.add(row["fiemap_path"])
         expected = {
-            "run": event["run"], "cache_mode": event["cache_mode"],
+            "workload": event["workload"],
             "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
             "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
             "dirty_blocks": event["dirty_blocks"],
@@ -331,23 +324,22 @@ def validate_result_set(result: ResultSet) -> list[str]:
     if seen != set(event_by_id):
         errors_found.append(f"{result.manifest['fs_config']}: raw event set is incomplete")
 
-    expected_controls: set[tuple[int, str, int, int]] = set()
+    expected_controls: set[tuple[int, int, int]] = set()
     grouped = collections.defaultdict(list)
     for event in result.events:
-        grouped[(event["run"], event["cache_mode"])].append(event)
-    for (run, cache), group in grouped.items():
+        grouped[event["workload"]].append(event)
+    for workload, group in grouped.items():
         for batch in range(1, math.ceil(len(group) / result.manifest["noop_interval"]) + 1):
             for replica in range(1, result.manifest["noop_repetitions"] + 1):
-                expected_controls.add((run, cache, batch, replica))
-    actual_controls: set[tuple[int, str, int, int]] = set()
+                expected_controls.add((workload, batch, replica))
+    actual_controls: set[tuple[int, int, int]] = set()
     for line_number, control in enumerate(result.controls, start=1):
         try:
             validate_control_shape(control, result.manifest["fs_config"], line_number)
         except AnalysisError as exc:
             errors_found.append(str(exc))
             continue
-        key = (control["run"], control["cache_mode"],
-               control["control_batch"], control["replica"])
+        key = (control["workload"], control["control_batch"], control["replica"])
         if key in actual_controls:
             errors_found.append(f"{result.manifest['fs_config']}: duplicate control {key}")
         actual_controls.add(key)
@@ -397,9 +389,7 @@ def discover(root: pathlib.Path) -> list[ResultSet]:
         if hashlib.sha256(event_path.read_bytes()).hexdigest() != manifest["event_file_sha256"]:
             raise AnalysisError(f"event file hash mismatch: {event_path}")
         try:
-            event_values = events.read_events(
-                event_path, manifest["preset"], manifest["run_index"],
-            )
+            event_values = events.read_events(event_path, manifest["preset"])
         except events.EventError as exc:
             raise AnalysisError(f"invalid event file {event_path}: {exc}") from exc
         result_sets.append(ResultSet(
@@ -410,30 +400,22 @@ def discover(root: pathlib.Path) -> list[ResultSet]:
     presets = {result.manifest["preset"] for result in result_sets}
     if len(presets) != 1:
         raise AnalysisError("filesystem results do not share one preset")
-    preset = next(iter(presets))
-    expected_runs = range(1, events.PRESETS[preset]["runs"] + 1)
-    by_identity: dict[tuple[str, int], ResultSet] = {}
+    by_identity: dict[str, ResultSet] = {}
     for result in result_sets:
-        identity = (result.manifest["fs_config"], result.manifest["run_index"])
+        identity = result.manifest["fs_config"]
         if identity in by_identity:
-            raise AnalysisError(f"duplicate filesystem/run shard: {identity}")
+            raise AnalysisError(f"duplicate filesystem result: {identity}")
         by_identity[identity] = result
-    expected_identities = {(config, run_index) for config in FS_CONFIGS
-                           for run_index in expected_runs}
+    expected_identities = set(FS_CONFIGS)
     if set(by_identity) != expected_identities:
         missing = sorted(expected_identities - set(by_identity))
         extra = sorted(set(by_identity) - expected_identities)
-        raise AnalysisError(f"filesystem/run shards mismatch: missing={missing} extra={extra}")
-    for run_index in expected_runs:
-        hashes = {
-            by_identity[(config, run_index)].manifest["event_file_sha256"]
-            for config in FS_CONFIGS
-        }
-        if len(hashes) != 1:
-            raise AnalysisError(f"run {run_index} event hashes differ across filesystems")
-    return sorted(result_sets, key=lambda result: (
-        result.manifest["run_index"],
-        FS_CONFIGS.index(result.manifest["fs_config"]),
+        raise AnalysisError(f"filesystem results mismatch: missing={missing} extra={extra}")
+    hashes = {by_identity[config].manifest["event_file_sha256"] for config in FS_CONFIGS}
+    if len(hashes) != 1:
+        raise AnalysisError("event hashes differ across filesystems")
+    return sorted(result_sets, key=lambda result: FS_CONFIGS.index(
+        result.manifest["fs_config"],
     ))
 
 
@@ -461,7 +443,7 @@ def cluster_bootstrap(rows: list[dict[str, Any]], value: Callable[[dict[str, Any
                       replicates: int = BOOTSTRAP_REPLICATES) -> tuple[float, float]:
     by_run: dict[int, list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
-        by_run[row["run"]].append(row)
+        by_run[row["workload"]].append(row)
     run_ids = sorted(by_run)
     if not run_ids or replicates < 1:
         raise AnalysisError("bootstrap has no clusters or replicates")
@@ -504,7 +486,7 @@ def cluster_bootstrap_median(rows: list[dict[str, Any]], field: str,
                              ) -> tuple[float, float]:
     by_run: dict[int, collections.Counter[float]] = collections.defaultdict(collections.Counter)
     for row in rows:
-        by_run[row["run"]][float(row[field])] += 1
+        by_run[row["workload"]][float(row[field])] += 1
     run_ids = sorted(by_run)
     if not run_ids or replicates < 1:
         raise AnalysisError("bootstrap has no clusters or replicates")
@@ -520,13 +502,12 @@ def cluster_bootstrap_median(rows: list[dict[str, Any]], field: str,
     return percentile(samples, 0.025), percentile(samples, 0.975)
 
 
-def control_baselines(result_sets: list[ResultSet]) -> dict[tuple[str, int, str, int], float]:
-    grouped: dict[tuple[str, int, str, int], list[float]] = collections.defaultdict(list)
+def control_baselines(result_sets: list[ResultSet]) -> dict[tuple[str, int, int], float]:
+    grouped: dict[tuple[str, int, int], list[float]] = collections.defaultdict(list)
     for result in result_sets:
         for row in result.controls:
             if row.get("status") == "ok":
-                key = (result.manifest["fs_config"], row["run"], row["cache_mode"],
-                       row["control_batch"])
+                key = (result.manifest["fs_config"], row["workload"], row["control_batch"])
                 grouped[key].append(float(row["physical_io_bytes"]))
     baselines = {}
     for key, values in grouped.items():
@@ -542,7 +523,7 @@ def enriched_rows(result_sets: list[ResultSet]) -> list[dict[str, Any]]:
     for result_set in result_sets:
         for source in result_set.rows:
             row = dict(source)
-            key = (row["fs_config"], row["run"], row["cache_mode"], row["control_batch"])
+            key = (row["fs_config"], row["workload"], row["control_batch"])
             baseline = baselines.get(key)
             if baseline is None:
                 raise AnalysisError(f"missing control baseline: {key}")
@@ -556,21 +537,21 @@ def enriched_rows(result_sets: list[ResultSet]) -> list[dict[str, Any]]:
 
 def calculate_stats(rows: list[dict[str, Any]],
                     replicates: int = BOOTSTRAP_REPLICATES) -> list[GroupStats]:
-    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
         if row["status"] == "ok":
             for metric in METRICS:
-                grouped[(row["fs_config"], row["cache_mode"], row["size_bin"], metric)].append(row)
+                grouped[(row["fs_config"], row["size_bin"], metric)].append(row)
     result = []
     for key in sorted(grouped, key=lambda item: (
-            FS_CONFIGS.index(item[0]), ("warm", "cold").index(item[1]),
-            list(events.SIZE_BINS.values()).index(item[2]), METRICS.index(item[3]))):
+            FS_CONFIGS.index(item[0]), list(events.SIZE_BINS.values()).index(item[1]),
+            METRICS.index(item[2]))):
         group = grouped[key]
-        metric = key[3]
+        metric = key[2]
         values = [float(row[metric]) for row in group]
         low, high = cluster_bootstrap_median(group, metric, (*key, "median"), replicates)
         result.append(GroupStats(
-            *key, len(group), percentile(values, 0.25), percentile(values, 0.5),
+            key[0], key[1], metric, len(group), percentile(values, 0.25), percentile(values, 0.5),
             percentile(values, 0.75), percentile(values, 0.95), low, high,
         ))
     return result
@@ -640,8 +621,8 @@ def paired_rows(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[
                 else:
                     ratio = 1.0
                 result.append({
-                    "event_id": event_id, "run": source["run"],
-                    "cache_mode": source["cache_mode"], "size_bin": source["size_bin"],
+                    "event_id": event_id, "workload": source["workload"],
+                    "size_bin": source["size_bin"],
                     "comparison": comparison, "source_config": source_config,
                     "target_config": target_config, "metric": metric,
                     "source_bytes": source_value, "target_bytes": target_value,
@@ -662,10 +643,10 @@ def regression(rows: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATE
         beta = (sum_xy - sum_x * sum_y / count) / denominator
         return y_mean - beta * x_mean, beta
 
-    grouped: dict[tuple[str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
         if row["status"] == "ok" and row["copyup_bytes"] > 0:
-            grouped[(row["fs_config"], row["cache_mode"])].append(row)
+            grouped[row["fs_config"]].append(row)
     output = []
     for key, group in sorted(grouped.items()):
         pairs = [(math.log2(row["file_size_before"]), math.log2(row["copyup_bytes"]))
@@ -676,10 +657,10 @@ def regression(rows: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATE
         )
         alpha, beta = fit_sums(*total)
         by_run: dict[int, tuple[int, float, float, float, float]] = {}
-        for run_id in sorted({row["run"] for row in group}):
+        for run_id in sorted({row["workload"] for row in group}):
             run_pairs = [
                 (math.log2(row["file_size_before"]), math.log2(row["copyup_bytes"]))
-                for row in group if row["run"] == run_id
+                for row in group if row["workload"] == run_id
             ]
             by_run[run_id] = (
                 len(run_pairs), sum(x for x, _ in run_pairs),
@@ -687,7 +668,7 @@ def regression(rows: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATE
                 sum(x * y for x, y in run_pairs),
             )
         run_ids = sorted(by_run)
-        randomizer = random.Random(stable_seed((*key, "regression")))
+        randomizer = random.Random(stable_seed((key, "regression")))
         betas = []
         for _ in range(replicates):
             selected = collections.Counter(randomizer.choice(run_ids) for _ in run_ids)
@@ -697,7 +678,7 @@ def regression(rows: list[dict[str, Any]], replicates: int = BOOTSTRAP_REPLICATE
                     sums[index] += value * multiplier
             betas.append(fit_sums(*sums)[1])
         low, high = percentile(betas, 0.025), percentile(betas, 0.975)
-        output.append({"fs_config": key[0], "cache_mode": key[1], "n": len(group),
+        output.append({"fs_config": key, "n": len(group),
                        "alpha": alpha, "beta": beta, "beta_ci95_low": low,
                        "beta_ci95_high": high})
     return output
@@ -710,10 +691,10 @@ def number(value: float) -> str:
 
 
 def write_summary(path: pathlib.Path, stats: list[GroupStats]) -> None:
-    lines = ["fs_config\tcache_mode\tsize_bin\tmetric\tn\tp25\tp50\tp75\tp95\tci95_low\tci95_high\n"]
+    lines = ["fs_config\tsize_bin\tmetric\tn\tp25\tp50\tp75\tp95\tci95_low\tci95_high\n"]
     for item in stats:
         lines.append("\t".join((
-            item.fs_config, item.cache_mode, item.size_bin, item.metric, str(item.count),
+            item.fs_config, item.size_bin, item.metric, str(item.count),
             number(item.p25), number(item.p50), number(item.p75), number(item.p95),
             number(item.ci95_low), number(item.ci95_high),
         )) + "\n")
@@ -721,7 +702,7 @@ def write_summary(path: pathlib.Path, stats: list[GroupStats]) -> None:
 
 
 def write_paired(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
-    fields = ("event_id", "run", "cache_mode", "size_bin", "comparison",
+    fields = ("event_id", "workload", "size_bin", "comparison",
               "source_config", "target_config", "metric", "source_bytes",
               "target_bytes", "bytes_saved", "ratio")
     lines = ["\t".join(fields) + "\n"]
@@ -735,10 +716,10 @@ def write_paired(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
 
 def write_paired_summary(path: pathlib.Path, paired: list[dict[str, Any]],
                          replicates: int = BOOTSTRAP_REPLICATES) -> None:
-    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = collections.defaultdict(list)
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = collections.defaultdict(list)
     for row in paired:
-        grouped[(row["comparison"], row["cache_mode"], row["size_bin"], row["metric"])].append(row)
-    lines = ["comparison\tcache_mode\tsize_bin\tmetric\tn\tp50_bytes_saved\tci95_low\tci95_high\tp50_ratio\n"]
+        grouped[(row["comparison"], row["size_bin"], row["metric"])].append(row)
+    lines = ["comparison\tsize_bin\tmetric\tn\tp50_bytes_saved\tci95_low\tci95_high\tp50_ratio\n"]
     for key, group in sorted(grouped.items()):
         low, high = cluster_bootstrap_median(
             group, "bytes_saved", (*key, "paired"), replicates,
@@ -751,7 +732,7 @@ def write_paired_summary(path: pathlib.Path, paired: list[dict[str, Any]],
 
 
 def write_regression(path: pathlib.Path, values: list[dict[str, Any]]) -> None:
-    fields = ("fs_config", "cache_mode", "n", "alpha", "beta",
+    fields = ("fs_config", "n", "alpha", "beta",
               "beta_ci95_low", "beta_ci95_high")
     lines = ["\t".join(fields) + "\n"]
     for row in values:
@@ -763,14 +744,14 @@ def write_regression(path: pathlib.Path, values: list[dict[str, Any]]) -> None:
 
 
 def write_sensitivity(path: pathlib.Path, rows: list[dict[str, Any]]) -> None:
-    lines = ["fs_config\trun\tcache_mode\tcontrol_batch\tno_op_median_bytes\tn\traw_p50_bytes\tcorrected_p50_bytes\n"]
-    grouped: dict[tuple[str, int, str, int, float], list[dict[str, Any]]] = collections.defaultdict(list)
+    lines = ["fs_config\tworkload\tcontrol_batch\tno_op_median_bytes\tn\traw_p50_bytes\tcorrected_p50_bytes\n"]
+    grouped: dict[tuple[str, int, int, float], list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
-        grouped[(row["fs_config"], row["run"], row["cache_mode"],
-                 row["control_batch"], row["noop_median_bytes"])].append(row)
+        grouped[(row["fs_config"], row["workload"], row["control_batch"],
+                 row["noop_median_bytes"])].append(row)
     for key, group in sorted(grouped.items()):
         lines.append("\t".join((
-            key[0], str(key[1]), key[2], str(key[3]), number(key[4]), str(len(group)),
+            key[0], str(key[1]), str(key[2]), number(key[3]), str(len(group)),
             number(statistics.median(row["physical_io_bytes"] for row in group)),
             number(statistics.median(row["physical_io_bytes_corrected"] for row in group)),
         )) + "\n")
@@ -1158,7 +1139,7 @@ def analyze(root: pathlib.Path, replicates: int = BOOTSTRAP_REPLICATES
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze three paired DeltaFS E3 runs")
+    parser = argparse.ArgumentParser(description="Analyze three paired DeltaFS E3 results")
     parser.add_argument("results_root", type=pathlib.Path)
     return parser.parse_args(argv)
 

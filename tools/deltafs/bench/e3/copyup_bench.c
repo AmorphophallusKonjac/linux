@@ -24,7 +24,6 @@ struct options {
 	const char *device_stat;
 	const char *expected_before;
 	const char *expected_after;
-	const char *cache_mode;
 	const char *fiemap_out;
 	const char *out;
 	uint64_t file_size;
@@ -56,7 +55,7 @@ static void usage(const char *program)
 		"  %s edit --merged ROOT --target PATH --upper PATH --lower PATH "
 		"--device-stat PATH --file-size N --offset N --write-bytes N "
 		"--payload-seed N --expected-before HEX --expected-after HEX "
-		"--cache-mode warm|cold --fiemap-out PATH --out PATH\n"
+		"--fiemap-out PATH --out PATH\n"
 		"  %s control --merged PATH --device-stat PATH --out PATH\n",
 		program, program);
 }
@@ -100,8 +99,6 @@ static int set_option(struct options *options, const char *name,
 		string = &options->expected_before;
 	else if (!strcmp(name, "--expected-after"))
 		string = &options->expected_after;
-	else if (!strcmp(name, "--cache-mode"))
-		string = &options->cache_mode;
 	else if (!strcmp(name, "--fiemap-out"))
 		string = &options->fiemap_out;
 	else if (!strcmp(name, "--out"))
@@ -163,7 +160,7 @@ static int parse_options(int argc, char **argv, struct options *options)
 	if (options->control) {
 		if (options->target || options->upper || options->lower ||
 		    options->expected_before ||
-		    options->expected_after || options->cache_mode ||
+		    options->expected_after ||
 		    options->fiemap_out || options->file_size || options->offset ||
 		    options->write_bytes || options->payload_seed) {
 			errno = EINVAL;
@@ -173,15 +170,13 @@ static int parse_options(int argc, char **argv, struct options *options)
 	}
 	if (!options->target || !options->upper || !options->lower ||
 	    !options->expected_before ||
-	    !options->expected_after || !options->cache_mode ||
+	    !options->expected_after ||
 	    !options->fiemap_out || options->target[0] != '/' ||
 	    options->upper[0] != '/' ||
 	    options->lower[0] != '/' || options->fiemap_out[0] != '/' ||
 	    !options->file_size || !options->write_bytes ||
 	    options->offset > options->file_size ||
 	    options->write_bytes > options->file_size - options->offset ||
-	    (strcmp(options->cache_mode, "warm") &&
-	     strcmp(options->cache_mode, "cold")) ||
 	    !valid_hex_hash(options->expected_before) ||
 	    !valid_hex_hash(options->expected_after)) {
 		errno = EINVAL;
@@ -206,23 +201,6 @@ static int syncfs_path(const char *path)
 	}
 	errno = saved_errno;
 	return ret;
-}
-
-static int advise_cold(const char *path)
-{
-	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-	int ret;
-
-	if (fd < 0)
-		return -1;
-	ret = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-	if (close(fd) && !ret)
-		ret = errno;
-	if (ret) {
-		errno = ret;
-		return -1;
-	}
-	return 0;
 }
 
 static int verify_input_files(const struct options *options,
@@ -318,11 +296,14 @@ static int compute_physical_io(struct result *result)
 static int run_control(const struct options *options, struct result *result,
 		       const char **stage)
 {
+	*stage = "syncfs_before";
+	if (syncfs_path(options->merged))
+		return -1;
 	*stage = "settle_before";
 	if (bench_wait_for_stable(options->device_stat, &result->sectors_before,
 				  &result->settle_timeout))
 		return -1;
-	*stage = "syncfs";
+	*stage = "syncfs_after";
 	if (syncfs_path(options->merged))
 		return -1;
 	*stage = "settle_after";
@@ -339,11 +320,9 @@ static int run_edit(const struct options *options, struct result *result,
 	*stage = "verify_preimage";
 	if (verify_input_files(options, result))
 		return -1;
-	if (!strcmp(options->cache_mode, "cold")) {
-		*stage = "cold_cache";
-		if (advise_cold(options->lower) || advise_cold(options->target))
-			return -1;
-	}
+	*stage = "syncfs_before";
+	if (syncfs_path(options->merged))
+		return -1;
 	*stage = "settle_before";
 	if (bench_wait_for_stable(options->device_stat, &result->sectors_before,
 				  &result->settle_timeout))
@@ -351,7 +330,7 @@ static int run_edit(const struct options *options, struct result *result,
 	*stage = "write";
 	if (write_payload(options))
 		return -1;
-	*stage = "syncfs";
+	*stage = "syncfs_after";
 	if (syncfs_path(options->merged))
 		return -1;
 	*stage = "settle_after";
@@ -391,7 +370,7 @@ static int write_result(const struct options *options,
 			      escaped_reason, sizeof(escaped_reason)))
 		return -1;
 	length = snprintf(buffer, sizeof(buffer),
-		"{\"schema\":1,\"kind\":\"%s\",\"status\":\"%s\","
+		"{\"schema\":%u,\"kind\":\"%s\",\"status\":\"%s\","
 		"\"errno\":%d,\"invalid_reason\":%s%s%s,"
 		"\"settle_timeout\":%s,\"sectors_before\":%" PRIu64 ","
 		"\"sectors_after\":%" PRIu64 ",\"physical_io_bytes\":%" PRIu64 ","
@@ -400,7 +379,7 @@ static int write_result(const struct options *options,
 		"\"copyup_bytes\":%" PRIu64 ",\"shared_bytes\":%" PRIu64 ","
 		"\"allocated_bytes_total\":%" PRIu64 ","
 		"\"fiemap_block_size\":%u,\"fiemap_extent_count\":%u}\n",
-		result->kind, result->status, result->error_number,
+		BENCH_SCHEMA, result->kind, result->status, result->error_number,
 		result->reason ? "\"" : "null", result->reason ? escaped_reason : "",
 		result->reason ? "\"" : "",
 		result->settle_timeout ? "true" : "false",

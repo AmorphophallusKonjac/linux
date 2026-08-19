@@ -11,7 +11,7 @@ import struct
 from typing import Any, Iterable
 
 
-SCHEMA = 1
+SCHEMA = 2
 SEED = 14857
 BLOCK_SIZE = 4096
 MASK64 = (1 << 64) - 1
@@ -26,11 +26,11 @@ SIZE_BINS = {
     192: "128-256KiB",
 }
 PRESETS = {
-    "smoke": {"warm": 1, "cold": 1, "runs": 1},
-    "run": {"warm": 100, "cold": 30, "runs": 5},
+    "smoke": {"samples": 2, "workloads": 1},
+    "run": {"samples": 130, "workloads": 5},
 }
 EVENT_FIELDS = frozenset((
-    "schema", "event_id", "run", "cache_mode", "relative_path",
+    "schema", "event_id", "workload", "relative_path",
     "file_size_before", "offset", "write_bytes", "payload_seed",
     "expected_before_sha256", "expected_after_sha256", "size_bin",
     "dirty_blocks",
@@ -38,7 +38,7 @@ EVENT_FIELDS = frozenset((
 
 
 class EventError(ValueError):
-    """An event or event file violates E3 v1."""
+    """An event or event file violates E3 schema 2."""
 
 
 class SplitMix64:
@@ -63,7 +63,7 @@ def byte_stream(seed: int, length: int) -> bytes:
         raise EventError("byte-stream seed must be a uint64")
     if not isinstance(length, int) or isinstance(length, bool) or length < 0:
         raise EventError("byte-stream length must be non-negative")
-    prefix = b"deltafs-e3-v1\0" + struct.pack("<Q", seed)
+    prefix = b"deltafs-e3-v2\0" + struct.pack("<Q", seed)
     chunks = []
     remaining = length
     counter = 0
@@ -98,7 +98,7 @@ def legal_cells() -> list[tuple[int, int]]:
     ]
 
 
-def _event(run: int, cache_mode: str, size_kib: int, dirty: int,
+def _event(workload: int, size_kib: int, dirty: int,
            ordinal: int, randomizer: SplitMix64) -> dict[str, Any]:
     file_size = size_kib * 1024
     write_bytes = dirty * BLOCK_SIZE
@@ -106,14 +106,13 @@ def _event(run: int, cache_mode: str, size_kib: int, dirty: int,
     offset = (randomizer.next() % positions) * BLOCK_SIZE
     payload_seed = randomizer.next()
     event_id = (
-        f"e3-r{run:02d}-{cache_mode}-f{size_kib:03d}-"
+        f"e3-w{workload:02d}-f{size_kib:03d}-"
         f"d{dirty:02d}-n{ordinal:03d}"
     )
     value = {
         "schema": SCHEMA,
         "event_id": event_id,
-        "run": run,
-        "cache_mode": cache_mode,
+        "workload": workload,
         "relative_path": "edit.bin",
         "file_size_before": file_size,
         "offset": offset,
@@ -130,28 +129,22 @@ def _event(run: int, cache_mode: str, size_kib: int, dirty: int,
     return value
 
 
-def generate_events(preset: str, run_index: int | None = None) -> list[dict[str, Any]]:
+def generate_events(preset: str) -> list[dict[str, Any]]:
     if preset not in PRESETS:
         raise EventError(f"unknown preset: {preset}")
     configuration = PRESETS[preset]
-    if run_index is None:
-        selected_runs = range(1, configuration["runs"] + 1)
-    elif not is_plain_int(run_index) or not 1 <= run_index <= configuration["runs"]:
-        raise EventError("run_index is outside the preset")
-    else:
-        selected_runs = (run_index,)
+    selected_workloads = range(1, configuration["workloads"] + 1)
     result: list[dict[str, Any]] = []
-    for run in selected_runs:
-        for cache_index, cache_mode in enumerate(("warm", "cold"), start=1):
-            randomizer = SplitMix64(SEED ^ (run << 32) ^ cache_index)
-            group = [
-                _event(run, cache_mode, size, dirty, ordinal, randomizer)
-                for size, dirty in legal_cells()
-                for ordinal in range(configuration[cache_mode])
-            ]
-            randomizer.shuffle(group)
-            result.extend(group)
-    validate_events(result, preset, run_index)
+    for workload in selected_workloads:
+        randomizer = SplitMix64(SEED ^ (workload << 32))
+        group = [
+            _event(workload, size, dirty, ordinal, randomizer)
+            for size, dirty in legal_cells()
+            for ordinal in range(configuration["samples"])
+        ]
+        randomizer.shuffle(group)
+        result.extend(group)
+    validate_events(result, preset)
     return result
 
 
@@ -184,14 +177,12 @@ def validate_event(event: dict[str, Any]) -> None:
     if event["schema"] != SCHEMA or not isinstance(event["event_id"], str) or \
             not event["event_id"].isascii() or not event["event_id"]:
         raise EventError("invalid event schema or ID")
-    if event["cache_mode"] not in ("warm", "cold"):
-        raise EventError("invalid cache mode")
     _validate_relative_path(event["relative_path"])
-    integer_fields = ("run", "file_size_before", "offset", "write_bytes",
+    integer_fields = ("workload", "file_size_before", "offset", "write_bytes",
                       "payload_seed", "dirty_blocks")
     if any(not is_plain_int(event[field]) for field in integer_fields):
         raise EventError("event numeric fields must be plain integers")
-    if event["run"] < 1 or event["file_size_before"] <= 0 or \
+    if event["workload"] < 1 or event["file_size_before"] <= 0 or \
             event["offset"] < 0 or event["write_bytes"] <= 0 or \
             not 0 <= event["payload_seed"] <= MASK64 or event["dirty_blocks"] <= 0:
         raise EventError("event numeric field is out of range")
@@ -214,33 +205,27 @@ def validate_event(event: dict[str, Any]) -> None:
         raise EventError("event hash does not match deterministic content")
 
 
-def expected_counts(preset: str, run_index: int | None = None
-                    ) -> dict[tuple[int, str, int, int], int]:
+def expected_counts(preset: str) -> dict[tuple[int, int, int], int]:
     configuration = PRESETS[preset]
-    selected_runs = range(1, configuration["runs"] + 1) \
-        if run_index is None else (run_index,)
     return {
-        (run, cache, size * 1024, dirty): configuration[cache]
-        for run in selected_runs
-        for cache in ("warm", "cold")
+        (workload, size * 1024, dirty): configuration["samples"]
+        for workload in range(1, configuration["workloads"] + 1)
         for size, dirty in legal_cells()
     }
 
 
-def validate_events(values: Iterable[dict[str, Any]], preset: str | None = None,
-                    run_index: int | None = None) -> None:
+def validate_events(values: Iterable[dict[str, Any]], preset: str | None = None) -> None:
     events = list(values)
     identities: set[str] = set()
-    counts: dict[tuple[int, str, int, int], int] = {}
+    counts: dict[tuple[int, int, int], int] = {}
     for event in events:
         validate_event(event)
         if event["event_id"] in identities:
             raise EventError(f"duplicate event_id: {event['event_id']}")
         identities.add(event["event_id"])
-        key = (event["run"], event["cache_mode"],
-               event["file_size_before"], event["dirty_blocks"])
+        key = (event["workload"], event["file_size_before"], event["dirty_blocks"])
         counts[key] = counts.get(key, 0) + 1
-    if preset is not None and counts != expected_counts(preset, run_index):
+    if preset is not None and counts != expected_counts(preset):
         raise EventError("event schedule differs from the fixed preset")
 
 
@@ -251,8 +236,7 @@ def canonical_jsonl(values: Iterable[dict[str, Any]]) -> bytes:
     )
 
 
-def read_events(path: pathlib.Path, preset: str | None = None,
-                run_index: int | None = None) -> list[dict[str, Any]]:
+def read_events(path: pathlib.Path, preset: str | None = None) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     try:
         stream = path.open(encoding="ascii")
@@ -269,7 +253,7 @@ def read_events(path: pathlib.Path, preset: str | None = None,
             if not isinstance(value, dict):
                 raise EventError(f"event line {line_number} is not an object")
             result.append(value)
-    validate_events(result, preset, run_index)
+    validate_events(result, preset)
     if path.read_bytes() != canonical_jsonl(result):
         raise EventError("event file is not in canonical JSONL form")
     return result

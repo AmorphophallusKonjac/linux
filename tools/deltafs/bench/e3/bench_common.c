@@ -248,7 +248,7 @@ int bench_sha256_path(const char *path, char output[65])
 
 int bench_fill_bytes(uint64_t seed, void *buffer, size_t length)
 {
-	static const unsigned char prefix[] = "deltafs-e3-v1\0";
+	static const unsigned char prefix[] = "deltafs-e3-v2\0";
 	unsigned char input[sizeof(prefix) - 1 + 16];
 	unsigned char digest[32];
 	struct sha256_context context;
@@ -629,9 +629,9 @@ static int write_fiemap_dump(const char *path,
 	if (!buffer)
 		return -1;
 	length = snprintf(buffer, capacity,
-		"{\"schema\":1,\"file_size\":%" PRIu64
+		"{\"schema\":%u,\"file_size\":%" PRIu64
 		",\"block_size\":%u,\"status\":\"%s\",\"errno\":%d,"
-		"\"extents\":[", file_size, block_size,
+		"\"extents\":[", BENCH_SCHEMA, file_size, block_size,
 		valid ? "ok" : "invalid", error_number);
 	if (length < 0 || (size_t)length >= capacity) {
 		free(buffer);

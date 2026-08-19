@@ -33,7 +33,7 @@ def write_jsonl(path: pathlib.Path, values: list[dict]) -> None:
 def manifest(config: str, event_hash: str, event_count: int) -> dict:
     fs_type = "ext4" if config.startswith("ext4") else "xfs"
     return {
-        "schema": 1, "preset": "smoke", "run_index": 1, "seed": events.SEED,
+        "schema": events.SCHEMA, "preset": "smoke", "seed": events.SEED,
         "event_file": "events.jsonl", "event_file_sha256": event_hash,
         "event_count": event_count, "git_commit": "test", "kernel_release": "test",
         "kernel_config_sha256": "", "fs_type": fs_type, "fs_config": config,
@@ -48,8 +48,8 @@ def manifest(config: str, event_hash: str, event_count: int) -> dict:
         "checkpoint_generation": run.CHECKPOINT_GENERATION,
         "copyup_source": run.COPYUP_SOURCE,
         "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
-        "warm_count_per_cell": 1, "cold_count_per_cell": 1,
-        "independent_runs": 1, "noop_interval": 20, "noop_repetitions": 3,
+        "samples_per_cell": 2,
+        "independent_workloads": 1, "noop_interval": 20, "noop_repetitions": 3,
         "settle_interval_ms": 100, "settle_stable_comparisons": 3,
         "settle_timeout_ms": 10000,
     }
@@ -68,15 +68,15 @@ def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> 
     for number, event in enumerate(event_values, start=1):
         fiemap_name = f"sample-{number:03d}.json"
         write_json(fiemap_dir / fiemap_name, {
-            "schema": 1, "file_size": event["file_size_before"], "block_size": 4096,
+            "schema": events.SCHEMA, "file_size": event["file_size_before"], "block_size": 4096,
             "status": "ok", "errno": 0,
             "extents": [{"logical": 0, "physical": number * 4096,
                          "length": event["file_size_before"], "flags": 1}],
         })
         rows.append({
-            "schema": 1, "run": event["run"], "sample": number,
+            "schema": events.SCHEMA, "workload": event["workload"], "sample": number,
             "sample_id": f"sample-{number:03d}", "sample_kind": "edit",
-            "control_batch": 1, "cache_mode": event["cache_mode"],
+            "control_batch": (number - 1) // run.NOOP_INTERVAL + 1,
             "fs_config": config, "event_id": event["event_id"],
             "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
             "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
@@ -95,21 +95,21 @@ def create_result(root: pathlib.Path, config: str, event_values: list[dict]) -> 
     write_jsonl(directory / "raw.jsonl", rows)
     controls = []
     sample = 0
-    for cache_mode in ("warm", "cold"):
+    for batch in range(1, 3):
         for replica in range(1, 4):
             sample += 1
             controls.append({
-                "schema": 1, "run": 1, "sample": sample,
-                "sample_id": f"control-{cache_mode}-{replica}",
-                "sample_kind": "control", "cache_mode": cache_mode,
-                "fs_config": config, "control_batch": 1, "replica": replica,
+                "schema": events.SCHEMA, "workload": 1, "sample": sample,
+                "sample_id": f"control-{batch}-{replica}",
+                "sample_kind": "control",
+                "fs_config": config, "control_batch": batch, "replica": replica,
                 "sectors_before": 2000, "sectors_after": 2002,
                 "physical_io_bytes": 1024, "settle_timeout": False,
                 "status": "ok", "errno": 0, "invalid_reason": None,
             })
     write_jsonl(directory / "controls.jsonl", controls)
     write_json(directory / "summary.json", {
-        "schema": 1, "preset": "smoke", "completed": True, "passed": True,
+        "schema": events.SCHEMA, "preset": "smoke", "completed": True, "passed": True,
         "counts": {"ok": len(rows), "invalid": 0, "failed": 0},
         "control_counts": {"ok": len(controls), "invalid": 0, "failed": 0},
         "planned_edits": len(rows), "planned_controls": len(controls),
@@ -136,7 +136,7 @@ class AnalyzeTests(unittest.TestCase):
         self.assertTrue(all("WARM" not in title and "CACHE" not in title
                             for title in analyze.PLOT_TITLES.values()))
 
-    def test_amplification_stats_pool_cache_modes_by_exact_cell(self) -> None:
+    def test_amplification_stats_group_exact_cell(self) -> None:
         rows = [
             {
                 "status": "ok", "fs_config": "xfs_reflink",
@@ -158,7 +158,7 @@ class AnalyzeTests(unittest.TestCase):
 
     def test_percentile_and_bootstrap(self) -> None:
         self.assertEqual(analyze.percentile([1, 2, 3, 4], 0.5), 2.5)
-        rows = [{"run": 1, "value": value} for value in (1, 2, 3)]
+        rows = [{"workload": 1, "value": value} for value in (1, 2, 3)]
         first = analyze.cluster_bootstrap(
             rows, lambda row: row["value"], statistics.median, ("test",), 50,
         )
@@ -172,7 +172,7 @@ class AnalyzeTests(unittest.TestCase):
         for config, value in (("ext4_noreflink", 10), ("xfs_noreflink", 8),
                               ("xfs_reflink", 3)):
             rows.append({
-                "event_id": "e", "run": 1, "cache_mode": "warm", "size_bin": "4KiB",
+                "event_id": "e", "workload": 1, "size_bin": "4KiB",
                 "fs_config": config, "status": "ok", "copyup_bytes": value,
                 "physical_io_bytes": value, "physical_io_bytes_corrected": value,
             })
@@ -195,7 +195,7 @@ class AnalyzeTests(unittest.TestCase):
                 create_result(root, config, event_values)
             stats, errors_found = analyze.analyze(root, replicates=20)
             self.assertFalse(errors_found)
-            self.assertEqual(len(stats), 108)
+            self.assertEqual(len(stats), 54)
             analysis_dir = root / "analysis"
             expected = {
                 "summary.tsv", "paired-benefit.tsv", "paired-benefit-summary.tsv",
