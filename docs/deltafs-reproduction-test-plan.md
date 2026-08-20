@@ -563,18 +563,21 @@ bytes-per-directory slope；文件 FIEMAP `copyup_bytes` 是不应随深度变�
 分析单独报告 artifact correctness 和 `depth_hypothesis_supported`，不得因趋势不符合
 预期而删除或重跑样本。完整 preset 数量、分析产物和 QEMU 命令以 E3 详细设计为准。
 
-## 11. 实验 E4：任意历史点回滚与层深扩展
+## 11. 实验 E4：时间维度的写延迟放大
 
-这是对 R3 “O(1) arbitrary rollback”的专门验证，论文没有单列图，但对机制主张非常重要。
+E4 是独立的 temporal write-latency benchmark，详细契约见
+[deltafs-e4-test-plan.md](deltafs-e4-test-plan.md)。它不属于 E3 的空间/物理 I/O
+矩阵，也不把 E2 的单次 checkpoint/restore ioctl latency 混入主指标。
 
-1. 生成深度 1/2/4/8/16/32/64/128 的线性 checkpoint chain。
-2. 每层创建、修改、删除不同文件，保存 oracle。
-3. 从最新状态随机回滚到任意历史点，共 10,000 次。
-4. 每次验证 tree manifest，并记录回滚距离、目标深度、ioctl latency。
-5. 额外构建分支树，在 A 分支编辑后回 root，再生成 B 分支，验证 A/B 不互相可见。
-6. 记录 mount 数、dentry/inode/slab、module allocation，验证旧 layer array 在 RCU grace period 后回收。
+E4 在连续 generation 中执行 `single`、`burst4`、`multi16` 三类 workload，比较
+`upper_resident`、`first_touch` 和 `steady_after_copyup`，并分别覆盖 close/reopen 与
+held-fd 两种访问方式。主结果是用户可见 `open + pwrite + fsync + close` 延迟、按序列
+配对的 `first_touch_ratio`，以及 generation/history-depth 趋势。checkpoint 只用于建立
+下一代，计时区间外；checkpoint 自身仍由 E2 负责 ioctl latency。
 
-输出 latency-vs-distance 和 memory-vs-live-checkpoints。若 rollback latency 随距离增加，定位是 layer config 构建、cache invalidation，还是实际数据操作。
+E4 的原始序列、generation 计数、CPU/clock validity、SHA-256 oracle 和 QEMU 交接必须
+按详细设计执行。原先计划中的 arbitrary rollback/depth sweep 不再占用 E4 编号：正确性
+部分归入 E0，纯 ioctl 的 target-depth 变化归入 E2；需要时作为后续辅助实验另行命名。
 
 ## 12. 实验 E5：SWE-bench 文件系统回放
 
@@ -691,6 +694,7 @@ bench/
   perf/
     switch_latency.c
     write_amp.py
+    temporal_write_latency.py
     block_stats.py
     replay_swe.py
   analysis/
@@ -727,7 +731,7 @@ bench/
 ### M2：微基准
 
 - 执行 E2 层切换延迟。
-- 执行 E4 arbitrary rollback/depth sweep。
+- 执行 E4 temporal write-latency sweep。
 
 退出条件：原始数据和统计脚本能从干净环境一键重跑，latency 口径完整。
 
@@ -755,13 +759,14 @@ bench/
 1. 环境对照表：论文 vs 本次实验。
 2. 正确性矩阵和压力测试统计。
 3. checkpoint/restore ioctl 与 wrapper latency 表。
-4. latency-vs-layer-depth、latency-vs-rollback-distance。
-5. copy-up amplification vs logical write-request size。
-6. physical-write amplification vs logical write-request size。
-7. 每桶样本量/IQR/CI 表。
-8. synthetic dirty-block sweep。
-9. DeltaFS-only SWE-bench replay 分组表。
-10. 与论文偏差分析：硬件、trace、内核、mount 参数、统计口径。
+4. E2 ioctl latency-vs-target-depth。
+5. E4 latency-vs-generation、latency-vs-history-depth 和 latency amplification。
+6. copy-up amplification vs logical write-request size。
+7. physical-write amplification vs logical write-request size。
+8. 每桶样本量/IQR/CI 表。
+9. synthetic dirty-block sweep。
+10. DeltaFS-only SWE-bench replay 分组表。
+11. 与论文偏差分析：硬件、trace、内核、mount 参数、统计口径。
 
 ## 18. 复现结论的措辞规则
 

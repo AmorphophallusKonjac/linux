@@ -21,6 +21,9 @@ e2-bench:
 e3-bench:
 	$(MAKE) -C bench/e3 all
 
+e4-bench:
+	$(MAKE) -C bench/e4 all
+
 deltafsctl: deltafsctl.c $(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@
 
@@ -41,6 +44,7 @@ clean:
 		deltafs_v2_ioctl_test
 	$(MAKE) -C bench/e2 clean
 	$(MAKE) -C bench/e3 clean
+	$(MAKE) -C bench/e4 clean
 
 check-v2-checkpoints:
 	./deltafs_v2_checkpoint_callsite_test.sh "$(KERNEL_DELTAFS_OBJ)" \
@@ -69,6 +73,6 @@ test-v2-acceptance: v2-tools
 	./deltafs_v2_acceptance_test.sh --backing-root "$(BACKING_ROOT)" \
 		--extra-backing-root "$(EXTRA_BACKING_ROOT)"
 
-.PHONY: all v2-phase1-tools v2-tools e2-bench e3-bench clean \
+.PHONY: all v2-phase1-tools v2-tools e2-bench e3-bench e4-bench clean \
 	check-v2-checkpoints check-v2-fast-path test-v2-phase1 check-v2-layout test-v2-controller \
 	test-v2-acceptance
