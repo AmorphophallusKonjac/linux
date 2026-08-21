@@ -18,7 +18,11 @@ MINIMAL_MODULES=(
 	fs/autofs/autofs4.ko
 	fs/nls/nls_iso8859-1.ko
 	fs/overlayfs/overlay.ko
+	fs/f2fs/f2fs.ko
+	crypto/crc32_generic.ko
 	fs/xfs/xfs.ko
+	lib/lz4/lz4_compress.ko
+	lib/lz4/lz4hc_compress.ko
 	lib/libcrc32c.ko
 	fs/netfs/netfs.ko
 	fs/9p/9p.ko
@@ -67,8 +71,8 @@ cmd_module() {
 }
 
 cmd_tools() {
-	echo "==> make -C tools/deltafs v2-tools"
-	make -C "$KROOT/tools/deltafs" v2-tools
+	echo "==> make -C tools/deltafs e0-tools"
+	make -C "$KROOT/tools/deltafs" e0-tools
 }
 
 cmd_status() {

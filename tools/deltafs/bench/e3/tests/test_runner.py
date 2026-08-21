@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0
 from __future__ import annotations
 
+import json
+import os
 import pathlib
 import subprocess
-import tempfile
 import sys
+import tempfile
 import unittest
 
 
@@ -15,164 +17,129 @@ import run  # noqa: E402
 
 
 class RunnerTests(unittest.TestCase):
-    def test_run_cli_has_no_run_index(self) -> None:
-        parsed = run.parse_args(["run", "/backing", "/dev/stat", "/out"])
-        self.assertFalse(hasattr(parsed, "run_index"))
+    def test_cli_is_independent_of_e3_device_counter(self) -> None:
+        parsed = run.parse_args(["smoke", "/backing", "/out"])
+        self.assertEqual(parsed.preset, "smoke")
+        self.assertFalse(hasattr(parsed, "device_stat"))
 
-    def test_xfs_info_uses_mount_target(self) -> None:
+    def test_filesystem_configuration_only_probes_xfs(self) -> None:
         calls: list[list[str]] = []
         original = run.command_output
-        run.command_output = lambda command: calls.append(command) or "reflink=1\n"
+        run.command_output = lambda command: calls.append(command) or "reflink=0\n"
         try:
-            config, info = run.xfs_configuration({"fstype": "xfs", "target": "/mnt"})
+            self.assertEqual(
+                run.filesystem_configuration({"fstype": "ext4", "target": "/ext4"}),
+                ("ext4", ""),
+            )
+            self.assertEqual(
+                run.filesystem_configuration({"fstype": "f2fs", "target": "/f2fs"}),
+                ("f2fs", ""),
+            )
+            config, info = run.filesystem_configuration(
+                {"fstype": "xfs", "target": "/xfs"},
+            )
         finally:
             run.command_output = original
-        self.assertEqual(config, "xfs_reflink")
-        self.assertEqual(calls, [["xfs_info", "/mnt"]])
+        self.assertEqual(config, "xfs_noreflink")
+        self.assertEqual(info, "reflink=0\n")
+        self.assertEqual(calls, [["xfs_info", "/xfs"]])
 
-    def test_counter_window_syncs_before_first_read(self) -> None:
-        source = (E3 / "copyup_bench.c").read_text(encoding="ascii")
-        edit = source[source.index("static int run_edit"):source.index("static int write_result")]
-        self.assertLess(edit.index('"syncfs_before"'), edit.index('"settle_before"'))
-        self.assertLess(edit.index("syncfs_path(options->merged)"),
-                        edit.index("bench_wait_for_stable(options->device_stat"))
-        control = source[source.index("static int run_control"):source.index("static int run_edit")]
-        self.assertLess(control.index('"syncfs_before"'), control.index('"settle_before"'))
+    def test_supported_filesystem_magics_include_f2fs(self) -> None:
+        self.assertEqual(run.FILESYSTEM_MAGICS["f2fs"], 0xF2F52010)
 
-    def test_helper_has_no_cache_mode_or_eviction(self) -> None:
-        source = (E3 / "copyup_bench.c").read_text(encoding="ascii")
-        self.assertNotIn("cache_mode", source)
-        self.assertNotIn("POSIX_FADV_DONTNEED", source)
-
-    def test_smoke_batches_cover_each_event(self) -> None:
-        values = events.generate_events("smoke")
-        batches = run.planned_batches(values)
-        flattened = [event for _, _, group in batches for event in group]
-        self.assertEqual(flattened, values)
-        self.assertEqual(len(batches), 2)
-        self.assertEqual([(item[0], item[1]) for item in batches], [(1, 1), (1, 2)])
-        self.assertEqual([len(item[2]) for item in batches], [20, 16])
-
-    def test_run_batch_boundaries_and_controls(self) -> None:
-        values = [
-            {"workload": run_number}
-            for run_number in range(1, 6)
-            for _ in range(2340)
-        ]
-        batches = run.planned_batches(values)
-        self.assertEqual(sum(len(group) for _, _, group in batches), 11_700)
-        self.assertTrue(all(1 <= len(group) <= run.NOOP_INTERVAL
-                            for _, _, group in batches))
-        # Per workload: ceil(2340/20) = 117 batches.
-        self.assertEqual(len(batches), 585)
-        self.assertEqual(len(batches) * run.NOOP_REPETITIONS, 1755)
-
-    def test_one_full_workload_has_fixed_counts(self) -> None:
-        counts = events.expected_counts("run")
-        self.assertEqual(sum(counts.values()), 11_700)
-        workload = sum(count for (workload_index, _, _, _), count in counts.items()
-                       if workload_index == 4)
-        self.assertEqual(workload, 2340)
-        batches = (workload + 19) // 20
-        self.assertEqual(batches * run.NOOP_REPETITIONS, 351)
-
-    def test_new_dmesg_accepts_prefix_and_rotation_overlap(self) -> None:
-        self.assertEqual(run.new_dmesg("a\nb\n", "a\nb\nc\n"), "c\n")
-        self.assertEqual(run.new_dmesg("a\nb\nc", "b\nc\nd"), "d")
-        with self.assertRaises(run.E3Error):
-            run.new_dmesg("a\nb", "c\nd")
-
-    def test_summarize_requires_complete_controls(self) -> None:
-        values = events.generate_events("smoke")
-        manifest = {
-            "preset": "smoke", "event_count": len(values), "independent_workloads": 1,
-            "samples_per_cell": 2,
-        }
-        rows = [{"status": "ok"} for _ in values]
-        control_count = len(run.planned_batches(values)) * run.NOOP_REPETITIONS
-        controls = [{"status": "ok"} for _ in range(control_count)]
-        summary = run.summarize(manifest, rows, controls, [], True)
-        self.assertTrue(summary["passed"])
-        controls.pop()
-        self.assertFalse(run.summarize(manifest, rows, controls, [], True)["passed"])
-
-    def test_raw_base_keeps_relative_fiemap_path(self) -> None:
-        event = events.generate_events("smoke")[0]
-        root = pathlib.Path("/tmp/e3-output")
-        row = run.raw_base(event, 1, "sample", "xfs_reflink", 1,
-                           root / "fiemap" / "sample.json", root)
-        self.assertEqual(row["fiemap_path"], "fiemap/sample.json")
-        self.assertEqual(row["logical_bytes_changed"], event["write_bytes"])
-
-    def test_sample_preimage_starts_in_generation_one_upper(self) -> None:
-        event = events.generate_events("smoke")[0]
-        with tempfile.TemporaryDirectory() as temporary:
-            sample = pathlib.Path(temporary) / "sample"
-            original_syncfs = run.syncfs
-            run.syncfs = lambda _path: None
-            try:
-                run.create_sample(sample, event)
-            finally:
-                run.syncfs = original_syncfs
-            target = sample / "generation-1" / "upper" / "edit.bin"
-            self.assertEqual(target.stat().st_mode & 0o777, 0o644)
-            self.assertEqual(run.sha256_file(target), event["expected_before_sha256"])
-            self.assertFalse((sample / "generation-2" / "upper" / "edit.bin").exists())
-
-    def test_depth_sample_and_upper_tree_oracle(self) -> None:
-        event = next(
-            value for value in events.generate_events("depth-smoke")
-            if value["directory_depth"] == 16
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            sample = pathlib.Path(temporary) / "sample"
-            original_syncfs = run.syncfs
-            run.syncfs = lambda _path: None
-            try:
-                run.create_sample(sample, event)
-            finally:
-                run.syncfs = original_syncfs
-            source = sample / "generation-1" / "upper" / event["relative_path"]
-            self.assertTrue(source.is_file())
-            destination = sample / "generation-2" / "upper" / event["relative_path"]
-            destination.parent.mkdir(parents=True)
-            destination.write_bytes(source.read_bytes())
-            self.assertEqual(run.verify_upper_tree(sample, event), 16)
-            extra = sample / "generation-2" / "upper" / "extra"
-            extra.mkdir()
-            with self.assertRaises(run.E3Error):
-                run.verify_upper_tree(sample, event)
-
-    def test_checkpoint_freezes_generation_one_and_uses_v2_helper(self) -> None:
+    def test_checkpoint_renames_upper_and_uses_next_workdir(self) -> None:
         class RecordingLogs:
             def __init__(self) -> None:
                 self.commands: list[list[str]] = []
 
-            def subprocess(self, command: list[str], **_kwargs: object
-                           ) -> subprocess.CompletedProcess[str]:
+            def subprocess(self, command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
                 self.commands.append(command)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-        event = events.generate_events("smoke")[0]
         with tempfile.TemporaryDirectory() as temporary:
-            sample = pathlib.Path(temporary) / "sample"
-            original_syncfs = run.syncfs
-            run.syncfs = lambda _path: None
-            try:
-                run.create_sample(sample, event)
-            finally:
-                run.syncfs = original_syncfs
+            sample = pathlib.Path(temporary)
+            (sample / "active" / "upper").mkdir(parents=True)
+            (sample / "active" / "work").mkdir()
+            (sample / "merged").mkdir()
             logs = RecordingLogs()
-            helper = pathlib.Path("/tmp/checkpoint_v2")
-            run.checkpoint_sample(sample, helper, logs)  # type: ignore[arg-type]
-            frozen = sample / "layers" / "g1" / "edit.bin"
-            self.assertEqual(run.sha256_file(frozen), event["expected_before_sha256"])
-            self.assertFalse((sample / "generation-1" / "upper").exists())
-            self.assertEqual(logs.commands, [[
-                str(helper), str(sample / "merged"), "1",
-                str(sample / "generation-2" / "upper"),
-                str(sample / "generation-2" / "work"),
-            ]])
+            run.checkpoint(sample, 1, pathlib.Path("/helper"), logs)  # type: ignore[arg-type]
+            self.assertTrue((sample / "layers" / "g001").is_dir())
+            self.assertTrue((sample / "active" / "work-g002").is_dir())
+            self.assertEqual(logs.commands[0][2], "1")
+
+    def test_helper_measures_reopen(self) -> None:
+        helper = E3 / "temporal_write_bench"
+        original_affinity = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, {min(original_affinity)})
+        with tempfile.TemporaryDirectory() as temporary:
+            try:
+                root = pathlib.Path(temporary)
+                target = root / "edit.bin"
+                target.write_bytes(b"\0" * 8192)
+                reopen_result = root / "reopen.json"
+                process = subprocess.run([
+                    str(helper), "reopen", str(root), str(target), "0", "17",
+                    "8192", "4096", str(reopen_result),
+                ], check=False)
+                self.assertEqual(process.returncode, 0)
+                value = json.loads(reopen_result.read_text(encoding="ascii"))
+                self.assertEqual(value["status"], "ok")
+                self.assertGreater(value["edit_e2e_ns"], 0)
+                self.assertEqual(target.read_bytes()[:4096], events.byte_stream(17, 4096))
+                process = subprocess.run([
+                    str(helper), "held_fd", str(root), str(target), "0", "17",
+                    "8192", "4096", str(root / "held.json"),
+                ], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertNotEqual(process.returncode, 0)
+            finally:
+                os.sched_setaffinity(0, original_affinity)
+
+    def test_lower_direct_replays_event_without_overlay(self) -> None:
+        class SubprocessLogs:
+            def subprocess(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    command, text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **kwargs,
+                )
+
+        event = events.generate_events("smoke")[0]
+        original_affinity = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, {min(original_affinity)})
+        with tempfile.TemporaryDirectory() as temporary:
+            try:
+                root = pathlib.Path(temporary)
+                sample = root / "direct"
+                rows = run.make_lower_direct_rows(
+                    [event], sample, E3 / "temporal_write_bench",
+                    SubprocessLogs(), "reopen", root / "setup.jsonl",  # type: ignore[arg-type]
+                )
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["sample_kind"], "lower_direct")
+                self.assertEqual(
+                    (rows[0]["checkpoint_generation_before"],
+                     rows[0]["checkpoint_generation_after"]),
+                    (0, 0),
+                )
+                target = sample / "base" / event["relative_path"]
+                self.assertEqual(run.sha256_file(target), event["expected_after_sha256"])
+                self.assertFalse((sample / "merged" / event["relative_path"]).exists())
+            finally:
+                os.sched_setaffinity(0, original_affinity)
+
+    def test_timed_helper_excludes_checkpoint_syncfs_and_hash(self) -> None:
+        source = (E3 / "temporal_write_bench.c").read_text(encoding="ascii")
+        self.assertNotIn("ioctl(", source)
+        self.assertNotIn("syncfs(", source)
+        self.assertIn("CLOCK_MONOTONIC_RAW", source)
+        self.assertLess(source.index("fill_e3_bytes(payload_seed"),
+                        source.index("getrusage(RUSAGE_SELF, &usage_before"))
+
+    def test_new_dmesg_handles_prefix_and_rotation(self) -> None:
+        self.assertEqual(run.new_dmesg("a\nb\n", "a\nb\nc\n"), "c\n")
+        self.assertEqual(run.new_dmesg("a\nb\nc", "b\nc\nd"), "d")
+        with self.assertRaises(run.E3Error):
+            run.new_dmesg("a", "z")
 
 
 if __name__ == "__main__":

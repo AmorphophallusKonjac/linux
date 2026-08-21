@@ -1,208 +1,306 @@
 # SPDX-License-Identifier: GPL-2.0
+from __future__ import annotations
 
 import copy
-import errno
+import hashlib
 import json
 import pathlib
+import statistics
 import string
 import sys
 import tempfile
 import unittest
 
 
-E2_DIR = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(E2_DIR))
+E2 = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(E2))
 import analyze  # noqa: E402
+import events  # noqa: E402
+import run  # noqa: E402
 
 
-def smoke_manifest() -> dict:
+def write_json(path: pathlib.Path, value: object) -> None:
+    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="ascii")
+
+
+def write_jsonl(path: pathlib.Path, values: list[dict]) -> None:
+    path.write_text("".join(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        for value in values
+    ), encoding="ascii")
+
+
+def manifest(config: str, event_hash: str, event_count: int,
+             preset: str = "smoke") -> dict:
+    fs_type = config if config in ("ext4", "f2fs") else "xfs"
+    configuration = events.PRESETS[preset]
     return {
-        "schema": 2,
-        "deltafs_abi_version": 2,
-        "preset": "smoke",
-        "seed": 14857,
-        "git_commit": "0" * 40,
-        "kernel_release": "test",
-        "kernel_config_sha256": "1" * 64,
-        "fs_type": "xfs",
-        "fs_uuid": "uuid",
-        "backing_source": "/dev/test",
-        "backing_mount_options": "rw",
-        "deltafs_mount_options": [
-            "index=off", "nfs_export=off", "metacopy=off", "xino=off",
-            "uuid=off", "redirect_dir=nofollow",
-        ],
-        "cpu": 3,
-        "clocksource": "kvm-clock",
-        "started_at": "2026-08-13T00:00:00Z",
-        "depth_matrix": {"checkpoint": [1, 127], "restore": [1, 128]},
-        "warmup_count": 2,
-        "measured_count": 5,
-        "independent_runs": 1,
+        "schema": events.SCHEMA, "preset": preset,
+        "experiment": configuration["experiment"], "seed": events.SEED,
+        "event_file": "events.jsonl", "event_file_sha256": event_hash,
+        "event_count": event_count, "git_commit": "test", "kernel_release": "test",
+        "kernel_config_sha256": "", "fs_type": fs_type, "fs_config": config,
+        "fs_uuid": "test", "backing_source": f"/dev/{config}",
+        "backing_mount_options": "rw", "xfs_info": "" if fs_type != "xfs" else
+        f"reflink={1 if config == 'xfs_reflink' else 0}",
+        "device_stat": "/sys/block/test/stat",
+        "canonical_device_stat": "/sys/devices/test/stat",
+        "overlay_mount_options": list(run.MOUNT_FEATURES), "started_at": "test",
+        "deltafs_abi_version": run.DELTAFS_ABI_VERSION,
+        "initial_generation": run.INITIAL_GENERATION,
+        "checkpoint_generation": run.CHECKPOINT_GENERATION,
+        "copyup_source": run.COPYUP_SOURCE,
+        "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
+        "experiment_cells": [[size * 1024, dirty, depth]
+                             for size, dirty, depth in events.experiment_cells(preset)],
+        "directory_depths": list(events.DIRECTORY_DEPTHS
+                                 if configuration["experiment"] == "path_depth" else (0,)),
+        "samples_per_cell": configuration["samples"],
+        "independent_workloads": configuration["workloads"],
+        "noop_interval": 20, "noop_repetitions": 3,
+        "settle_interval_ms": 100, "settle_stable_comparisons": 3,
+        "settle_timeout_ms": 10000,
     }
 
 
-def row(sample: int, operation: str, depth: int, warmup: bool) -> dict:
-    source = depth if operation == "checkpoint" else 128
-    target = depth + 1 if operation == "checkpoint" else depth
-    return {
-        "schema": 2,
-        "run": 1,
-        "sample": sample,
-        "warmup": warmup,
-        "operation": operation,
-        "source_depth": source,
-        "target_depth": target,
-        "request_depth": target,
-        "rollback_distance": 0 if operation == "checkpoint" else 128 - depth,
-        "keep_bottom": 0 if operation == "checkpoint" else target,
-        "prefix_depth": 0,
-        "request_fd_count": 2,
-        "expected_generation": 1,
-        "generation_after": 2,
-        "cpu_before": 3,
-        "cpu_after": 3,
-        "major_faults": 0,
-        "ioctl_ret": 0,
-        "errno": 0,
-        "ioctl_latency_ns": 100_000 + sample,
-        "status": "ok",
-        "invalid_reason": None,
+def create_result(root: pathlib.Path, config: str, event_values: list[dict],
+                  preset: str = "smoke") -> None:
+    directory = root / config
+    fiemap_dir = directory / "fiemap"
+    fiemap_dir.mkdir(parents=True)
+    event_data = events.canonical_jsonl(event_values)
+    (directory / "events.jsonl").write_bytes(event_data)
+    write_json(directory / "manifest.json", manifest(
+        config, hashlib.sha256(event_data).hexdigest(), len(event_values), preset,
+    ))
+    batches = run.planned_batches(event_values)
+    event_batches = {
+        event["event_id"]: batch for _workload, batch, group in batches for event in group
     }
+    rows = []
+    for number, event in enumerate(event_values, start=1):
+        fiemap_name = f"sample-{number:03d}.json"
+        write_json(fiemap_dir / fiemap_name, {
+            "schema": events.SCHEMA, "file_size": event["file_size_before"], "block_size": 4096,
+            "status": "ok", "errno": 0,
+            "extents": [{"logical": 0, "physical": number * 4096,
+                         "length": event["file_size_before"], "flags": 1}],
+        })
+        rows.append({
+            "schema": events.SCHEMA, "experiment": event["experiment"],
+            "workload": event["workload"], "sample": number,
+            "sample_id": f"sample-{number:03d}", "sample_kind": "edit",
+            "control_batch": event_batches[event["event_id"]],
+            "fs_config": config, "event_id": event["event_id"],
+            "case_id": event["case_id"], "relative_path": event["relative_path"],
+            "directory_depth": event["directory_depth"],
+            "file_size_before": event["file_size_before"], "size_bin": event["size_bin"],
+            "offset": event["offset"], "logical_bytes_changed": event["write_bytes"],
+            "dirty_blocks": event["dirty_blocks"],
+            "copyup_bytes": event["file_size_before"], "shared_bytes": 0,
+            "allocated_bytes_total": event["file_size_before"],
+            "copyup_amplification": event["file_size_before"] / event["write_bytes"],
+            "copied_up_parent_dirs": event["directory_depth"],
+            "sectors_before": 1000,
+            "sectors_after": 1008 + event["directory_depth"] * 8,
+            "physical_io_bytes": 4096 + event["directory_depth"] * 4096,
+            "settle_timeout": False, "pre_sha256": event["expected_before_sha256"],
+            "post_sha256": event["expected_after_sha256"],
+            "upper_sha256": event["expected_after_sha256"],
+            "lower_sha256": event["expected_before_sha256"],
+            "fiemap_path": f"fiemap/{fiemap_name}", "fiemap_block_size": 4096,
+            "status": "ok", "errno": 0, "invalid_reason": None,
+        })
+    write_jsonl(directory / "raw.jsonl", rows)
+    controls = []
+    sample = 0
+    for workload, batch, group in batches:
+        template = group[0]
+        for replica in range(1, 4):
+            sample += 1
+            controls.append({
+                "schema": events.SCHEMA, "experiment": template["experiment"],
+                "workload": workload, "sample": sample,
+                "sample_id": f"control-{batch}-{replica}",
+                "sample_kind": "control",
+                "fs_config": config, "template_event_id": template["event_id"],
+                "case_id": template["case_id"],
+                "relative_path": template["relative_path"],
+                "directory_depth": template["directory_depth"],
+                "control_batch": batch, "replica": replica,
+                "sectors_before": 2000, "sectors_after": 2002,
+                "physical_io_bytes": 1024, "settle_timeout": False,
+                "status": "ok", "errno": 0, "invalid_reason": None,
+            })
+    write_jsonl(directory / "controls.jsonl", controls)
+    write_json(directory / "summary.json", {
+        "schema": events.SCHEMA, "preset": preset, "completed": True, "passed": True,
+        "counts": {"ok": len(rows), "invalid": 0, "failed": 0},
+        "control_counts": {"ok": len(controls), "invalid": 0, "failed": 0},
+        "planned_edits": len(rows), "planned_controls": len(controls),
+        "dmesg_failures": [], "finished_at": "test",
+    })
 
 
-def smoke_rows() -> list[dict]:
-    rows = [{
-        "schema": 2,
-        "run": 1,
-        "sample": 1,
-        "warmup": False,
-        "operation": "checkpoint",
-        "source_depth": 128,
-        "target_depth": 129,
-        "request_depth": 129,
-        "rollback_distance": 0,
-        "keep_bottom": 0,
-        "prefix_depth": 0,
-        "request_fd_count": 2,
-        "expected_generation": 1,
-        "generation_after": 1,
-        "cpu_before": -1,
-        "cpu_after": -1,
-        "major_faults": 0,
-        "ioctl_ret": -1,
-        "errno": errno.E2BIG,
-        "ioctl_latency_ns": 0,
-        "status": "expected_reject",
-        "invalid_reason": None,
-    }]
-    sample = 2
-    for operation, depths in (("checkpoint", (1, 127)), ("restore", (1, 128))):
-        for depth in depths:
-            for _ in range(2):
-                rows.append(row(sample, operation, depth, True))
-                sample += 1
-            for _ in range(5):
-                rows.append(row(sample, operation, depth, False))
-                sample += 1
-    return rows
-
-
-def write_run(root: pathlib.Path, rows: list[dict]) -> None:
-    (root / "manifest.json").write_text(
-        json.dumps(smoke_manifest()), encoding="utf-8"
-    )
-    with (root / "raw.jsonl").open("w", encoding="utf-8") as stream:
-        for item in rows:
-            stream.write(json.dumps(item) + "\n")
-    (root / "summary.json").write_text(
-        json.dumps({
-            "schema": 2,
-            "completed": True,
-            "passed": True,
-            "counts": {
-                "ok": sum(item["status"] == "ok" for item in rows),
-                "expected_reject": sum(
-                    item["status"] == "expected_reject" for item in rows
-                ),
-                "invalid": sum(item["status"] == "invalid" for item in rows),
-                "failed": sum(item["status"] == "failed" for item in rows),
-            },
-            "dmesg_failures": [],
-        }),
-        encoding="utf-8",
-    )
-
-
-class AnalyzerTests(unittest.TestCase):
-    def test_plot_style_uses_clean_title_and_readable_axes(self):
-        self.assertNotIn("E2", analyze.PLOT_TITLE)
+class AnalyzeTests(unittest.TestCase):
+    def test_plot_font_and_log_scale_cover_amplification_charts(self) -> None:
         self.assertFalse(set(string.ascii_uppercase) - set(analyze.FONT))
-        low, high, ticks = analyze.linear_plot_bounds([35.0, 205.0])
-        self.assertLessEqual(low, 35.0)
-        self.assertGreaterEqual(high, 205.0)
-        self.assertTrue(all(float(value).is_integer() for value in ticks))
-        self.assertNotEqual(
-            analyze.PLOT_STYLES["checkpoint"]["marker"],
-            analyze.PLOT_STYLES["restore"]["marker"],
+        low, high, ticks = analyze.log2_plot_bounds([1, 85])
+        self.assertLess(low, 0)
+        self.assertGreater(high, 7)
+        self.assertEqual(ticks, list(range(0, 8)))
+        self.assertEqual(analyze.format_amplification_tick(0), "1X")
+        self.assertEqual(analyze.format_amplification_tick(3), "8X")
+        self.assertEqual(analyze.format_amplification_tick(-1), "1/2X")
+        self.assertEqual(set(analyze.FILE_SIZE_STYLES), set(analyze.FILE_SIZE_ORDER))
+        self.assertEqual(set(analyze.PANEL_TITLES), set(analyze.FS_CONFIGS))
+        self.assertEqual(len({
+            style["label"] for style in analyze.FILE_SIZE_STYLES.values()
+        }), len(analyze.FILE_SIZE_ORDER))
+        self.assertTrue(all("AMPLIFICATION" in title and "WRITE SIZE" in title
+                            for title in analyze.PLOT_TITLES.values()))
+        self.assertTrue(all("WARM" not in title and "CACHE" not in title
+                            for title in analyze.PLOT_TITLES.values()))
+
+    def test_amplification_stats_group_exact_cell(self) -> None:
+        rows = [
+            {
+                "status": "ok", "fs_config": "xfs_reflink",
+                "file_size_before": 12288, "logical_bytes_changed": 4096,
+                "copyup_bytes": 4096, "physical_io_bytes": physical,
+            }
+            for physical in (8192, 12288)
+        ]
+        stats = analyze.calculate_amplification_stats(rows)
+        self.assertEqual(len(stats), 2)
+        copyup = next(item for item in stats
+                      if item.metric == "copyup_amplification")
+        physical = next(item for item in stats
+                        if item.metric == "physical_write_amplification")
+        self.assertEqual(copyup.count, 2)
+        self.assertEqual(copyup.p50, 1.0)
+        self.assertEqual(physical.count, 2)
+        self.assertEqual(physical.p50, 2.5)
+
+    def test_percentile_and_bootstrap(self) -> None:
+        self.assertEqual(analyze.percentile([1, 2, 3, 4], 0.5), 2.5)
+        rows = [{"workload": 1, "value": value} for value in (1, 2, 3)]
+        first = analyze.cluster_bootstrap(
+            rows, lambda row: row["value"], statistics.median, ("test",), 50,
         )
+        second = analyze.cluster_bootstrap(
+            rows, lambda row: row["value"], statistics.median, ("test",), 50,
+        )
+        self.assertEqual(first, second)
 
-    def test_complete_smoke_generates_all_artifacts(self):
+    def test_paired_join_reports_missing_and_uses_event_delta(self) -> None:
+        rows = []
+        for config, value in (("ext4", 10), ("xfs_noreflink", 8),
+                              ("xfs_reflink", 3), ("f2fs", 9)):
+            rows.append({
+                "event_id": "e", "workload": 1, "size_bin": "4KiB",
+                "fs_config": config, "status": "ok", "copyup_bytes": value,
+                "physical_io_bytes": value, "physical_io_bytes_corrected": value,
+            })
+        paired, errors_found = analyze.paired_rows(rows)
+        self.assertFalse(errors_found)
+        metadata = next(row for row in paired if row["comparison"] == "xfs_metadata"
+                        and row["metric"] == "copyup_bytes")
+        reflink = next(row for row in paired if row["comparison"] == "reflink"
+                       and row["metric"] == "copyup_bytes")
+        self.assertEqual(metadata["bytes_saved"], 2)
+        self.assertEqual(reflink["bytes_saved"], 5)
+        _, errors_found = analyze.paired_rows(rows[:-1])
+        self.assertTrue(errors_found)
+
+    def test_end_to_end_smoke_artifacts(self) -> None:
+        event_values = events.generate_events("smoke")
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            write_run(root, smoke_rows())
-            stats, errors = analyze.analyze(root)
-            self.assertEqual(errors, [])
-            self.assertEqual(len(stats), 4)
-            self.assertTrue(all(item.count == 5 for item in stats))
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            stats, errors_found = analyze.analyze(root, replicates=20)
+            self.assertFalse(errors_found)
+            self.assertEqual(len(stats), 72)
             analysis_dir = root / "analysis"
-            for name in (
-                "summary.tsv", "latency-vs-depth.tsv", "errno-counts.tsv",
-                "invalid.jsonl", "latency-vs-depth.png",
-            ):
-                self.assertTrue((analysis_dir / name).is_file(), name)
-            self.assertEqual(
-                (analysis_dir / "latency-vs-depth.png").read_bytes()[:8],
-                b"\x89PNG\r\n\x1a\n",
+            expected = {
+                "summary.tsv", "paired-benefit.tsv", "paired-benefit-summary.tsv",
+                "regression.tsv", "noop-sensitivity.tsv", "pairing-errors.tsv",
+                "amplification-summary.tsv", "invalid.jsonl",
+                "copyup-amplification-by-write-size.png",
+                "physical-write-amplification-by-write-size.png", "summary.json",
+            }
+            self.assertEqual({path.name for path in analysis_dir.iterdir()}, expected)
+            self.assertTrue(json.loads(
+                (analysis_dir / "summary.json").read_text(encoding="utf-8")
+            )["passed"])
+            self.assertGreater(
+                (analysis_dir / "copyup-amplification-by-write-size.png").stat().st_size,
+                1000,
             )
-            invalid = (analysis_dir / "invalid.jsonl").read_text(encoding="utf-8")
-            self.assertIn('"status":"expected_reject"', invalid)
+            header = (analysis_dir / "amplification-summary.tsv").read_text(
+                encoding="ascii",
+            ).splitlines()[0]
+            self.assertNotIn("cache_mode", header)
 
-    def test_missing_sample_is_rejected_but_diagnostics_are_written(self):
+    def test_end_to_end_depth_smoke_artifacts(self) -> None:
+        event_values = events.generate_events("depth-smoke")
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            rows = smoke_rows()
-            rows.pop()
-            write_run(root, rows)
-            _, errors = analyze.analyze(root)
-            self.assertTrue(any("sample matrix mismatch" in error for error in errors))
-            self.assertTrue((root / "analysis/errno-counts.tsv").is_file())
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values, "depth-smoke")
+            stats, errors_found = analyze.analyze(root, replicates=20)
+            self.assertEqual(stats, [])
+            self.assertFalse(errors_found)
+            analysis_dir = root / "analysis"
+            expected = {
+                "depth-summary.tsv", "depth-paired.tsv", "depth-paired-summary.tsv",
+                "depth-slope.tsv", "noop-sensitivity.tsv", "pairing-errors.tsv",
+                "invalid.jsonl", "path-depth-physical-write-amplification.png",
+                "path-depth-copyup-amplification.png", "summary.json",
+            }
+            self.assertEqual({path.name for path in analysis_dir.iterdir()}, expected)
+            summary = json.loads(
+                (analysis_dir / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(summary["passed"])
+            self.assertTrue(summary["depth_hypothesis_supported"])
+            self.assertTrue(summary["copyup_depth_invariant"])
+            self.assertEqual(summary["experiment"], "path_depth")
+            paired = (analysis_dir / "depth-paired.tsv").read_text(encoding="ascii")
+            self.assertIn("physical_io_bytes_corrected", paired)
+            self.assertGreater(
+                (analysis_dir / "path-depth-physical-write-amplification.png").stat().st_size,
+                1000,
+            )
 
-    def test_invalid_ok_semantics_are_rejected(self):
+    def test_event_hash_mismatch_is_rejected(self) -> None:
+        event_values = events.generate_events("smoke")
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            rows = smoke_rows()
-            rows[2] = copy.deepcopy(rows[2])
-            rows[2]["generation_after"] = 1
-            write_run(root, rows)
-            _, errors = analyze.analyze(root)
-            self.assertTrue(any("successful-sample contract" in error for error in errors))
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            value = read = json.loads(
+                (root / "xfs_reflink" / "manifest.json").read_text(encoding="ascii")
+            )
+            value = copy.deepcopy(read)
+            value["event_file_sha256"] = "0" * 64
+            write_json(root / "xfs_reflink" / "manifest.json", value)
+            with self.assertRaises(analyze.AnalysisError):
+                analyze.discover(root)
 
-    def test_v2_restore_topology_mismatch_is_rejected(self):
+    def test_non_v2_manifest_is_rejected(self) -> None:
+        event_values = events.generate_events("smoke")
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            rows = smoke_rows()
-            restore = next(item for item in rows if item["operation"] == "restore")
-            restore["keep_bottom"] = 0
-            write_run(root, rows)
-            _, errors = analyze.analyze(root)
-            self.assertTrue(any("restore raw depth semantics" in error for error in errors))
-
-    def test_unknown_raw_field_is_rejected(self):
-        item = smoke_rows()[0]
-        item["extra"] = 1
-        with self.assertRaises(analyze.AnalysisError):
-            analyze.validate_raw_row(item, 1)
+            for config in analyze.FS_CONFIGS:
+                create_result(root, config, event_values)
+            path = root / "ext4" / "manifest.json"
+            value = json.loads(path.read_text(encoding="ascii"))
+            value["deltafs_abi_version"] = 1
+            write_json(path, value)
+            with self.assertRaisesRegex(analyze.AnalysisError, "v2 lifecycle"):
+                analyze.discover(root)
 
 
 if __name__ == "__main__":

@@ -1,2 +1,4 @@
 deltafsctl
 deltafsctl_test
+deltafs_e0_layout_test
+deltafs_e0_ioctl_test

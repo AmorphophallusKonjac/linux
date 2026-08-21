@@ -618,8 +618,8 @@ checkpoint 不再传或重新 `fget` 完整 lower fd 数组。restore 只传 tar
 
 kernel 仍为 target 的派生 layer clone private mounts，因此 builder 成本与 target
 depth 近似线性。mutex commit 本身只移动固定数量的 owner pointer，但完整 ioctl
-不能宣称 O(1)。E2 必须记录 target depth、keep_bottom、prefix depth、request fd count
-和 ioctl latency；controller 端到端耗时属于独立 benchmark，不能混入 E2 ioctl latency。
+不能宣称 O(1)。E1 必须记录 target depth、keep_bottom、prefix depth、request fd count
+和 ioctl latency；controller 端到端耗时属于独立 benchmark，不能混入 E1 ioctl latency。
 
 ## 12. 验证策略
 
@@ -632,10 +632,10 @@ cd /home/wangmingyu/repos/agentfs/fs/deltafs
 make -j"$(nproc)" bzImage modules
 make M=fs/overlayfs W=1
 make C=2 CHECK=sparse M=fs/overlayfs
-make -C tools/deltafs clean v2-tools
-make -C tools/deltafs test-v2-controller
-make -C tools/deltafs check-v2-layout
-make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs clean e0-tools
+make -C tools/deltafs test-e0-controller
+make -C tools/deltafs check-e0-layout
+make -C tools/deltafs check-e0-checkpoints CHECKPOINT_MODE=auto
 for f in tools/deltafs/*.sh; do bash -n "$f"; done
 ```
 
@@ -649,12 +649,12 @@ v2 不拆分 P1 到 P7 阶段脚本。旧 P5--P7 helper/harness 已删除；最�
 
 | 入口 | 运行位置 | 主要证明 |
 |---|---|---|
-| `check-v2-layout` | host | 两种 request 的 size、offset 和 fd index |
-| `check-v2-checkpoints` | host | debug/production build 的 ownership fault-injection 调用点完整性 |
-| `test-v2-controller` | host/guest | format-2 parser、最长公共后缀和失败补偿 |
-| `deltafs_v2_acceptance_test.sh` | QEMU guest | kernel UABI、切换、cache、压力和 teardown |
+| `check-e0-layout` | host | 两种 request 的 size、offset 和 fd index |
+| `check-e0-checkpoints` | host | debug/production build 的 ownership fault-injection 调用点完整性 |
+| `test-e0-controller` | host/guest | format-2 parser、最长公共后缀和失败补偿 |
+| `deltafs_e0_acceptance_test.sh` | QEMU guest | kernel UABI、切换、cache、压力和 teardown |
 
-acceptance harness 内部调用一个 native `deltafs_v2_ioctl_test` helper，并必须覆盖：
+acceptance harness 内部调用一个 native `deltafs_e0_ioctl_test` helper，并必须覆盖：
 
 - checkpoint request 没有 lower fd；
 - `keep_bottom=0/1/all/out-of-range`；
@@ -676,11 +676,11 @@ ioctl binary 和总 acceptance 已在源码树中提供。本开发环境执行�
 QEMU debug guest 中执行的总验收均已通过（2026-08-15）。
 
 第一阶段的独立静态与 QEMU 交接见
-`docs/deltafs_v2_phase1_test.md`。第二阶段总入口为
-`tools/deltafs/deltafs_v2_acceptance_test.sh`，它会额外执行 format-2 controller、
+`docs/deltafs-e0-test-plan.md`。第二阶段总入口为
+`tools/deltafs/deltafs_e0_acceptance_test.sh`，它会额外执行 format-2 controller、
 最长公共后缀、lower 边界和 teardown 验收。
 
-guest 运行态由 `tools/deltafs/deltafs_v2_acceptance_test.sh` 一键编排；用户无需逐条
+guest 运行态由 `tools/deltafs/deltafs_e0_acceptance_test.sh` 一键编排；用户无需逐条
 复制负向矩阵、checkpoint/restore 或 ownership fault-injection 命令。
 
 ### 13.1 Host 构建
@@ -688,8 +688,8 @@ guest 运行态由 `tools/deltafs/deltafs_v2_acceptance_test.sh` 一键编排；
 ```bash
 cd /home/wangmingyu/repos/agentfs/fs/deltafs
 make -j"$(nproc)" bzImage modules
-make -C tools/deltafs clean v2-tools
-make -C tools/deltafs check-v2-layout
+make -C tools/deltafs clean e0-tools
+make -C tools/deltafs check-e0-layout
 ```
 
 debug kernel 至少启用：
@@ -713,8 +713,8 @@ CONFIG_PROVE_LOCKING=y
 arch/x86/boot/bzImage
 fs/overlayfs/overlay.ko
 tools/deltafs/deltafsctl
-tools/deltafs/deltafs_v2_ioctl_test
-tools/deltafs/deltafs_v2_acceptance_test.sh
+tools/deltafs/deltafs_e0_ioctl_test
+tools/deltafs/deltafs_e0_acceptance_test.sh
 ```
 
 ### 13.2 启动 QEMU
@@ -754,7 +754,7 @@ depmod -a
 ulimit -n 192
 
 cd /mnt/host
-make -C tools/deltafs v2-tools
+make -C tools/deltafs e0-tools
 ```
 
 各脚本创建并卸载自己的 mount。手工 smoke 的 mount 形状为：
@@ -778,13 +778,13 @@ umount "$R/merged"
 ```bash
 mkdir -p /mnt/deltafs-v2/disk1/acceptance
 
-make -C tools/deltafs test-v2-controller
-# 期望：All DeltaFS v2 controller unit tests passed
+make -C tools/deltafs test-e0-controller
+# 期望：All DeltaFS E0 controller unit tests passed
 
-sudo tools/deltafs/deltafs_v2_acceptance_test.sh \
+sudo tools/deltafs/deltafs_e0_acceptance_test.sh \
   --backing-root /mnt/deltafs-v2/disk1/acceptance \
   --extra-backing-root /mnt/deltafs-v2/disk2
-# 期望：All DeltaFS v2 acceptance checks passed
+# 期望：All DeltaFS E0 acceptance checks passed
 ```
 
 完整 acceptance summary 至少包含：

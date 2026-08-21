@@ -22,7 +22,7 @@ int main(void)
 	assert(!memcmp(data, again, sizeof(data)));
 	assert(!bench_sha256_buffer(data, sizeof(data), hash));
 	assert(!strcmp(hash,
-		"b862b106a59f04dff1ab9c1d1b3629b525ac6d1f0da37bd95c9722aba018e4dd"));
+		"935a07d4c84bfab12ef2a9f49f728c5f9c131eb66b17d1bc7b99271a4a21a816"));
 	errno = 0;
 	assert(bench_json_escape("toolong", escaped, 2) == -1);
 	assert(errno == ENOSPC);

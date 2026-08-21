@@ -6,44 +6,23 @@ WARNINGS := -Wall -Wextra -Werror
 UAPI_HEADERS ?= ../../../../usr/include
 CPPFLAGS += -I. -I$(UAPI_HEADERS)
 
-all: copyup_bench checkpoint_v2
+all: temporal_write_bench checkpoint_v2
 
-copyup_bench: copyup_bench.c bench_common.c bench_common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) copyup_bench.c bench_common.c -o $@
+temporal_write_bench: temporal_write_bench.c ../e2/bench_common.c \
+		../e2/bench_common.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -I../e2 $< ../e2/bench_common.c -o $@
 
 checkpoint_v2: checkpoint_v2.c deltafs_v2_common.c deltafs_v2_common.h \
 		$(UAPI_HEADERS)/linux/deltafs.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) checkpoint_v2.c \
 		deltafs_v2_common.c -o $@
 
-tests/fiemap_fixture_test: tests/fiemap_fixture_test.c bench_common.c bench_common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< bench_common.c -o $@
-
-tests/blockstat_test: tests/blockstat_test.c bench_common.c bench_common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< bench_common.c -o $@
-
-tests/common_test: tests/common_test.c bench_common.c bench_common.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< bench_common.c -o $@
-
-tests/v2_request_test: tests/v2_request_test.c deltafs_v2_common.c \
-		deltafs_v2_common.h $(UAPI_HEADERS)/linux/deltafs.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) $< deltafs_v2_common.c -o $@
-
-$(UAPI_HEADERS)/linux/deltafs.h: ../../../../include/uapi/linux/deltafs.h
-	$(MAKE) -C ../../../.. headers_install
-
-check: all tests/fiemap_fixture_test tests/blockstat_test tests/common_test \
-		tests/v2_request_test
-	./tests/fiemap_fixture_test
-	./tests/blockstat_test
-	./tests/common_test
-	./tests/v2_request_test
+check: all
 	python3 -m unittest discover tests
 	python3 -m py_compile events.py run.py analyze.py tests/test_events.py \
 		tests/test_runner.py tests/test_analyze.py
 
 clean:
-	$(RM) copyup_bench checkpoint_v2 tests/fiemap_fixture_test tests/blockstat_test \
-		tests/common_test tests/v2_request_test
+	$(RM) temporal_write_bench checkpoint_v2
 
 .PHONY: all check clean

@@ -1,4 +1,8 @@
-switch_once
-tests/request_layout_test
+copyup_bench
+checkpoint_v2
+tests/blockstat_test
+tests/common_test
+tests/fiemap_fixture_test
+tests/v2_request_test
 __pycache__/
 tests/__pycache__/

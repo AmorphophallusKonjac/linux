@@ -15,7 +15,11 @@ readonly REQUIRED_MODULES=(
 	fs/autofs/autofs4.ko
 	fs/nls/nls_iso8859-1.ko
 	fs/overlayfs/overlay.ko
+	fs/f2fs/f2fs.ko
+	crypto/crc32_generic.ko
 	fs/xfs/xfs.ko
+	lib/lz4/lz4_compress.ko
+	lib/lz4/lz4hc_compress.ko
 	lib/libcrc32c.ko
 	fs/netfs/netfs.ko
 	fs/9p/9p.ko
@@ -72,5 +76,5 @@ for module in "${REQUIRED_MODULES[@]}"; do
 		"MINIMAL_MODULES is missing required dependency $module"
 done
 
-printf 'PASS: host/guest minimal module lists contain all %d required modules\n' \
+	printf 'PASS: host/guest minimal module lists contain all %d required modules\n' \
 	"${#REQUIRED_MODULES[@]}"

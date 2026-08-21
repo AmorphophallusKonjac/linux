@@ -1,96 +1,60 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0
-"""DeltaFS E2 fixed-preset switch ioctl benchmark runner."""
+"""DeltaFS E2 fixed-preset copy-up benchmark runner."""
 
 from __future__ import annotations
 
 import argparse
+import collections
 import ctypes
 import datetime as dt
-import errno
-import fcntl
 import hashlib
+import itertools
 import json
 import os
 import pathlib
 import platform
-import random
 import re
-import resource
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
 from typing import Any
 
+import events
 
-SCHEMA = 2
+
+SCHEMA = events.SCHEMA
 DELTAFS_ABI_VERSION = 2
-SEED = 14857
-MAX_LOWERS = 128
+INITIAL_GENERATION = 1
+CHECKPOINT_GENERATION = 2
+COPYUP_SOURCE = "checkpoint_frozen_upper"
+SYNTHETIC_MTIME_NS = 946684800 * 1_000_000_000
 MOUNT_FEATURES = (
-    "index=off",
-    "nfs_export=off",
-    "metacopy=off",
-    "xino=off",
-    "uuid=off",
-    "redirect_dir=nofollow",
+    "index=off", "nfs_export=off", "metacopy=off", "xino=off",
+    "uuid=off", "redirect_dir=nofollow",
 )
-PRESETS = {
-    "smoke": {
-        "checkpoint_depths": (1, 127),
-        "restore_depths": (1, 128),
-        "warmup": 2,
-        "measured": 5,
-        "runs": 1,
-    },
-    "run": {
-        "checkpoint_depths": (1, 2, 4, 8, 16, 32, 64, 127),
-        "restore_depths": (1, 2, 4, 8, 16, 32, 64, 128),
-        "warmup": 20,
-        "measured": 200,
-        "runs": 5,
-    },
+FILESYSTEM_MAGICS = {
+    "ext4": 0xEF53,
+    "xfs": 0x58465342,
+    "f2fs": 0xF2F52010,
 }
-MARKER_PREFIX = ".e2-marker-"
-WRITE_PROBE = ".e2-write-probe"
-WORK_ENTRIES = frozenset(("work", "index"))
-FILESYSTEM_MAGICS = {"ext4": 0xEF53, "xfs": 0x58465342}
+NOOP_INTERVAL = 20
+NOOP_REPETITIONS = 3
+STAT_FIELDS = frozenset((
+    "schema", "kind", "status", "errno", "invalid_reason", "settle_timeout",
+    "sectors_before", "sectors_after", "physical_io_bytes", "pre_sha256",
+    "post_sha256", "upper_sha256", "lower_sha256", "copyup_bytes",
+    "shared_bytes", "allocated_bytes_total", "fiemap_block_size",
+    "fiemap_extent_count",
+))
 DMESG_FAILURE = re.compile(
     r"(?:\bBUG:|\bWARNING:|KASAN|KFENCE|UBSAN|lockdep|"
-    r"RCU (?:stall|warning)|rcu_preempt detected stalls)",
-    re.IGNORECASE,
-)
-
-# Linux asm-generic ioctl encoding used by the DeltaFS UAPI.
-_IOC_WRITE = 1
-_IOC_NRSHIFT = 0
-_IOC_TYPESHIFT = 8
-_IOC_SIZESHIFT = 16
-_IOC_DIRSHIFT = 30
-RESTORE_REQUEST_FORMAT = "=IIQQII130i4Q"
-REQUEST_SIZE = 584
-DELTAFS_IOC_RESTORE = (
-    (_IOC_WRITE << _IOC_DIRSHIFT)
-    | (REQUEST_SIZE << _IOC_SIZESHIFT)
-    | (0xDF << _IOC_TYPESHIFT)
-    | (0x02 << _IOC_NRSHIFT)
+    r"RCU (?:stall|warning)|rcu_preempt detected stalls)", re.IGNORECASE,
 )
 
 
 class E2Error(RuntimeError):
-    """An E2 contract or execution failure."""
-
-
-@dataclass(frozen=True)
-class Attempt:
-    operation: str
-    source_depth: int
-    target_depth: int
-    request_depth: int
-    rollback_distance: int
-    warmup: bool
-    negative: bool = False
+    """An E2 environment or execution contract failure."""
 
 
 class Logs:
@@ -113,12 +77,8 @@ class Logs:
     def subprocess(self, command: list[str], *, cwd: pathlib.Path | None = None,
                    check: bool = True) -> subprocess.CompletedProcess[str]:
         process = subprocess.run(
-            command,
-            cwd=cwd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+            command, cwd=cwd, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
         )
         if process.stdout:
             self.stdout.write(process.stdout)
@@ -135,10 +95,18 @@ class Logs:
         return process
 
 
+def write_all_fd(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count == 0:
+            raise OSError("zero-length write")
+        view = view[count:]
+
+
 def atomic_write_bytes(path: pathlib.Path, data: bytes) -> None:
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    fd = os.open(temporary, flags, 0o600)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
     try:
         write_all_fd(fd, data)
         os.fsync(fd)
@@ -156,22 +124,13 @@ def atomic_write_bytes(path: pathlib.Path, data: bytes) -> None:
         raise
 
 
-def write_all_fd(fd: int, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        written = os.write(fd, view)
-        if written == 0:
-            raise OSError(errno.EIO, "zero-length write")
-        view = view[written:]
-
-
 def atomic_write_json(path: pathlib.Path, value: Any) -> None:
-    data = (json.dumps(value, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
+    data = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("ascii")
     atomic_write_bytes(path, data)
 
 
 def append_jsonl(path: pathlib.Path, value: dict[str, Any]) -> None:
-    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         write_all_fd(fd, data)
@@ -198,8 +157,7 @@ def command_output(command: list[str]) -> str:
 def canonical_new_path(path: pathlib.Path) -> pathlib.Path:
     if path.exists():
         return path.resolve(strict=True)
-    parent = path.parent.resolve(strict=True)
-    return parent / path.name
+    return path.parent.resolve(strict=True) / path.name
 
 
 def is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
@@ -211,15 +169,14 @@ def is_relative_to(path: pathlib.Path, parent: pathlib.Path) -> bool:
 
 
 def find_mount(path: pathlib.Path) -> dict[str, str]:
-    output = command_output(
-        ["findmnt", "-J", "-T", str(path),
-         "-o", "SOURCE,TARGET,FSTYPE,OPTIONS,FS-OPTIONS,UUID"]
-    )
+    output = command_output([
+        "findmnt", "-J", "-T", str(path), "-o",
+        "SOURCE,TARGET,FSTYPE,OPTIONS,FS-OPTIONS,UUID",
+    ])
     try:
-        filesystems = json.loads(output)["filesystems"]
-        entry = filesystems[0]
+        entry = json.loads(output)["filesystems"][0]
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise E2Error("findmnt returned an invalid JSON document") from exc
+        raise E2Error("findmnt returned invalid JSON") from exc
     return {
         "source": str(entry.get("source", "")),
         "target": str(entry.get("target", "")),
@@ -230,45 +187,15 @@ def find_mount(path: pathlib.Path) -> dict[str, str]:
     }
 
 
-def validate_output_dir(path: pathlib.Path) -> pathlib.Path:
-    if path.is_symlink():
-        raise E2Error("OUT_DIR must not be a symlink")
-    canonical = canonical_new_path(path)
-    if canonical.exists():
-        if not canonical.is_dir():
-            raise E2Error("OUT_DIR must be a directory")
-        if any(canonical.iterdir()):
-            raise E2Error("OUT_DIR must not exist or must be empty")
-    else:
-        canonical.mkdir(mode=0o700)
-    return canonical
-
-
-def overlay_mounts() -> list[str]:
-    mounts = []
-    with open("/proc/self/mountinfo", encoding="utf-8") as stream:
-        for line in stream:
-            if " - overlay " in line:
-                fields = line.split()
-                mounts.append(fields[4] if len(fields) > 4 else line.strip())
-    return mounts
-
-
 def filesystem_magic(path: pathlib.Path) -> int:
     class StatFs(ctypes.Structure):
         _fields_ = [
-            ("f_type", ctypes.c_long),
-            ("f_bsize", ctypes.c_long),
-            ("f_blocks", ctypes.c_ulonglong),
-            ("f_bfree", ctypes.c_ulonglong),
-            ("f_bavail", ctypes.c_ulonglong),
-            ("f_files", ctypes.c_ulonglong),
-            ("f_ffree", ctypes.c_ulonglong),
-            ("f_fsid", ctypes.c_int * 2),
-            ("f_namelen", ctypes.c_long),
-            ("f_frsize", ctypes.c_long),
-            ("f_flags", ctypes.c_long),
-            ("f_spare", ctypes.c_long * 4),
+            ("f_type", ctypes.c_long), ("f_bsize", ctypes.c_long),
+            ("f_blocks", ctypes.c_ulonglong), ("f_bfree", ctypes.c_ulonglong),
+            ("f_bavail", ctypes.c_ulonglong), ("f_files", ctypes.c_ulonglong),
+            ("f_ffree", ctypes.c_ulonglong), ("f_fsid", ctypes.c_int * 2),
+            ("f_namelen", ctypes.c_long), ("f_frsize", ctypes.c_long),
+            ("f_flags", ctypes.c_long), ("f_spare", ctypes.c_long * 4),
         ]
 
     value = StatFs()
@@ -282,56 +209,93 @@ def filesystem_magic(path: pathlib.Path) -> int:
     return int(value.f_type)
 
 
-def validate_environment(backing_arg: pathlib.Path,
-                         out_arg: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path, dict[str, str], int]:
+def overlay_mounts() -> list[str]:
+    result = []
+    with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+        for line in stream:
+            if " - overlay " in line:
+                fields = line.split()
+                result.append(fields[4] if len(fields) > 4 else line.strip())
+    return result
+
+
+def filesystem_configuration(mount: dict[str, str]) -> tuple[str, str]:
+    if mount["fstype"] in ("ext4", "f2fs"):
+        return mount["fstype"], ""
+    output = command_output(["xfs_info", mount["target"]])
+    matches = re.findall(r"(?:^|\s)reflink=([01])(?:\s|$)", output)
+    if len(matches) != 1:
+        raise E2Error("xfs_info did not report exactly one reflink=0/1 value")
+    return ("xfs_reflink" if matches[0] == "1" else "xfs_noreflink"), output
+
+
+def validate_device_stat(backing: pathlib.Path, supplied: pathlib.Path) -> pathlib.Path:
+    if supplied.is_symlink():
+        raise E2Error("DEVICE_STAT must be the stat file, not a symlink")
+    canonical = supplied.resolve(strict=True)
+    if not canonical.is_file():
+        raise E2Error("DEVICE_STAT must be a readable regular sysfs file")
+    device = os.stat(backing).st_dev
+    major_minor = f"{os.major(device)}:{os.minor(device)}"
+    sys_device = pathlib.Path("/sys/dev/block") / major_minor
+    try:
+        expected = (sys_device.resolve(strict=True) / "stat").resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise E2Error(f"backing device has no sysfs stat: {major_minor}") from exc
+    if canonical != expected:
+        raise E2Error(
+            f"DEVICE_STAT does not match BACKING_DIR device {major_minor}: "
+            f"expected {expected}, got {canonical}"
+        )
+    fields = canonical.read_text(encoding="ascii").split()
+    if len(fields) < 7 or any(not field.isdecimal() for field in fields[:7]):
+        raise E2Error("DEVICE_STAT has an invalid block-stat record")
+    return canonical
+
+
+def validate_output_dir(path: pathlib.Path) -> pathlib.Path:
+    if path.is_symlink():
+        raise E2Error("OUT_DIR must not be a symlink")
+    canonical = canonical_new_path(path)
+    if canonical.exists():
+        if not canonical.is_dir() or any(canonical.iterdir()):
+            raise E2Error("OUT_DIR must not exist or must be an empty directory")
+    else:
+        canonical.mkdir(mode=0o700)
+    return canonical
+
+
+def validate_environment(backing_arg: pathlib.Path, device_arg: pathlib.Path,
+                         out_arg: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path,
+                                                        pathlib.Path, dict[str, str],
+                                                        str, str]:
     if os.geteuid() != 0:
         raise E2Error("E2 must run as root")
-    if not hasattr(time_module(), "CLOCK_MONOTONIC_RAW"):
-        raise E2Error("CLOCK_MONOTONIC_RAW is unavailable")
-    time_module().clock_gettime(time_module().CLOCK_MONOTONIC_RAW)
     for command in ("findmnt", "mount", "umount", "dmesg"):
         if shutil.which(command) is None:
             raise E2Error(f"required command not found: {command}")
     if backing_arg.is_symlink():
         raise E2Error("BACKING_DIR must not be a symlink")
     backing = backing_arg.resolve(strict=True)
-    if not backing.is_dir():
-        raise E2Error("BACKING_DIR must be a real directory")
-    if any(backing.iterdir()):
-        raise E2Error("BACKING_DIR must be empty")
+    if not backing.is_dir() or any(backing.iterdir()):
+        raise E2Error("BACKING_DIR must be a real empty directory")
     out_candidate = canonical_new_path(out_arg)
     if is_relative_to(out_candidate, backing):
         raise E2Error("OUT_DIR must not be inside BACKING_DIR")
     if overlay_mounts():
         raise E2Error("refusing to run while an OverlayFS mount exists")
     mount = find_mount(backing)
-    if mount["fstype"] not in ("ext4", "xfs"):
-        raise E2Error(
-            f"BACKING_DIR must be on ext4 or XFS, found {mount['fstype']!r}"
-        )
-    magic = filesystem_magic(backing)
-    if magic != FILESYSTEM_MAGICS[mount["fstype"]]:
-        raise E2Error(
-            f"findmnt/statfs filesystem mismatch: {mount['fstype']} magic=0x{magic:x}"
-        )
-    if not os.access(backing, os.R_OK | os.W_OK | os.X_OK):
-        raise E2Error("BACKING_DIR is not accessible")
-    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-    if soft_limit < 192:
-        raise E2Error("RLIMIT_NOFILE must be at least 192")
-    affinity = sorted(os.sched_getaffinity(0))
-    if not affinity:
-        raise E2Error("the process has no available CPU")
-    os.sched_setaffinity(0, {affinity[0]})
+    if mount["fstype"] not in FILESYSTEM_MAGICS or \
+            filesystem_magic(backing) != FILESYSTEM_MAGICS[mount["fstype"]]:
+        raise E2Error("BACKING_DIR must be on matching ext4, XFS, or F2FS")
+    if mount["fstype"] == "xfs" and shutil.which("xfs_info") is None:
+        raise E2Error("required command not found: xfs_info")
+    device = validate_device_stat(backing, device_arg)
+    fs_config, xfs_info = filesystem_configuration(mount)
     out_dir = validate_output_dir(out_arg)
-    return backing, out_dir, mount, affinity[0]
-
-
-def time_module():
-    # Kept behind a function so host-safe tests can exercise preset logic
-    # without patching module globals.
-    import time
-    return time
+    if out_dir.stat().st_dev == backing.stat().st_dev:
+        raise E2Error("OUT_DIR must be on a different device from BACKING_DIR")
+    return backing, device, out_dir, mount, fs_config, xfs_info
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -342,217 +306,73 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def kernel_config() -> tuple[str, str]:
+def kernel_config_sha256() -> str:
     candidates = (
-        pathlib.Path("/proc/config.gz"),
-        pathlib.Path(f"/boot/config-{platform.release()}"),
+        pathlib.Path("/proc/config.gz"), pathlib.Path(f"/boot/config-{platform.release()}"),
         pathlib.Path(__file__).resolve().parents[4] / ".config",
     )
     for candidate in candidates:
         if candidate.is_file():
-            return str(candidate), sha256_file(candidate)
-    return "", ""
+            return sha256_file(candidate)
+    return ""
 
 
-def git_commit(repo_root: pathlib.Path) -> str:
+def git_commit() -> str:
+    root = pathlib.Path(__file__).resolve().parents[4]
     process = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True,
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
     )
     return process.stdout.strip() if process.returncode == 0 else "unknown"
 
 
-def build_manifest(preset_name: str, mount: dict[str, str], cpu: int) -> dict[str, Any]:
-    preset = PRESETS[preset_name]
-    repo_root = pathlib.Path(__file__).resolve().parents[4]
-    _, config_hash = kernel_config()
-    clocksource_path = pathlib.Path(
-        "/sys/devices/system/clocksource/clocksource0/current_clocksource"
-    )
-    clocksource = clocksource_path.read_text(encoding="utf-8").strip() \
-        if clocksource_path.is_file() else "unknown"
+def build_manifest(preset: str, event_path: pathlib.Path,
+                   values: list[dict[str, Any]],
+                   mount: dict[str, str], fs_config: str, xfs_info: str,
+                   device_arg: pathlib.Path, device: pathlib.Path) -> dict[str, Any]:
+    configuration = events.PRESETS[preset]
     return {
         "schema": SCHEMA,
-        "deltafs_abi_version": DELTAFS_ABI_VERSION,
-        "preset": preset_name,
-        "seed": SEED,
-        "git_commit": git_commit(repo_root),
+        "preset": preset,
+        "experiment": configuration["experiment"],
+        "seed": events.SEED,
+        "event_file": event_path.name,
+        "event_file_sha256": sha256_file(event_path),
+        "event_count": len(values),
+        "git_commit": git_commit(),
         "kernel_release": platform.release(),
-        "kernel_config_sha256": config_hash,
+        "kernel_config_sha256": kernel_config_sha256(),
         "fs_type": mount["fstype"],
+        "fs_config": fs_config,
         "fs_uuid": mount["uuid"],
         "backing_source": mount["source"],
         "backing_mount_options": mount["options"],
-        "deltafs_mount_options": list(MOUNT_FEATURES),
-        "cpu": cpu,
-        "clocksource": clocksource,
+        "xfs_info": xfs_info,
+        "device_stat": str(device_arg.absolute()),
+        "canonical_device_stat": str(device),
+        "overlay_mount_options": list(MOUNT_FEATURES),
+        "deltafs_abi_version": DELTAFS_ABI_VERSION,
+        "initial_generation": INITIAL_GENERATION,
+        "checkpoint_generation": CHECKPOINT_GENERATION,
+        "copyup_source": COPYUP_SOURCE,
         "started_at": utc_now(),
-        "depth_matrix": {
-            "checkpoint": list(preset["checkpoint_depths"]),
-            "restore": list(preset["restore_depths"]),
-        },
-        "warmup_count": preset["warmup"],
-        "measured_count": preset["measured"],
-        "independent_runs": preset["runs"],
+        "legal_cells": [[size * 1024, dirty] for size, dirty in events.legal_cells()],
+        "experiment_cells": [
+            [size * 1024, dirty, depth]
+            for size, dirty, depth in events.experiment_cells(preset)
+        ],
+        "directory_depths": list(
+            events.DIRECTORY_DEPTHS
+            if configuration["experiment"] == "path_depth" else (0,)
+        ),
+        "samples_per_cell": configuration["samples"],
+        "independent_workloads": configuration["workloads"],
+        "noop_interval": NOOP_INTERVAL,
+        "noop_repetitions": NOOP_REPETITIONS,
+        "settle_interval_ms": 100,
+        "settle_stable_comparisons": 3,
+        "settle_timeout_ms": 10000,
     }
-
-
-def planned_attempts(preset_name: str, run_number: int) -> list[Attempt]:
-    preset = PRESETS[preset_name]
-    warmups: list[Attempt] = []
-    measured: list[Attempt] = []
-    for operation, depths in (
-        ("checkpoint", preset["checkpoint_depths"]),
-        ("restore", preset["restore_depths"]),
-    ):
-        for depth in depths:
-            source_depth = depth if operation == "checkpoint" else MAX_LOWERS
-            target_depth = depth + 1 if operation == "checkpoint" else depth
-            request_depth = target_depth
-            rollback = 0 if operation == "checkpoint" else MAX_LOWERS - depth
-            for _ in range(preset["warmup"]):
-                warmups.append(Attempt(operation, source_depth, target_depth,
-                                       request_depth, rollback, True))
-            for _ in range(preset["measured"]):
-                measured.append(Attempt(operation, source_depth, target_depth,
-                                        request_depth, rollback, False))
-    randomizer = random.Random(SEED + run_number)
-    randomizer.shuffle(warmups)
-    randomizer.shuffle(measured)
-    negative = Attempt("checkpoint", MAX_LOWERS, MAX_LOWERS + 1,
-                       MAX_LOWERS + 1, 0, False, True)
-    return [negative, *warmups, *measured]
-
-
-def marker(run_number: int, attempt: Attempt, layer: int) -> tuple[str, str]:
-    name = f"{MARKER_PREFIX}{layer:03d}"
-    identity = (
-        f"schema={SCHEMA};seed={SEED};run={run_number};"
-        f"operation={attempt.operation};source={attempt.source_depth};"
-        f"target={attempt.target_depth};layer={layer}"
-    )
-    digest = hashlib.sha256(identity.encode()).hexdigest()
-    return name, f"{identity};sha256={digest}\n"
-
-
-def source_lower_paths(sample_dir: pathlib.Path, depth: int) -> list[pathlib.Path]:
-    paths = [sample_dir / "layers" / f"l{layer:03d}"
-             for layer in range(depth - 1, 0, -1)]
-    paths.append(sample_dir / "base")
-    return paths
-
-
-def target_lower_paths(sample_dir: pathlib.Path, attempt: Attempt) -> list[pathlib.Path]:
-    if attempt.operation == "restore":
-        return source_lower_paths(sample_dir, attempt.target_depth)
-    frozen = sample_dir / "layers" / f"l{attempt.source_depth:03d}"
-    return [frozen, *source_lower_paths(sample_dir, attempt.source_depth)]
-
-
-def expected_markers(run_number: int, attempt: Attempt, depth: int) -> dict[str, str]:
-    return dict(marker(run_number, attempt, layer) for layer in range(depth))
-
-
-def create_sample(sample_dir: pathlib.Path, run_number: int, attempt: Attempt) -> None:
-    (sample_dir / "base").mkdir(parents=True)
-    (sample_dir / "layers").mkdir()
-    (sample_dir / "active" / "upper").mkdir(parents=True)
-    (sample_dir / "active" / "work").mkdir()
-    (sample_dir / "next" / "upper").mkdir(parents=True)
-    (sample_dir / "next" / "work").mkdir()
-    (sample_dir / "merged").mkdir()
-    for layer in range(attempt.source_depth):
-        directory = sample_dir / "base" if layer == 0 else \
-            sample_dir / "layers" / f"l{layer:03d}"
-        if layer:
-            directory.mkdir()
-        name, contents = marker(run_number, attempt, layer)
-        marker_path = directory / name
-        marker_path.write_text(contents, encoding="ascii")
-        marker_path.chmod(0o444)
-    backing_dev = sample_dir.stat().st_dev
-    for path in sample_dir.rglob("*"):
-        if path.stat().st_dev != backing_dev:
-            raise E2Error(f"sample path crosses a backing superblock: {path}")
-
-
-def mount_source(sample_dir: pathlib.Path, attempt: Attempt, logs: Logs) -> None:
-    relative_lowers = [str(path.relative_to(sample_dir))
-                       for path in source_lower_paths(sample_dir, attempt.source_depth)]
-    options = [
-        f"lowerdir={':'.join(relative_lowers)}",
-        "upperdir=active/upper",
-        "workdir=active/work",
-        *MOUNT_FEATURES,
-    ]
-    logs.subprocess(
-        ["mount", "-t", "overlay", "overlay", "-o", ",".join(options), "merged"],
-        cwd=sample_dir,
-    )
-    mount = find_mount(sample_dir / "merged")
-    if mount["fstype"] != "overlay":
-        raise E2Error("mounted source is not OverlayFS")
-    # show_options omits explicit values that equal the kernel default. Reject
-    # a conflicting value when one is reported; the mount command above still
-    # supplies every required DeltaFS option explicitly.
-    option_set = set(mount["options"].split(","))
-    conflicts = {
-        "index=on", "nfs_export=on", "metacopy=on", "xino=on",
-        "xino=auto", "uuid=on", "uuid=auto", "redirect_dir=on",
-        "redirect_dir=follow", "redirect_dir=off",
-    }
-    reported = sorted(option_set & conflicts)
-    if reported:
-        raise E2Error(f"mounted OverlayFS feature mismatch: {reported}")
-
-
-def merged_markers(merged: pathlib.Path) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for entry in merged.iterdir():
-        if entry.name.startswith(MARKER_PREFIX):
-            if not entry.is_file():
-                raise E2Error(f"marker is not a regular file: {entry}")
-            result[entry.name] = entry.read_text(encoding="ascii")
-        elif entry.name != WRITE_PROBE:
-            raise E2Error(f"unexpected merged entry: {entry.name}")
-    return result
-
-
-def verify_merged(merged: pathlib.Path, expected: dict[str, str]) -> None:
-    actual = merged_markers(merged)
-    if actual != expected:
-        missing = sorted(set(expected) - set(actual))
-        extra = sorted(set(actual) - set(expected))
-        wrong = sorted(name for name in set(actual) & set(expected)
-                       if actual[name] != expected[name])
-        raise E2Error(
-            f"merged marker mismatch: missing={missing} extra={extra} wrong={wrong}"
-        )
-
-
-def lower_snapshot(sample_dir: pathlib.Path) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    candidates = [sample_dir / "base"]
-    candidates.extend(sorted((sample_dir / "layers").glob("l[0-9][0-9][0-9]")))
-    for directory in candidates:
-        stat = directory.stat()
-        markers = sorted(directory.glob(f"{MARKER_PREFIX}*"))
-        result[str(directory)] = {
-            "inode": stat.st_ino,
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "markers": [
-                {
-                    "name": path.name,
-                    "inode": path.stat().st_ino,
-                    "size": path.stat().st_size,
-                    "mtime_ns": path.stat().st_mtime_ns,
-                    "sha256": sha256_file(path),
-                }
-                for path in markers
-            ],
-        }
-    return result
 
 
 def syncfs(path: pathlib.Path) -> None:
@@ -569,308 +389,230 @@ def syncfs(path: pathlib.Path) -> None:
         os.close(fd)
 
 
-def write_spec(sample_dir: pathlib.Path, attempt: Attempt, cpu: int) -> pathlib.Path:
-    lower_prefix: list[pathlib.Path] = []
-    keep_bottom = attempt.target_depth if attempt.operation == "restore" else 0
-    all_paths = [sample_dir / "merged", sample_dir / "next" / "upper",
-                 sample_dir / "next" / "work", *lower_prefix]
-    if any(len(str(path)) >= 4096 for path in all_paths):
-        raise E2Error("an E2 switch path reaches PATH_MAX")
-    spec = {
-        "schema": SCHEMA,
-        "operation": attempt.operation,
-        "cpu": cpu,
-        "source_depth": attempt.source_depth,
-        "expected_generation": 1,
-        "keep_bottom": keep_bottom,
-        "merged": str(sample_dir / "merged"),
-        "upper": str(sample_dir / "next" / "upper"),
-        "work": str(sample_dir / "next" / "work"),
-        "lower_prefix": [str(path) for path in lower_prefix],
-    }
-    spec_path = sample_dir / "spec.json"
-    atomic_write_json(spec_path, spec)
-    return spec_path
+def sample_id(event: dict[str, Any], sample_number: int) -> str:
+    return f"w{event['workload']:02d}-s{sample_number:05d}-{event['event_id']}"
 
 
-def prepare_spec(sample_dir: pathlib.Path, attempt: Attempt, cpu: int) -> pathlib.Path:
-    if attempt.operation == "checkpoint" and not attempt.negative:
-        frozen = sample_dir / "layers" / f"l{attempt.source_depth:03d}"
-        (sample_dir / "active" / "upper").rename(frozen)
-    return write_spec(sample_dir, attempt, cpu)
+def create_sample(sample_dir: pathlib.Path, event: dict[str, Any] | None) -> None:
+    (sample_dir / "base").mkdir(parents=True)
+    (sample_dir / "generation-1" / "upper").mkdir(parents=True)
+    (sample_dir / "generation-1" / "work").mkdir()
+    (sample_dir / "generation-2" / "upper").mkdir(parents=True)
+    (sample_dir / "generation-2" / "work").mkdir()
+    (sample_dir / "layers").mkdir()
+    (sample_dir / "merged").mkdir()
+    if event is not None:
+        before, _ = events.event_images(event)
+        target = sample_dir / "generation-1" / "upper" / event["relative_path"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        upper = sample_dir / "generation-1" / "upper"
+        for parent in target.parents:
+            if parent == upper:
+                break
+            parent.chmod(0o755)
+        target.write_bytes(before)
+        target.chmod(0o644)
+        os.utime(target, ns=(SYNTHETIC_MTIME_NS, SYNTHETIC_MTIME_NS))
+        for parent in target.parents:
+            if parent == upper:
+                break
+            os.utime(parent, ns=(SYNTHETIC_MTIME_NS, SYNTHETIC_MTIME_NS))
+        with target.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if sha256_file(target) != event["expected_before_sha256"]:
+            raise E2Error("generated generation-1 upper preimage hash mismatch")
+    syncfs(sample_dir)
+    device = sample_dir.stat().st_dev
+    for path in sample_dir.rglob("*"):
+        if path.stat().st_dev != device:
+            raise E2Error(f"sample path crosses backing superblock: {path}")
 
 
-def run_driver(switch_once: pathlib.Path, spec_path: pathlib.Path,
-               result_path: pathlib.Path, logs: Logs) -> dict[str, Any]:
-    process = logs.subprocess(
-        [str(switch_once), str(spec_path), str(result_path)], check=False
+def mount_sample(sample_dir: pathlib.Path, logs: Logs) -> None:
+    options = [
+        "lowerdir=base", "upperdir=generation-1/upper",
+        "workdir=generation-1/work", *MOUNT_FEATURES,
+    ]
+    logs.subprocess(
+        ["mount", "-t", "overlay", "overlay", "-o", ",".join(options), "merged"],
+        cwd=sample_dir,
     )
-    if not result_path.is_file():
-        raise E2Error(f"switch_once exited {process.returncode} without result.json")
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise E2Error("switch_once produced invalid result JSON") from exc
-    required = {
-        "schema", "ioctl_attempted", "ioctl_ret", "errno",
-        "ioctl_latency_ns", "cpu_before", "cpu_after", "major_faults",
-        "status", "invalid_reason",
-    }
-    if set(result) != required or result["schema"] != SCHEMA or \
-            result["status"] not in ("ok", "expected_reject", "invalid", "failed"):
-        raise E2Error(f"switch_once result violates schema {SCHEMA}")
-    if process.returncode and result["status"] != "failed":
-        raise E2Error(
-            f"switch_once exited {process.returncode} for {result['status']} result"
-        )
-    return result
-
-
-def invalid_generation_request(generation: int) -> bytearray:
-    import struct
-    values = [REQUEST_SIZE, DELTAFS_ABI_VERSION, 0, generation, 1, 2]
-    values.extend([-1] * (MAX_LOWERS + 2))
-    values.extend([0] * 4)
-    request = bytearray(struct.pack(RESTORE_REQUEST_FORMAT, *values))
-    if len(request) != REQUEST_SIZE:
-        raise E2Error("Python DeltaFS request layout mismatch")
-    return request
-
-
-def expect_ioctl_errno(fd: int, generation: int, expected_errno: int) -> None:
-    request = invalid_generation_request(generation)
-    try:
-        fcntl.ioctl(fd, DELTAFS_IOC_RESTORE, request, True)
-    except OSError as exc:
-        if exc.errno == expected_errno:
-            return
-        raise E2Error(
-            f"generation {generation}: expected errno {expected_errno}, got {exc.errno}"
-        ) from exc
-    raise E2Error(
-        f"generation {generation}: expected errno {expected_errno}, got success"
-    )
-
-
-def probe_generation(merged: pathlib.Path, generation: int) -> int:
-    fd = os.open(merged, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        expect_ioctl_errno(fd, generation - 1, errno.ESTALE)
-        expect_ioctl_errno(fd, generation, errno.EBADF)
-    finally:
-        os.close(fd)
-    return generation
-
-
-def verify_workdir(work: pathlib.Path) -> None:
-    entries = {entry.name for entry in work.iterdir()}
-    if not entries.issubset(WORK_ENTRIES):
-        raise E2Error(f"fresh work contains non-OverlayFS entries: {sorted(entries)}")
-
-
-def unescape_mount_option(value: str) -> str:
-    result = bytearray()
-    index = 0
-    encoded = value.encode("utf-8")
-    while index < len(encoded):
-        if encoded[index:index + 1] == b"\\" and index + 3 < len(encoded) and \
-                all(48 <= byte <= 55 for byte in encoded[index + 1:index + 4]):
-            result.append(int(encoded[index + 1:index + 4], 8))
-            index += 4
-        else:
-            result.append(encoded[index])
-            index += 1
-    return result.decode("utf-8")
-
-
-def verify_published_paths(sample_dir: pathlib.Path, attempt: Attempt) -> None:
     mount = find_mount(sample_dir / "merged")
-    options = split_mount_options(mount["fs_options"])
-    lowers = [unescape_mount_option(option.split("=", 1)[1])
-              for option in options if option.startswith("lowerdir+=")]
-    expected_lowers = [str(path) for path in target_lower_paths(sample_dir, attempt)]
-    upper = [unescape_mount_option(option.split("=", 1)[1])
-             for option in options if option.startswith("upperdir=")]
-    work = [unescape_mount_option(option.split("=", 1)[1])
-            for option in options if option.startswith("workdir=")]
-    if lowers != expected_lowers:
-        raise E2Error("published lowerdir order differs from the switch request")
-    if upper != [str(sample_dir / "next" / "upper")] or \
-            work != [str(sample_dir / "next" / "work")]:
-        raise E2Error("published upperdir/workdir differ from the switch request")
-
-
-def split_mount_options(value: str) -> list[str]:
-    options: list[str] = []
-    start = 0
-    index = 0
-    while index < len(value):
-        if value[index] == "\\" and index + 3 < len(value) and \
-                all("0" <= character <= "7" for character in value[index + 1:index + 4]):
-            index += 4
-            continue
-        if value[index] == ",":
-            options.append(value[start:index])
-            start = index + 1
-        index += 1
-    options.append(value[start:])
-    return options
-
-
-def verify_success(sample_dir: pathlib.Path, run_number: int,
-                   attempt: Attempt, before: dict[str, dict[str, Any]]) -> int:
-    target_marker_depth = attempt.source_depth if attempt.operation == "checkpoint" \
-        else attempt.target_depth
-    expected = expected_markers(run_number, attempt, target_marker_depth)
-    verify_merged(sample_dir / "merged", expected)
-    verify_published_paths(sample_dir, attempt)
-    if lower_snapshot(sample_dir) != before:
-        raise E2Error("lower metadata or marker content changed across switch")
-    fresh_upper = sample_dir / "next" / "upper"
-    if any(fresh_upper.iterdir()):
-        raise E2Error("fresh upper is not empty before write probe")
-    verify_workdir(sample_dir / "next" / "work")
-    probe_path = sample_dir / "merged" / WRITE_PROBE
-    probe_contents = "deltafs-e2-write-probe\n"
-    probe_path.write_text(probe_contents, encoding="ascii")
-    upper_probe = fresh_upper / WRITE_PROBE
-    if not upper_probe.is_file() or upper_probe.read_text(encoding="ascii") != probe_contents:
-        raise E2Error("write probe did not land in the fresh upper")
-    for directory in (sample_dir / "base", sample_dir / "layers", sample_dir / "active"):
-        if any(directory.rglob(WRITE_PROBE)):
-            raise E2Error("write probe appeared outside the fresh upper")
-    return probe_generation(sample_dir / "merged", 2)
-
-
-def verify_negative(sample_dir: pathlib.Path, run_number: int,
-                    attempt: Attempt, before: dict[str, dict[str, Any]],
-                    result: dict[str, Any]) -> int:
-    if result["status"] != "expected_reject" or result["errno"] != errno.E2BIG or \
-            result["ioctl_attempted"]:
-        raise E2Error("checkpoint@128 was not rejected by E2BIG preflight")
-    verify_merged(
-        sample_dir / "merged",
-        expected_markers(run_number, attempt, attempt.source_depth),
-    )
-    if lower_snapshot(sample_dir) != before:
-        raise E2Error("checkpoint@128 preflight changed lower metadata")
-    if any((sample_dir / "next" / "upper").iterdir()) or \
-            any((sample_dir / "next" / "work").iterdir()):
-        raise E2Error("checkpoint@128 preflight changed fresh switch paths")
-    # No generation-probe ioctl is allowed in this negative sample. Since the
-    # driver did not issue an ioctl and every observable path is unchanged,
-    # generation remains at the mount-time value.
-    return 1
-
-
-def raw_base(run_number: int, sample_number: int, attempt: Attempt) -> dict[str, Any]:
-    return {
-        "schema": SCHEMA,
-        "run": run_number,
-        "sample": sample_number,
-        "warmup": attempt.warmup,
-        "operation": attempt.operation,
-        "source_depth": attempt.source_depth,
-        "target_depth": attempt.target_depth,
-        "request_depth": attempt.request_depth,
-        "rollback_distance": attempt.rollback_distance,
-        "keep_bottom": attempt.target_depth
-        if attempt.operation == "restore" else 0,
-        "prefix_depth": 0,
-        "request_fd_count": 2,
-        "expected_generation": 1,
-        "generation_after": None,
-        "cpu_before": -1,
-        "cpu_after": -1,
-        "major_faults": 0,
-        "ioctl_ret": -1,
-        "errno": 0,
-        "ioctl_latency_ns": 0,
-        "status": "failed",
-        "invalid_reason": None,
+    if mount["fstype"] != "overlay":
+        raise E2Error("sample mount is not OverlayFS")
+    conflicting = {
+        "index=on", "nfs_export=on", "metacopy=on", "xino=on", "xino=auto",
+        "uuid=on", "uuid=auto", "redirect_dir=on", "redirect_dir=follow",
+        "redirect_dir=off",
     }
+    found = sorted(set(mount["options"].split(",")) & conflicting)
+    if found:
+        raise E2Error(f"mounted OverlayFS feature mismatch: {found}")
 
 
-def merge_driver_result(row: dict[str, Any], result: dict[str, Any]) -> None:
-    for key in (
-        "cpu_before", "cpu_after", "major_faults", "ioctl_ret", "errno",
-        "ioctl_latency_ns", "status", "invalid_reason",
-    ):
-        row[key] = result[key]
-
-
-def exception_reason(stage: str, exc: BaseException) -> str:
-    text = str(exc).replace("\n", " ")
-    return f"{stage}: {text}"[:1000]
+def checkpoint_sample(sample_dir: pathlib.Path, helper: pathlib.Path, logs: Logs) -> None:
+    initial_upper = sample_dir / "generation-1" / "upper"
+    frozen_upper = sample_dir / "layers" / "g1"
+    os.rename(initial_upper, frozen_upper)
+    logs.subprocess([
+        str(helper), str(sample_dir / "merged"), str(INITIAL_GENERATION),
+        str(sample_dir / "generation-2" / "upper"),
+        str(sample_dir / "generation-2" / "work"),
+    ])
 
 
 def unmount_sample(sample_dir: pathlib.Path, logs: Logs) -> None:
     logs.subprocess(["umount", "--", str(sample_dir / "merged")])
 
 
-def run_attempt(backing: pathlib.Path, switch_once: pathlib.Path,
-                raw_path: pathlib.Path, logs: Logs, cpu: int,
-                run_number: int, sample_number: int,
-                attempt: Attempt) -> dict[str, Any]:
-    tag = "negative" if attempt.negative else ("warmup" if attempt.warmup else "measured")
-    operation = "cp" if attempt.operation == "checkpoint" else "rs"
-    sample_id = (
-        f"r{run_number:02d}-{operation}-d{attempt.request_depth:03d}-"
-        f"{tag}-s{sample_number:05d}"
-    )
-    sample_dir = backing / ".e2-work" / sample_id
-    result_path = sample_dir / "result.json"
-    row = raw_base(run_number, sample_number, attempt)
-    mounted = False
-    stage = "prepare_sample"
-    preserve = True
+def read_helper_result(path: pathlib.Path, kind: str) -> dict[str, Any]:
     try:
-        create_sample(sample_dir, run_number, attempt)
-        spec_path = write_spec(sample_dir, attempt, cpu)
-        stage = "mount_source"
-        mount_source(sample_dir, attempt, logs)
-        mounted = True
-        stage = "verify_source"
-        verify_merged(
-            sample_dir / "merged",
-            expected_markers(run_number, attempt, attempt.source_depth),
+        value = json.loads(path.read_text(encoding="ascii"))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeError) as exc:
+        raise E2Error(f"invalid helper result: {path}") from exc
+    if not isinstance(value, dict) or set(value) != STAT_FIELDS or \
+            value["schema"] != SCHEMA or value["kind"] != kind or \
+            value["status"] not in ("ok", "invalid", "failed"):
+        raise E2Error("helper result schema mismatch")
+    return value
+
+
+def raw_base(event: dict[str, Any], number: int, identity: str,
+             fs_config: str, batch: int, fiemap: pathlib.Path,
+             out_dir: pathlib.Path) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA, "experiment": event["experiment"],
+        "workload": event["workload"], "sample": number,
+        "sample_id": identity, "sample_kind": "edit", "control_batch": batch,
+        "fs_config": fs_config,
+        "event_id": event["event_id"], "case_id": event["case_id"],
+        "relative_path": event["relative_path"],
+        "directory_depth": event["directory_depth"],
+        "file_size_before": event["file_size_before"],
+        "size_bin": event["size_bin"], "offset": event["offset"],
+        "logical_bytes_changed": event["write_bytes"],
+        "dirty_blocks": event["dirty_blocks"], "copyup_bytes": 0,
+        "shared_bytes": 0, "allocated_bytes_total": 0,
+        "copyup_amplification": 0.0, "copied_up_parent_dirs": 0,
+        "sectors_before": 0, "sectors_after": 0,
+        "physical_io_bytes": 0, "settle_timeout": False, "pre_sha256": "",
+        "post_sha256": "", "upper_sha256": "", "lower_sha256": "",
+        "fiemap_path": str(fiemap.relative_to(out_dir)), "fiemap_block_size": 0,
+        "status": "failed", "errno": 0, "invalid_reason": None,
+    }
+
+
+def merge_edit_result(row: dict[str, Any], result: dict[str, Any]) -> None:
+    for key in (
+        "copyup_bytes", "shared_bytes", "allocated_bytes_total", "sectors_before",
+        "sectors_after", "physical_io_bytes", "settle_timeout", "pre_sha256",
+        "post_sha256", "upper_sha256", "lower_sha256", "fiemap_block_size",
+        "status", "errno", "invalid_reason",
+    ):
+        row[key] = result[key]
+    if row["logical_bytes_changed"]:
+        row["copyup_amplification"] = (
+            row["copyup_bytes"] / row["logical_bytes_changed"]
         )
-        stage = "prepare_request"
-        spec_path = prepare_spec(sample_dir, attempt, cpu)
-        before = lower_snapshot(sample_dir)
-        syncfs(sample_dir / "merged")
-        stage = "run_once"
-        result = run_driver(switch_once, spec_path, result_path, logs)
-        merge_driver_result(row, result)
-        stage = "verify_target"
-        if attempt.negative:
-            row["generation_after"] = verify_negative(
-                sample_dir, run_number, attempt, before, result
-            )
-        elif result["ioctl_ret"] == 0:
-            row["generation_after"] = verify_success(
-                sample_dir, run_number, attempt, before
-            )
-        if attempt.negative:
-            if result["status"] != "expected_reject":
-                raise E2Error("negative gate did not return expected_reject")
-        elif result["status"] != "ok":
-            raise E2Error(f"switch_once returned {result['status']}")
-        stage = "umount"
+
+
+def exception_reason(stage: str, error: BaseException) -> str:
+    return f"{stage}: {str(error).replace(chr(10), ' ')}"[:1000]
+
+
+def verify_upper_tree(sample_dir: pathlib.Path, event: dict[str, Any]) -> int:
+    upper = sample_dir / "generation-2" / "upper"
+    target = upper / event["relative_path"]
+    relative = pathlib.PurePosixPath(event["relative_path"])
+    expected = {relative.as_posix()}
+    current = relative.parent
+    while current != pathlib.PurePosixPath("."):
+        expected.add(current.as_posix())
+        current = current.parent
+    actual = {path.relative_to(upper).as_posix() for path in upper.rglob("*")}
+    if actual != expected:
+        raise E2Error(
+            f"generation-2 upper tree mismatch: expected={sorted(expected)} "
+            f"actual={sorted(actual)}"
+        )
+    if not target.is_file() or target.is_symlink():
+        raise E2Error("generation-2 upper target is not a regular file")
+    parents = []
+    for path in target.parents:
+        if path == upper:
+            break
+        parents.append(path)
+    if len(parents) != event["directory_depth"] or any(
+            not path.is_dir() or path.is_symlink() for path in parents):
+        raise E2Error("generation-2 upper parent chain differs from directory_depth")
+    return len(parents)
+
+
+def verify_control_tree(sample_dir: pathlib.Path, event: dict[str, Any]) -> None:
+    upper = sample_dir / "generation-2" / "upper"
+    if any(upper.iterdir()):
+        raise E2Error("no-op control materialized generation-2 upper entries")
+    relative = event["relative_path"]
+    frozen = sample_dir / "layers" / "g1" / relative
+    merged = sample_dir / "merged" / relative
+    if sha256_file(frozen) != event["expected_before_sha256"] or \
+            sha256_file(merged) != event["expected_before_sha256"]:
+        raise E2Error("no-op control changed the event preimage")
+
+
+def run_edit(backing: pathlib.Path, helper: pathlib.Path,
+             checkpoint_helper: pathlib.Path, out_dir: pathlib.Path,
+             raw_path: pathlib.Path, logs: Logs, device: pathlib.Path,
+             fs_config: str, event: dict[str, Any], number: int,
+             batch: int) -> dict[str, Any]:
+    identity = sample_id(event, number)
+    sample_dir = backing / ".e2-work" / identity
+    result_path = sample_dir / "helper-result.json"
+    fiemap = out_dir / "fiemap" / f"{identity}.json"
+    row = raw_base(event, number, identity, fs_config, batch, fiemap, out_dir)
+    mounted = False
+    preserve = True
+    stage = "prepare_sample"
+    try:
+        create_sample(sample_dir, event)
+        stage = "mount_sample"
+        mount_sample(sample_dir, logs)
+        mounted = True
+        stage = "checkpoint_sample"
+        checkpoint_sample(sample_dir, checkpoint_helper, logs)
+        stage = "run_helper"
+        relative = event["relative_path"]
+        command = [
+            str(helper), "edit", "--merged", str(sample_dir / "merged"),
+            "--target", str(sample_dir / "merged" / relative),
+            "--upper", str(sample_dir / "generation-2" / "upper" / relative),
+            "--lower", str(sample_dir / "layers" / "g1" / relative),
+            "--device-stat", str(device), "--file-size", str(event["file_size_before"]),
+            "--offset", str(event["offset"]), "--write-bytes", str(event["write_bytes"]),
+            "--payload-seed", str(event["payload_seed"]),
+            "--expected-before", event["expected_before_sha256"],
+            "--expected-after", event["expected_after_sha256"],
+            "--fiemap-out", str(fiemap),
+            "--out", str(result_path),
+        ]
+        process = logs.subprocess(command, check=False)
+        result = read_helper_result(result_path, "edit")
+        merge_edit_result(row, result)
+        if process.returncode or result["status"] != "ok":
+            raise E2Error(f"copyup_bench returned {result['status']}")
+        stage = "verify_upper_tree"
+        row["copied_up_parent_dirs"] = verify_upper_tree(sample_dir, event)
+        stage = "unmount_sample"
         unmount_sample(sample_dir, logs)
         mounted = False
         preserve = False
-    except BaseException as exc:
-        if row["status"] == "ok" or row["status"] == "expected_reject":
+    except BaseException as error:
+        if row["status"] == "ok":
             row["status"] = "invalid"
-        elif row["status"] not in ("invalid", "failed"):
-            row["status"] = "failed"
         existing = row.get("invalid_reason")
-        reason = exception_reason(stage, exc)
+        reason = exception_reason(stage, error)
         row["invalid_reason"] = f"{existing}; {reason}" if existing else reason
-        if isinstance(exc, OSError) and exc.errno and not row["errno"]:
-            row["errno"] = exc.errno
-        logs.error(f"FAIL: {sample_id}: {row['invalid_reason']}")
+        logs.error(f"FAIL: {identity}: {row['invalid_reason']}")
     finally:
         if not mounted and (sample_dir / "merged").is_dir():
             mounted = os.path.ismount(sample_dir / "merged")
@@ -878,30 +620,110 @@ def run_attempt(backing: pathlib.Path, switch_once: pathlib.Path,
             try:
                 unmount_sample(sample_dir, logs)
                 mounted = False
-            except BaseException as exc:
+            except BaseException as error:
                 row["status"] = "failed"
-                reason = exception_reason("umount_after_failure", exc)
-                existing = row.get("invalid_reason")
-                row["invalid_reason"] = f"{existing}; {reason}" if existing else reason
-        if not preserve and row["status"] in ("ok", "expected_reject"):
+                reason = exception_reason("umount_after_failure", error)
+                row["invalid_reason"] = f"{row['invalid_reason']}; {reason}"
+        if not preserve and row["status"] == "ok":
             try:
                 shutil.rmtree(sample_dir)
-            except BaseException as exc:
+            except BaseException as error:
                 row["status"] = "failed"
-                row["invalid_reason"] = exception_reason("remove_sample", exc)
+                row["invalid_reason"] = exception_reason("remove_sample", error)
         append_jsonl(raw_path, row)
     return row
 
 
+def run_control(backing: pathlib.Path, helper: pathlib.Path,
+                checkpoint_helper: pathlib.Path, controls_path: pathlib.Path,
+                logs: Logs, device: pathlib.Path, fs_config: str,
+                event: dict[str, Any], sample: int, batch: int,
+                replica: int) -> dict[str, Any]:
+    workload = event["workload"]
+    identity = f"w{workload:02d}-b{batch:04d}-control-{replica}"
+    sample_dir = backing / ".e2-work" / identity
+    result_path = sample_dir / "helper-result.json"
+    row = {
+        "schema": SCHEMA, "experiment": event["experiment"],
+        "workload": workload, "sample": sample, "sample_id": identity,
+        "sample_kind": "control", "fs_config": fs_config,
+        "template_event_id": event["event_id"], "case_id": event["case_id"],
+        "relative_path": event["relative_path"],
+        "directory_depth": event["directory_depth"],
+        "control_batch": batch, "replica": replica, "sectors_before": 0,
+        "sectors_after": 0, "physical_io_bytes": 0, "settle_timeout": False,
+        "status": "failed", "errno": 0, "invalid_reason": None,
+    }
+    mounted = False
+    preserve = True
+    stage = "prepare_control"
+    try:
+        create_sample(sample_dir, event)
+        stage = "mount_control"
+        mount_sample(sample_dir, logs)
+        mounted = True
+        stage = "checkpoint_control"
+        checkpoint_sample(sample_dir, checkpoint_helper, logs)
+        stage = "run_control_helper"
+        process = logs.subprocess([
+            str(helper), "control", "--merged", str(sample_dir / "merged"),
+            "--device-stat", str(device), "--out", str(result_path),
+        ], check=False)
+        result = read_helper_result(result_path, "control")
+        for key in ("sectors_before", "sectors_after", "physical_io_bytes",
+                    "settle_timeout", "status", "errno", "invalid_reason"):
+            row[key] = result[key]
+        if process.returncode or result["status"] != "ok":
+            raise E2Error(f"control helper returned {result['status']}")
+        stage = "verify_control_tree"
+        verify_control_tree(sample_dir, event)
+        stage = "unmount_control"
+        unmount_sample(sample_dir, logs)
+        mounted = False
+        preserve = False
+    except BaseException as error:
+        if row["status"] == "ok":
+            row["status"] = "invalid"
+        existing = row.get("invalid_reason")
+        reason = exception_reason(stage, error)
+        row["invalid_reason"] = f"{existing}; {reason}" if existing else reason
+        logs.error(f"FAIL: {identity}: {row['invalid_reason']}")
+    finally:
+        if not mounted and (sample_dir / "merged").is_dir():
+            mounted = os.path.ismount(sample_dir / "merged")
+        if mounted:
+            try:
+                unmount_sample(sample_dir, logs)
+            except BaseException as error:
+                row["status"] = "failed"
+                row["invalid_reason"] = exception_reason("umount_control_failure", error)
+        if not preserve and row["status"] == "ok":
+            try:
+                shutil.rmtree(sample_dir)
+            except BaseException as error:
+                row["status"] = "failed"
+                row["invalid_reason"] = exception_reason("remove_control", error)
+        append_jsonl(controls_path, row)
+    return row
+
+
+def planned_batches(values: list[dict[str, Any]]) -> list[tuple[int, int, list[dict[str, Any]]]]:
+    result = []
+    for workload, group_iterator in itertools.groupby(
+            values, key=lambda value: value["workload"]):
+        group = list(group_iterator)
+        for start in range(0, len(group), NOOP_INTERVAL):
+            result.append((workload, start // NOOP_INTERVAL + 1,
+                           group[start:start + NOOP_INTERVAL]))
+    return result
+
+
 def read_dmesg(logs: Logs) -> str:
-    process = subprocess.run(
-        ["dmesg"], text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, check=False,
-    )
+    process = subprocess.run(["dmesg"], text=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, check=False)
     if process.returncode:
         if process.stderr:
             logs.stderr.write(process.stderr)
-            logs.stderr.flush()
         raise E2Error("cannot read dmesg as root")
     return process.stdout
 
@@ -918,157 +740,192 @@ def new_dmesg(before: str, after: str) -> str:
 
 
 def summarize(manifest: dict[str, Any], rows: list[dict[str, Any]],
-              dmesg_failures: list[dict[str, Any]], completed: bool) -> dict[str, Any]:
-    counts = {status: 0 for status in ("ok", "expected_reject", "invalid", "failed")}
-    for row in rows:
-        counts[row["status"]] += 1
-    preset = PRESETS[manifest["preset"]]
-    cells = len(preset["checkpoint_depths"]) + len(preset["restore_depths"])
-    planned_ok = preset["runs"] * cells * (preset["warmup"] + preset["measured"])
-    planned_reject = preset["runs"]
+              controls: list[dict[str, Any]], dmesg_failures: list[dict[str, Any]],
+              completed: bool) -> dict[str, Any]:
+    counts = collections.Counter(row["status"] for row in rows)
+    control_counts = collections.Counter(row["status"] for row in controls)
+    cells = len(events.experiment_cells(manifest["preset"]))
+    planned_batches_per_workload = (
+        cells * manifest["samples_per_cell"] + NOOP_INTERVAL - 1
+    ) // NOOP_INTERVAL
+    planned_batches_count = (
+        planned_batches_per_workload * manifest["independent_workloads"]
+    )
+    planned_controls = planned_batches_count * NOOP_REPETITIONS
     passed = (
-        completed
-        and counts == {
-            "ok": planned_ok,
-            "expected_reject": planned_reject,
-            "invalid": 0,
-            "failed": 0,
-        }
+        completed and len(rows) == manifest["event_count"] and counts == {"ok": len(rows)}
+        and len(controls) == planned_controls and control_counts == {"ok": len(controls)}
         and not dmesg_failures
     )
     return {
-        "schema": SCHEMA,
-        "preset": manifest["preset"],
-        "completed": completed,
+        "schema": SCHEMA, "preset": manifest["preset"], "completed": completed,
         "passed": passed,
-        "planned_ok": planned_ok,
-        "planned_expected_reject": planned_reject,
-        "counts": counts,
-        "dmesg_failures": dmesg_failures,
-        "finished_at": utc_now(),
+        "counts": {status: counts[status] for status in ("ok", "invalid", "failed")},
+        "control_counts": {
+            status: control_counts[status] for status in ("ok", "invalid", "failed")
+        },
+        "planned_edits": manifest["event_count"], "planned_controls": planned_controls,
+        "dmesg_failures": dmesg_failures, "finished_at": utc_now(),
     }
 
 
-def run_benchmark(preset_name: str, backing: pathlib.Path, out_dir: pathlib.Path,
-                  mount: dict[str, str], cpu: int) -> int:
+def run_benchmark(preset: str, backing: pathlib.Path,
+                  device: pathlib.Path,
+                  device_arg: pathlib.Path, out_dir: pathlib.Path,
+                  mount: dict[str, str], fs_config: str, xfs_info: str) -> int:
     logs = Logs(out_dir)
+    helper = pathlib.Path(__file__).resolve().with_name("copyup_bench")
+    checkpoint_helper = pathlib.Path(__file__).resolve().with_name("checkpoint_v2")
+    event_path = out_dir / "events.jsonl"
     raw_path = out_dir / "raw.jsonl"
-    try:
-        manifest = build_manifest(preset_name, mount, cpu)
-        atomic_write_json(out_dir / "manifest.json", manifest)
-    except BaseException as exc:
-        logs.error(f"FAIL: E2 manifest: {exc}")
-        logs.close()
-        return 1
-    switch_once = pathlib.Path(__file__).resolve().with_name("switch_once")
+    controls_path = out_dir / "controls.jsonl"
+    values = events.generate_events(preset)
+    atomic_write_bytes(event_path, events.canonical_jsonl(values))
+    manifest = build_manifest(
+        preset, event_path, values, mount, fs_config, xfs_info,
+        device_arg, device,
+    )
+    atomic_write_json(out_dir / "manifest.json", manifest)
     rows: list[dict[str, Any]] = []
+    controls: list[dict[str, Any]] = []
     dmesg_failures: list[dict[str, Any]] = []
     completed = True
     dmesg_before = ""
     dmesg_cursor = ""
     try:
-        if not switch_once.is_file() or not os.access(switch_once, os.X_OK):
-            raise E2Error("switch_once is not built; run make -C tools/deltafs e2-bench")
+        if not helper.is_file() or not os.access(helper, os.X_OK):
+            raise E2Error("copyup_bench is not built; run make -C tools/deltafs e2-bench")
+        if not checkpoint_helper.is_file() or not os.access(checkpoint_helper, os.X_OK):
+            raise E2Error("checkpoint_v2 is not built; run make -C tools/deltafs e2-bench")
+        (out_dir / "fiemap").mkdir()
         (backing / ".e2-work").mkdir(mode=0o700)
         dmesg_before = read_dmesg(logs)
         dmesg_cursor = dmesg_before
         atomic_write_bytes(out_dir / "dmesg-before.log", dmesg_before.encode())
-        for run_number in range(1, PRESETS[preset_name]["runs"] + 1):
-            logs.info(f"E2: independent run {run_number}/{PRESETS[preset_name]['runs']}")
-            run_failed = False
-            for sample_number, attempt in enumerate(
-                    planned_attempts(preset_name, run_number), start=1):
-                row = run_attempt(
-                    backing, switch_once, raw_path, logs, cpu,
-                    run_number, sample_number, attempt,
+        edit_number = 0
+        control_number = 0
+        current_workload = 0
+        run_failed = False
+        for workload, batch, group in planned_batches(values):
+            if workload != current_workload:
+                if current_workload:
+                    after = read_dmesg(logs)
+                    delta = new_dmesg(dmesg_cursor, after)
+                    match = DMESG_FAILURE.search(delta)
+                    if match:
+                        dmesg_failures.append({
+                            "workload": current_workload, "keyword": match.group(0),
+                        })
+                        completed = False
+                        break
+                    dmesg_cursor = after
+                current_workload = workload
+                logs.info(
+                    f"E2: independent workload {workload}/"
+                    f"{events.PRESETS[preset]['workloads']}"
+                )
+            for event in group:
+                edit_number += 1
+                row = run_edit(
+                    backing, helper, checkpoint_helper, out_dir, raw_path, logs,
+                    device, fs_config, event, edit_number, batch,
                 )
                 rows.append(row)
-                if row["status"] not in ("ok", "expected_reject"):
+                if row["status"] != "ok":
                     run_failed = True
                     completed = False
                     break
-            after_run = read_dmesg(logs)
-            try:
-                delta = new_dmesg(dmesg_cursor, after_run)
-                match = DMESG_FAILURE.search(delta)
-                if match:
-                    dmesg_failures.append({
-                        "run": run_number,
-                        "keyword": match.group(0),
-                        "excerpt": delta[max(0, match.start() - 240):match.end() + 480],
-                    })
+            if run_failed:
+                break
+            for replica in range(1, NOOP_REPETITIONS + 1):
+                control_number += 1
+                control = run_control(
+                    backing, helper, checkpoint_helper, controls_path, logs,
+                    device, fs_config, group[0], control_number, batch, replica,
+                )
+                controls.append(control)
+                if control["status"] != "ok":
                     run_failed = True
                     completed = False
-            except E2Error as exc:
-                dmesg_failures.append({"run": run_number, "keyword": "dmesg-overlap",
-                                       "excerpt": str(exc)})
-                run_failed = True
-                completed = False
-            dmesg_cursor = after_run
-            atomic_write_bytes(out_dir / "dmesg-after.log", after_run.encode())
+                    break
             if run_failed:
-                logs.error(f"FAIL: independent run {run_number} stopped")
-            residual_mounts = overlay_mounts()
-            if residual_mounts:
-                completed = False
-                logs.error(
-                    "FAIL: aborting E2 because OverlayFS mounts remain: "
-                    + ", ".join(residual_mounts)
-                )
                 break
-        work_root = backing / ".e2-work"
-        if work_root.is_dir() and not any(work_root.iterdir()):
-            work_root.rmdir()
-    except BaseException as exc:
+        after = read_dmesg(logs)
+        atomic_write_bytes(out_dir / "dmesg-after.log", after.encode())
+        if current_workload and not dmesg_failures:
+            delta = new_dmesg(dmesg_cursor, after)
+            match = DMESG_FAILURE.search(delta)
+            if match:
+                dmesg_failures.append({
+                    "workload": current_workload, "keyword": match.group(0),
+                })
+                completed = False
+        if overlay_mounts():
+            completed = False
+            logs.error("FAIL: E2 left an OverlayFS mount")
+        work = backing / ".e2-work"
+        if work.is_dir() and not any(work.iterdir()):
+            work.rmdir()
+    except BaseException as error:
         completed = False
-        logs.error(f"FAIL: E2 runner: {exc}")
+        logs.error(f"FAIL: E2 runner: {error}")
         if dmesg_before and not (out_dir / "dmesg-after.log").exists():
             try:
-                after = read_dmesg(logs)
-                atomic_write_bytes(out_dir / "dmesg-after.log", after.encode())
+                atomic_write_bytes(out_dir / "dmesg-after.log", read_dmesg(logs).encode())
             except BaseException:
                 pass
-    finally:
-        summary = summarize(manifest, rows, dmesg_failures, completed)
-        atomic_write_json(out_dir / "summary.json", summary)
-        counts = summary["counts"]
-        prefix = "PASS" if summary["passed"] else "FAIL"
-        message = (
-            f"{prefix}: E2 {preset_name} completed; ok={counts['ok']} "
-            f"invalid={counts['invalid']} failed={counts['failed']} "
-            f"expected_reject={counts['expected_reject']}"
-        )
-        if summary["passed"]:
-            logs.info(message)
-        else:
-            logs.error(message)
-        logs.close()
+    summary = summarize(manifest, rows, controls, dmesg_failures, completed)
+    atomic_write_json(out_dir / "summary.json", summary)
+    counts = summary["counts"]
+    prefix = "PASS" if summary["passed"] else "FAIL"
+    message = (
+        f"{prefix}: E2 {preset} {fs_config} completed; ok={counts['ok']} "
+        f"invalid={counts['invalid']} failed={counts['failed']} "
+        f"controls={summary['control_counts']['ok']}"
+    )
+    (logs.info if summary["passed"] else logs.error)(message)
+    logs.close()
     return 0 if summary["passed"] else 1
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Measure DeltaFS checkpoint/restore switch ioctl latency"
+        description="Measure DeltaFS v2 post-checkpoint copy-up and device I/O",
     )
-    parser.add_argument("preset", choices=tuple(PRESETS))
-    parser.add_argument("backing_dir", type=pathlib.Path)
-    parser.add_argument("out_dir", type=pathlib.Path)
-    return parser.parse_args(argv)
+    subparsers = parser.add_subparsers(dest="preset", required=True)
+    smoke = subparsers.add_parser("smoke", help="run two samples per copy-up cell")
+    full = subparsers.add_parser("run", help="run the full copy-up matrix")
+    depth_smoke = subparsers.add_parser(
+        "depth-smoke", help="run two samples per path-depth cell",
+    )
+    depth_full = subparsers.add_parser(
+        "depth-run", help="run the full path-depth experiment",
+    )
+    for subparser in (smoke, full, depth_smoke, depth_full):
+        subparser.add_argument("backing_dir", type=pathlib.Path, metavar="BACKING_DIR")
+        subparser.add_argument("device_stat", type=pathlib.Path, metavar="DEVICE_STAT")
+        subparser.add_argument("out_dir", type=pathlib.Path, metavar="OUT_DIR")
+    parsed = parser.parse_args(argv)
+    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        backing, out_dir, mount, cpu = validate_environment(
-            arguments.backing_dir, arguments.out_dir
+        environment = validate_environment(
+            arguments.backing_dir, arguments.device_stat, arguments.out_dir,
         )
-    except (E2Error, OSError) as exc:
-        print(f"FAIL: E2 environment: {exc}", file=sys.stderr)
+    except (E2Error, OSError) as error:
+        print(f"FAIL: E2 environment: {error}", file=sys.stderr)
         return 2
+    backing, device, out_dir, mount, fs_config, xfs_info = environment
     try:
-        return run_benchmark(arguments.preset, backing, out_dir, mount, cpu)
-    except (E2Error, OSError) as exc:
-        print(f"FAIL: E2 runner: {exc}", file=sys.stderr)
+        return run_benchmark(
+            arguments.preset, backing, device, arguments.device_stat,
+            out_dir, mount, fs_config, xfs_info,
+        )
+    except (E2Error, OSError, events.EventError) as error:
+        print(f"FAIL: E2 runner: {error}", file=sys.stderr)
         return 1
 
 

@@ -30,7 +30,7 @@ Usage: $PROGRAM --backing-root PATH --extra-backing-root PATH
 EOF
 }
 
-log() { printf '[deltafs-v2] %s\n' "$*"; }
+log() { printf '[deltafs-e0] %s\n' "$*"; }
 pass() { printf 'PASS: %s\n' "$*"; }
 skip() { printf 'SKIP: %s\n' "$*"; skipped=1; }
 die() { log "FAIL: $*"; exit 1; }
@@ -63,7 +63,7 @@ done
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(cd -- "$script_dir/../.." && pwd -P)
-helper="$script_dir/deltafs_v2_ioctl_test"
+helper="$script_dir/deltafs_e0_ioctl_test"
 controller="$script_dir/deltafsctl"
 module_path="$repo_root/fs/overlayfs/overlay.ko"
 
@@ -75,7 +75,7 @@ if findmnt -rn -t overlay | grep -q .; then
 	die 'an overlay mount already exists'
 fi
 
-run_dir="$backing_root/v2-acceptance-$(date +%Y%m%d-%H%M%S)-$$"
+run_dir="$backing_root/e0-acceptance-$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p -- "$run_dir"
 exec > >(tee -a "$run_dir/runner.log") 2>&1
 
@@ -117,11 +117,11 @@ cleanup()
 	collect_diagnostics
 	log "results: $run_dir"
 	if ((status == 0 && skipped)); then
-		log 'DeltaFS v2 acceptance completed with skipped capability-dependent checks'; status=4
+		log 'DeltaFS E0 acceptance completed with skipped capability-dependent checks'; status=4
 	elif ((status == 0)); then
-		log 'All DeltaFS v2 acceptance checks passed'
+		log 'All DeltaFS E0 acceptance checks passed'
 	else
-		log "DeltaFS v2 acceptance failed (exit $status)"
+		log "DeltaFS E0 acceptance failed (exit $status)"
 	fi
 	trap - EXIT
 	exit "$status"
@@ -258,9 +258,9 @@ run_fault_injection()
 	die "fault injection did not reach success by $max_fault_nth"
 }
 
-make -C "$script_dir" v2-tools
-make -C "$script_dir" test-v2-controller
-"$script_dir/deltafs_v2_layout_test"
+make -C "$script_dir" e0-tools
+make -C "$script_dir" test-e0-controller
+"$script_dir/deltafs_e0_layout_test"
 [[ -r "$module_path" ]] || make -C "$repo_root" M=fs/overlayfs modules
 [[ -r "$module_path" ]] || die "overlay module was not built: $module_path"
 mountpoint -q "$DEBUGFS" || mount -t debugfs debugfs "$DEBUGFS"

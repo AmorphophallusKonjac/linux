@@ -21,16 +21,16 @@ int main(void)
 	}
 
 	errno = 0;
-	if (!e3_build_checkpoint_request(&request, 10, 11, 0) ||
+	if (!e2_build_checkpoint_request(&request, 10, 11, 0) ||
 	    errno != EINVAL)
 		return 1;
 	errno = 0;
-	if (!e3_build_checkpoint_request(&request, -1, 11, 1) ||
+	if (!e2_build_checkpoint_request(&request, -1, 11, 1) ||
 	    errno != EBADF)
 		return 1;
 
 	memset(&request, 0xa5, sizeof(request));
-	if (e3_build_checkpoint_request(&request, 10, 11, 1) ||
+	if (e2_build_checkpoint_request(&request, 10, 11, 1) ||
 	    request.size != sizeof(request) ||
 	    request.version != DELTAFS_ABI_VERSION || request.flags ||
 	    request.expected_generation != 1 || request.upper_fd != 10 ||
@@ -40,6 +40,6 @@ int main(void)
 		if (request.reserved[i])
 			return 1;
 
-	puts("PASS: E3 DeltaFS v2 checkpoint request layout");
+	puts("PASS: E2 DeltaFS v2 checkpoint request layout");
 	return 0;
 }

@@ -9,19 +9,19 @@
 1. **主线：DeltaFS 独立实验**
    - 热切换 checkpoint/rollback 的正确性。
    - OverlayFS 层切换延迟。
-   - ext4、XFS、XFS+reflink 下的 copy-up 写放大。
-   - ext4、XFS、XFS+reflink 下的物理 I/O。
-2. **增强：论文未单列但复现必须具备的文件系统验证**
-   - 任意历史点回滚、深层栈、打开文件、mmap、并发 copy-up、崩溃后一致性等。
+   - ext4、XFS、XFS+reflink、F2FS 下的 copy-up 写放大。
+   - ext4、XFS、XFS+reflink、F2FS 下的物理 I/O。
+2. **增强：当前支持边界内的文件系统验证**
+   - 任意历史点回滚、深层栈、cache revalidation、故障注入和 teardown。
 3. **后续：需要 DeltaCR 或完整 DeltaBox 的耦合实验**
    - SWE-bench MCTS 每事件 checkpoint/restore。
    - 30 轮 MCTS 端到端开销。
    - RL fan-out 和 GPU occupation。
 
-E2 和 E3 已拆成两个独立 benchmark。E2 的固定 switch-latency preset、当前
+E1 和 E2 已拆成两个独立 benchmark。E1 的固定 switch-latency preset、当前
 128-lower ABI 的 depth 口径和 QEMU 交接见
-[deltafs-e2-test-plan.md](deltafs-e2-test-plan.md)；E3 的 event、FIEMAP/sector counter
-采样和 QEMU 交接见 [deltafs-e3-test-plan.md](deltafs-e3-test-plan.md)。
+[deltafs-e1-test-plan.md](deltafs-e1-test-plan.md)；E2 的 event、FIEMAP/sector counter
+采样和 QEMU 交接见 [deltafs-e2-test-plan.md](deltafs-e2-test-plan.md)。
 
 仅完成文件系统代码时，可以复现论文 Fig. 9 的核心结果和 Table 4 的 `Overlay ioctl switch` 分量；不能把只测 DeltaFS 的结果表述为 Table 2、Fig. 6 或 Fig. 7 的完整 DeltaBox 复现。
 
@@ -158,10 +158,8 @@ Table 2 的完整均值目标如下，单位均为 ms：
 | H2 | layer switch 为亚毫秒级，且 rollback 到任意历史点不复制目录内容 | ioctl latency | Table 4 |
 | H3 | 无 reflink 时 copy-up bytes 随文件大小增长；有 reflink 时主要随实际 dirty block 数增长 | bytes/edit、log-log slope | Fig. 9(a) |
 | H4 | XFS metadata 降低小文件 physical I/O，reflink 进一步降低大文件 physical I/O | loop sectors written/edit | Fig. 9(b) |
-| H5 | checkpoint 前打开的 fd 和 mmap 在 checkpoint 后首次写入时切到新 upper | correctness、首次写延迟 | §4.1.1 |
-| H6 | 并发写同一 stale dentry 不会产生 stale upper、丢写或错误层引用 | stress failure count | §4.1.1 |
-
-H5-H6 是设计关键点，论文没有单独给出评估图；它们应作为性能结果可信的前置门槛。
+论文中的跨切换普通 fd、mmap lazy switch 和并发 data-path 协议不属于当前 DeltaFS
+v2 支持边界，不能列为当前 E0 门禁，也不能用偶然成功的结果声明支持。
 
 ## 5. 实验环境
 
@@ -183,22 +181,23 @@ H5-H6 是设计关键点，论文没有单独给出评估图；它们应作为�
 6. 每个 run 同时记录 load average、CPU frequency、context switches、major/minor faults。
 7. 时间源使用 `clock_gettime(CLOCK_MONOTONIC_RAW)`；不要用 shell `time` 测 0.1 ms 量级 ioctl。
 
-### 5.3 三种 backing filesystem 配置
+### 5.3 四种 E2/E3 backing filesystem 配置
 
-在同一块 NVMe 上创建三个相同大小的 loopback image，每个 image 独占一个 loop device：
+在同一块 NVMe 上创建四个相同大小的 loopback image，每个 image 独占一个 loop device：
 
 | ID | 格式 | 关键参数 | 用途 |
 |---|---|---|---|
-| `ext4_noreflink` | ext4 | 固定 4 KiB block | 无 reflink 基线 |
+| `ext4` | ext4 | 固定 4 KiB block | ext4 基线 |
 | `xfs_noreflink` | XFS | `mkfs.xfs -m reflink=0` | 分离 XFS metadata 效果 |
 | `xfs_reflink` | XFS | `mkfs.xfs -m reflink=1` | DeltaBox 目标配置 |
+| `f2fs` | F2FS | `mkfs.f2fs` | log-structured filesystem 基线 |
 
 要求：
 
-- 三个 image 大小一致，文件系统创建参数写入 manifest。
+- 四个 image 大小一致，文件系统创建参数写入 manifest。
 - 每轮实验都从新格式化或从同一个干净 image snapshot 开始。
 - upperdir 与 workdir 必须位于同一 backing filesystem。
-- 三种配置的 DeltaFS 层拓扑、数据集和操作顺序完全一致。
+- 四种配置的 DeltaFS 层拓扑、数据集和操作顺序完全一致。
 - 测物理 I/O 时一次只挂载和运行一个配置。
 - 不把宿主文件系统的写计入客体 loop device 指标。
 
@@ -206,7 +205,7 @@ H5-H6 是设计关键点，论文没有单独给出评估图；它们应作为�
 
 ```text
 /mnt/deltafs-bench/
-  ext4_noreflink/
+  ext4/
     base/
     layers/0000/
     work/0000/
@@ -214,6 +213,8 @@ H5-H6 是设计关键点，论文没有单独给出评估图；它们应作为�
   xfs_noreflink/
     ...
   xfs_reflink/
+    ...
+  f2fs/
     ...
 ```
 
@@ -283,7 +284,7 @@ Linux block stat 的 sector 单位按 512 bytes 解释；同时记录内核文�
 
 ### 6.4 cache 规范
 
-cache state is not an E3 write-amplification dimension. The single schedule is
+cache state is not an E2 write-amplification dimension. The single schedule is
 cache-neutral: it does not issue per-edit `POSIX_FADV_DONTNEED`, write
 `/proc/sys/vm/drop_caches`, or produce a separate cold-cache sensitivity run.
 
@@ -317,68 +318,44 @@ cache-neutral: it does not issue per-edit `POSIX_FADV_DONTNEED`, write
 
 ## 7. 实验 E0：正确性与一致性门禁
 
-性能测试前必须通过 E0；任何 correctness failure 都使后续性能结果无效。
+性能测试前必须通过当前 E0；任何 correctness failure 都使后续性能结果无效。E0 是
+滚动门禁，直接覆盖更新，不按 ABI 或开发阶段创建平行编号。
 
-### 7.1 状态 oracle
+### 7.1 现行覆盖
 
-每个 checkpoint 保存 manifest，不复制文件数据作为被测机制的一部分。manifest 对 view 做递归遍历，记录：
+Host 静态部分包括 v2 UABI layout、format-2 controller、ownership checkpoint callsite
+和 fast workdir/active-view validation。QEMU acceptance 覆盖 native ABI 负向矩阵、
+checkpoint derived chain、restore prefix/suffix、1/128/129 lower 边界、generation、
+cache revalidation、故障注入、retired-state teardown、反复 mount/unmount、module unload、
+sanitizer、lockdep 和 kmemleak 诊断。
 
-- 相对路径与类型。
-- regular file 的 SHA-256、size、allocated blocks。
-- mode、uid、gid、mtime/ctime（按测试是否要求精确恢复分别比较）。
-- symlink target。
-- hardlink inode group。
-- xattr、ACL。
-- sparse extent map。
+公开入口为：
 
-rollback 后重新生成 manifest，与目标 checkpoint 的 oracle 比较。
+```bash
+make -C tools/deltafs check-e0-layout
+make -C tools/deltafs test-e0-controller
+make -C tools/deltafs check-e0-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs check-e0-fast-path
+make -C tools/deltafs test-e0-acceptance \
+  BACKING_ROOT=/path/on/filesystem-a \
+  EXTRA_BACKING_ROOT=/path/on/filesystem-b
+```
 
-### 7.2 基础操作矩阵
+完整 QEMU 成功终止行为 `All DeltaFS E0 acceptance checks passed`。退出码 4 或 `SKIP`
+不是完整 E0 证据。具体构建、启动、数据盘和取证命令见
+[E0 测试交接](deltafs-e0-test-plan.md)和统一测试用户手册。
 
-对每类操作执行 `checkpoint -> mutate -> checkpoint -> mutate -> restore`：
+### 7.2 明确排除的场景
 
-- 新建、覆盖、append、pwrite、truncate、hole punch。
-- unlink、rename、rename-over-existing、跨目录 rename。
-- mkdir/rmdir、深目录。
-- symlink、hardlink。
-- chmod、chown、xattr、ACL。
-- sparse file、1 B、4 KiB、1 MiB、256 MiB 文件。
-- fsync、fdatasync、syncfs 后回滚。
-- whiteout/opaque directory 语义。
+ioctl 前 workload 必须静止并释放所有非 control fd 引用。E0 不运行或认可以下场景：
 
-覆盖回滚目标：parent、grandparent、非祖先分支、最新 checkpoint、root checkpoint。
+- checkpoint 前打开的普通/目录 fd 跨切换继续访问；
+- cwd、进程 root、writable mmap 或 io_uring 跨切换；
+- checkpoint/restore 与 lookup、copy-up、写 syscall 或 writeback 并发。
 
-### 7.3 打开文件与 mmap lazy switch
+这些能力需要先修改 DeltaFS 支持边界和 data-path 协议，再直接覆盖更新 E0。
 
-至少覆盖：
-
-1. checkpoint 前 `open(O_RDWR)`，checkpoint 后通过旧 fd `pwrite`。
-2. checkpoint 前 `mmap(MAP_SHARED)`，checkpoint 后写入并 `msync`。
-3. checkpoint 前打开后 unlink，checkpoint 后继续写 fd。
-4. checkpoint 前打开，checkpoint 后 rename pathname，再通过旧 fd 写。
-5. 同一 inode 多 fd、多进程共享 fd。
-
-检查旧只读层内容不变，新 upper 有正确 copy-up，rollback 后目标 generation 内容正确。
-
-### 7.4 并发 copy-up 压测
-
-对同一 stale inode，在 checkpoint 后用 2/4/8/16/32 个线程同时写不同 4 KiB 区域；每个并发度运行 1,000 轮。记录：
-
-- EEXIST 次数和处理路径。
-- 最终内容 hash。
-- 是否出现 stale backing mount。
-- kernel warning/oops/lockdep/KASAN 报告。
-
-建议至少运行一次 KASAN+LOCKDEP debug kernel 的 1 小时压力测试，再用 release kernel 做性能实验。
-
-### 7.5 通过条件
-
-- 所有确定性测试 100% 通过。
-- 并发压力测试无内容错误、死锁、内核告警和资源泄漏。
-- `inspect` 返回的层顺序、checkpoint generation 和 oracle 一致。
-- 失败注入后要么 checkpoint 原子成功，要么完整保留旧状态，不出现半切换。
-
-## 8. 实验 E1：真实 SWE-Search 编辑轨迹准备
+## 8. 真实 SWE-Search 编辑轨迹准备（非独立实验编号）
 
 ### 8.1 路径 A：作者 artifact/trace
 
@@ -403,7 +380,7 @@ rollback 后重新生成 manifest，与目标 checkpoint 的 oracle 比较。
 4. 将每个文件系统变更正规化为可重放 event：前置 tree hash、命令/patch、后置 tree hash。
 5. 从事件中抽取修改前大小在 1-256 KiB 的 regular file 编辑。
 6. 按六个大小桶分层；每桶至少 100 个有效事件。若真实轨迹不足，扩大 instance 集，不用复制同一事件凑数。
-7. 同一事件在三个 FS 配置上使用相同顺序回放。
+7. 同一事件在 E2/E3 的四个 FS 配置上使用相同顺序回放；E1 保持三配置切换延迟矩阵。
 
 如果预算有限，最低可用规模为每桶 30 个独立事件，但必须报告置信区间，并标记为 pilot。
 
@@ -418,17 +395,17 @@ rollback 后重新生成 manifest，与目标 checkpoint 的 oracle 比较。
 
 预期：无 reflink的 duplicated bytes 随 file size 增长；XFS+reflink 随 dirty block 数而非 file size 增长。
 
-## 9. 实验 E2：层切换延迟
+## 9. 实验 E1：层切换延迟
 
 ### 9.1 目标
 
 复现 Table 4 的 DeltaFS ioctl switch component，并验证延迟是否随 request lower 数
-增长。E2 不测 controller wrapper、dirty workload、cold cache 或随机分支；这些因素
+增长。E1 不测 controller wrapper、dirty workload、cold cache 或随机分支；这些因素
 需要单独实验，不能混入 ioctl latency。
 
 ### 9.2 测试矩阵
 
-E2 对三种 backing filesystem 分别运行同一个固定 preset：
+E1 对三种 backing filesystem 分别运行同一个固定 preset：
 
 | 操作 | 固定 depth |
 |---|---|
@@ -442,13 +419,13 @@ checkpoint 只做一次 `E2BIG` 用户态 preflight，不进入 latency 分布�
 
 公开命令只接收空的 backing 目录和结果目录：
 
-    sudo python3 tools/deltafs/bench/e2/run.py smoke BACKING_DIR OUT_DIR
-    sudo python3 tools/deltafs/bench/e2/run.py run   BACKING_DIR OUT_DIR
+    sudo python3 tools/deltafs/bench/e1/run.py smoke BACKING_DIR OUT_DIR
+    sudo python3 tools/deltafs/bench/e1/run.py run   BACKING_DIR OUT_DIR
 
 runner 为每个 sample 创建独立 mount、自动构造 topology/request/generation、只计时一次
 ioctl，然后执行 marker、lower immutable、fresh upper 和 generation oracle。所有固定
 参数、raw schema、失败处理及完整 QEMU 命令以
-[deltafs-e2-test-plan.md](deltafs-e2-test-plan.md) 为唯一权威定义。
+[deltafs-e1-test-plan.md](deltafs-e1-test-plan.md) 为唯一权威定义。
 
 ### 9.4 统计
 
@@ -464,28 +441,28 @@ standard deviation 和两级 cluster-bootstrap CI95。只纳入
   checkpoint@128 只得到计划内 `E2BIG`。
 - 结果只表述为 ioctl switch latency，不外推为完整 checkpoint/restore latency。
 
-## 10. 实验 E3：copy-up 写放大和物理 I/O
+## 10. 实验 E2：copy-up 写放大和物理 I/O
 
-E3 已实现为独立固定 preset benchmark。公开入口仅为：
+E2 已实现为独立固定 preset benchmark。公开入口仅为：
 
 ```text
-sudo python3 tools/deltafs/bench/e3/run.py smoke BACKING_DIR DEVICE_STAT OUT_DIR
-sudo python3 tools/deltafs/bench/e3/run.py run BACKING_DIR DEVICE_STAT OUT_DIR
-sudo python3 tools/deltafs/bench/e3/run.py depth-smoke BACKING_DIR DEVICE_STAT OUT_DIR
-sudo python3 tools/deltafs/bench/e3/run.py depth-run BACKING_DIR DEVICE_STAT OUT_DIR
-python3 tools/deltafs/bench/e3/analyze.py RESULTS_ROOT
+sudo python3 tools/deltafs/bench/e2/run.py smoke BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e2/run.py run BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e2/run.py depth-smoke BACKING_DIR DEVICE_STAT OUT_DIR
+sudo python3 tools/deltafs/bench/e2/run.py depth-run BACKING_DIR DEVICE_STAT OUT_DIR
+python3 tools/deltafs/bench/e2/analyze.py RESULTS_ROOT
 ```
 
 runner 自动生成 immutable synthetic event、逐样本创建 fresh OverlayFS mount、采集
 FIEMAP/sector counter/hash/no-op control，并保留失败现场。full run 的单次调用在一个
-测试对象上串行执行 5 个 independent workload；分析器要求三个 filesystem 结果完整且
+测试对象上串行执行 5 个 independent workload；分析器要求四个 filesystem 结果完整且
 event hash 一致。接口、18 个合法 size/dirty-block cell、raw schema、
 统计口径、path-depth 实验及完整 QEMU 命令以
-[deltafs-e3-test-plan.md](deltafs-e3-test-plan.md) 为唯一权威定义。
+[deltafs-e2-test-plan.md](deltafs-e2-test-plan.md) 为唯一权威定义。
 
 ### 10.1 主矩阵
 
-对每一个 trace event，在三个配置上执行：
+对每一个 trace event，在四个配置上执行：
 
 1. 恢复相同的 pre-edit base tree。
 2. 创建空的新 upper/workdir。
@@ -498,7 +475,7 @@ event hash 一致。接口、18 个合法 size/dirty-block cell、raw schema、
 9. 验证 post-edit tree hash。
 10. 保存原始证据并清理到下一个相同起点。
 
-同一个 event 的三种 FS 结果必须通过 `event_id` 配对。配置运行顺序使用详细设计固定的
+同一个 event 的四种 FS 结果必须通过 `event_id` 配对。配置运行顺序使用详细设计固定的
 Latin square，且一次只运行一个配置，避免温度/设备后台行为与配置绑定或污染计数器。
 
 ### 10.2 主图
@@ -508,7 +485,7 @@ Latin square，且一次只运行一个配置，避免温度/设备后台行为�
 - x：`logical_bytes_changed`，即 4、8、16、32 KiB 逻辑写请求。
 - y(a)：`copyup_bytes / logical_bytes_changed`。
 - y(b)：`physical_io_bytes / logical_bytes_changed`。
-- 每幅图按 ext4-no-reflink、XFS-no-reflink、XFS+reflink 分为三个 panel。
+- 每幅图按 ext4、XFS-no-reflink、XFS+reflink、F2FS 分为四个 panel。
 - panel 内按 `file_size_before` 绘制六条序列，不能把不同文件大小隐藏在同一个
   请求大小聚合值中。
 - cache state is absent from the event and artifact schemas; each exact
@@ -521,7 +498,7 @@ p25、p50、p75、p95，方便审计放大率的分子。
 
 ### 10.3 机制分解
 
-用三个配置的成对差分解释来源：
+用两个预注册的 XFS 机制成对差分解释来源；F2FS 作为独立第四 panel 报告：
 
 ```text
 XFS metadata benefit = median(ext4 physical I/O - XFS-no-reflink physical I/O)
@@ -536,13 +513,13 @@ reflink benefit      = median(XFS-no-reflink physical I/O - XFS-reflink physical
 log2(copyup_bytes) = alpha + beta * log2(file_size_before)
 ```
 
-分别报告三种 FS 的 `beta` 和 bootstrap CI。预期 no-reflink 的 `beta` 接近 1，而 reflink 的 `beta` 显著更小。由于真实 edit 的 dirty range 不恒定，这一回归是趋势证据，不应强制 `beta=0`。
+分别报告四种 FS 的 `beta` 和 bootstrap CI。预期非 reflink 文件系统的 `beta` 接近 1，而 reflink 的 `beta` 显著更小。由于真实 edit 的 dirty range 不恒定，这一回归是趋势证据，不应强制 `beta=0`。
 
 ### 10.4 对齐判据
 
 满足以下条件可称为复现 Fig. 9 的核心结论：
 
-1. ext4-no-reflink 与 XFS-no-reflink 的 copy-up 曲线在各桶接近，且都随 file size 明显上升。
+1. ext4 与 XFS-no-reflink 的 copy-up 曲线在各桶接近，且都随 file size 明显上升；F2FS 单独报告，不预注册相对大小方向。
 2. XFS+reflink 的 copy-up 曲线低于两条 no-reflink 曲线，尤其在 64-256 KiB 桶差距扩大。
 3. 1-8 KiB physical I/O 中 XFS 明显低于 ext4；论文参考为约 132 KiB -> 26 KiB。
 4. 128-256 KiB physical I/O 中 XFS+reflink 明显低于 no-reflink；论文参考为约 315 KiB -> 141 KiB。
@@ -561,25 +538,27 @@ generation-1 layer。每个成功样本必须证明 fresh upper 中恰好 materi
 主结果是同一 filesystem/case 相对 depth 0 的 corrected physical-I/O 配对增量及
 bytes-per-directory slope；文件 FIEMAP `copyup_bytes` 是不应随深度变化的负对照。
 分析单独报告 artifact correctness 和 `depth_hypothesis_supported`，不得因趋势不符合
-预期而删除或重跑样本。完整 preset 数量、分析产物和 QEMU 命令以 E3 详细设计为准。
+预期而删除或重跑样本。完整 preset 数量、分析产物和 QEMU 命令以 E2 详细设计为准。
 
-## 11. 实验 E4：时间维度的写延迟放大
+## 11. 实验 E3：时间维度的写延迟放大
 
-E4 是独立的 temporal write-latency benchmark，详细契约见
-[deltafs-e4-test-plan.md](deltafs-e4-test-plan.md)。它不属于 E3 的空间/物理 I/O
-矩阵，也不把 E2 的单次 checkpoint/restore ioctl latency 混入主指标。
+E3 是独立的 temporal write-latency benchmark，详细契约见
+[deltafs-e3-test-plan.md](deltafs-e3-test-plan.md)。它不属于 E2 的空间/物理 I/O
+矩阵，也不把 E1 的单次 checkpoint/restore ioctl latency 混入主指标。
 
-E4 在连续 generation 中执行 `single`、`burst4`、`multi16` 三类 workload，比较
-`upper_resident`、`first_touch` 和 `steady_after_copyup`，并分别覆盖 close/reopen 与
-held-fd 两种访问方式。主结果是用户可见 `open + pwrite + fsync + close` 延迟、按序列
-配对的 `first_touch_ratio`，以及 generation/history-depth 趋势。checkpoint 只用于建立
-下一代，计时区间外；checkpoint 自身仍由 E2 负责 ioctl latency。
+E3 在连续 generation 中执行 `single`、`burst4`、`multi16` 三类 workload，比较
+直接 lower base 文件系统的 `lower_direct`、`upper_resident`、`first_touch` 和
+`steady_after_copyup`，仅覆盖当前支持的
+close/reopen 访问方式。主结果是用户可见 `open + pwrite + fsync + close` 延迟、按序列
+配对的 `first_touch_ratio`，以及相对 `lower_direct` 的 `ratio_to_lower_direct` /
+`overhead_ns` 和 generation/history-depth 趋势。checkpoint 只用于建立
+下一代，计时区间外；checkpoint 自身仍由 E1 负责 ioctl latency。
 
-E4 的原始序列、generation 计数、CPU/clock validity、SHA-256 oracle 和 QEMU 交接必须
-按详细设计执行。原先计划中的 arbitrary rollback/depth sweep 不再占用 E4 编号：正确性
-部分归入 E0，纯 ioctl 的 target-depth 变化归入 E2；需要时作为后续辅助实验另行命名。
+E3 的原始序列、generation 计数、CPU/clock validity、SHA-256 oracle 和 QEMU 交接必须
+按详细设计执行。原先计划中的 arbitrary rollback/depth sweep 不再占用 E3 编号：正确性
+部分归入 E0，纯 ioctl 的 target-depth 变化归入 E1；需要时作为后续辅助实验另行命名。
 
-## 12. 实验 E5：SWE-bench 文件系统回放
+## 12. SWE-bench 文件系统回放（未来工作）
 
 在 DeltaCR 未完成时，把 Table 2 的 coupled C/R 拆成 DeltaFS-only replay：
 
@@ -716,35 +695,35 @@ bench/
 
 - 固定 kernel/DeltaFS commit。
 - 完成 `deltafsctl` 四个接口。
-- 生成三种 backing image。
+- 生成 E1 所需三种 backing image，以及 E2/E3 所需的第四个 F2FS image。
 - 自动生成 manifest。
 
-退出条件：三种 FS 都能完成 mount/checkpoint/restore/inspect。
+退出条件：E1 的三种 FS 与 E2/E3 的四种 FS 都能完成各自的 mount/checkpoint/restore/inspect。
 
 ### M1：正确性
 
-- 完成 E0 基础、open-fd、mmap、并发 copy-up、分支回滚。
+- 完成 E0 ABI、checkpoint/restore、cache、深层栈、故障注入和 teardown。
 - KASAN/LOCKDEP 压测。
 
-退出条件：第 7.5 节全部通过。
+退出条件：第 7.4 节全部通过。
 
 ### M2：微基准
 
-- 执行 E2 层切换延迟。
-- 执行 E4 temporal write-latency sweep。
+- 执行 E1 层切换延迟。
+- 执行 E3 temporal write-latency sweep。
 
 退出条件：原始数据和统计脚本能从干净环境一键重跑，latency 口径完整。
 
 ### M3：写放大
 
 - 准备真实 trace 和 synthetic control。
-- 执行 E3，复刻 Fig. 9。
+- 执行 E2，复刻 Fig. 9。
 
-退出条件：三配置成对事件完全一致，图表和数据校验通过。
+退出条件：四配置成对事件完全一致，图表和数据校验通过。
 
 ### M4：文件系统轨迹回放
 
-- 执行 E5 的 24 轨迹 x 2 replay。
+- 执行 24 轨迹 x 2 replay。
 - 报告 DeltaFS-only 分组结果。
 
 退出条件：所有 rollback oracle 一致，按论文权重生成汇总表。
@@ -759,8 +738,8 @@ bench/
 1. 环境对照表：论文 vs 本次实验。
 2. 正确性矩阵和压力测试统计。
 3. checkpoint/restore ioctl 与 wrapper latency 表。
-4. E2 ioctl latency-vs-target-depth。
-5. E4 latency-vs-generation、latency-vs-history-depth 和 latency amplification。
+4. E1 ioctl latency-vs-target-depth。
+5. E3 latency-vs-generation、latency-vs-history-depth 和 latency amplification。
 6. copy-up amplification vs logical write-request size。
 7. physical-write amplification vs logical write-request size。
 8. 每桶样本量/IQR/CI 表。
@@ -786,12 +765,12 @@ bench/
 ## 19. 最小验收清单
 
 - [ ] Linux 6.8 和 DeltaFS commit、config 已冻结。
-- [ ] ext4-no-reflink、XFS-no-reflink、XFS-reflink 三配置可重复创建。
-- [ ] correctness/open-fd/mmap/concurrency 全部通过。
+- [ ] E2/E3 的 ext4、XFS-no-reflink、XFS-reflink、F2FS 四配置可重复创建。
+- [ ] E0 支持范围内的 correctness、故障注入和 teardown 全部通过。
 - [ ] ioctl 和 wrapper latency 分开记录。
 - [ ] physical I/O 取自专用 loop device 且包含 sync/静默协议。
 - [ ] copy-up bytes 使用 FIEMAP/shared extent 或等价内核计数，不仅是 `du`。
-- [ ] 真实 edit event 在三配置上成对一致。
+- [ ] 真实 edit event 在四配置上成对一致。
 - [ ] 六个大小桶样本数、median、IQR、CI 完整。
 - [ ] Fig. 9 趋势和效应来源被正确解释。
 - [ ] DeltaFS-only 与 coupled DeltaBox 结果明确区分。
@@ -801,7 +780,7 @@ bench/
 
 | 阶段 | 人日 |
 |---|---:|
-| 环境、三种 image、适配器 | 1-2 |
+| 环境、四种 E2/E3 image、适配器 | 1-2 |
 | 正确性与并发压力测试 | 2-3 |
 | 层切换/深度微基准 | 1-2 |
 | 轨迹整理与 Fig. 9 写放大实验 | 3-5 |

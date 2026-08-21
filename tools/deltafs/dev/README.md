@@ -4,7 +4,7 @@
 
 | 脚本 | 在哪跑 | 什么时候跑 |
 |---|---|---|
-| `minimal-modules-test.sh` | host | 静态检查 host/guest 的 11 个最小模块及依赖闭包；`release` 会自动运行 |
+| `minimal-modules-test.sh` | host | 静态检查 host/guest 的 15 个最小模块及依赖闭包；`release` 会自动运行 |
 | `host-build.sh release` | host | 每个新 release 串一次（首次、改 .config/localversion/内核核心后） |
 | `host-build.sh module` | host | 日常改 `fs/overlayfs`、`include/uapi/linux/deltafs.h` 后 |
 | `guest-init.sh` | guest（root） | 每次开机后；显示对齐状态 |

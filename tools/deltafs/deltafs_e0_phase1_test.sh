@@ -29,7 +29,7 @@ EOF
 
 log()
 {
-	printf '[deltafs-v2] %s\n' "$*"
+	printf '[deltafs-e0] %s\n' "$*"
 }
 
 die()
@@ -76,8 +76,8 @@ done
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
-helper="$script_dir/deltafs_v2_ioctl_test"
-layout_test="$script_dir/deltafs_v2_layout_test"
+helper="$script_dir/deltafs_e0_ioctl_test"
+layout_test="$script_dir/deltafs_e0_layout_test"
 module_path="$repo_root/fs/overlayfs/overlay.ko"
 
 for command in awk cat cp date dmesg findmnt grep install lsmod make mkdir \
@@ -154,14 +154,14 @@ cleanup()
 	log "results: $run_dir"
 	if ((status == 0)); then
 		if ((fault_skipped)); then
-			log 'DeltaFS v2 phase1 smoke checks passed (fault injection skipped)'
+			log 'DeltaFS E0 phase1 smoke checks passed (fault injection skipped)'
 		else
-			log 'All DeltaFS v2 phase1 checks passed'
+			log 'All DeltaFS E0 phase1 checks passed'
 		fi
 	elif ((status == 4)); then
-		log 'DeltaFS v2 phase1 completed with skipped checks'
+		log 'DeltaFS E0 phase1 completed with skipped checks'
 	else
-		log "DeltaFS v2 phase1 failed (exit $status)"
+		log "DeltaFS E0 phase1 failed (exit $status)"
 	fi
 	trap - EXIT
 	exit "$status"
@@ -171,7 +171,7 @@ trap cleanup EXIT
 log "source: $repo_root"
 log "results: $run_dir"
 
-make -C "$script_dir" v2-phase1-tools
+make -C "$script_dir" e0-phase1-tools
 "$layout_test"
 [[ -r "$module_path" ]] || make -C "$repo_root" M=fs/overlayfs modules
 [[ -r "$module_path" ]] || die "overlay module was not built: $module_path"

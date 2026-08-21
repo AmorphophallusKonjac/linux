@@ -1,9 +1,14 @@
-# DeltaFS v2 第一阶段测试交接
+# DeltaFS E0 正确性测试交接（v2 ABI）
 
-本文只验收 v2 工作包一：checkpoint/restore UABI、kernel target builder、layer
-source-path 生命周期和 native ioctl helper。format-2 controller、自动化 guest
-acceptance、E2/E3 更新属于后续工作包；旧 v1 P1-P7 binary 使用已删除的 v1 request，
-已经从当前工具树删除，不能作为 v2 结果运行或引用。
+E0 是当前 DeltaFS 唯一的滚动正确性门禁。公开总入口是
+`make -C tools/deltafs test-e0-acceptance`；本文中的 `test-e0-phase1` 是用于定位
+UABI、builder 和 ownership 问题的诊断子集。后续实现变化直接覆盖更新 E0，不创建
+按实现版本平行维护的正确性套件。
+
+本文记录 E0 的 v2 ABI 正确性覆盖：checkpoint/restore UABI、kernel target builder、
+layer source-path 生命周期、format-2 controller、native ioctl helper、故障注入和
+QEMU acceptance。旧 v1 P1-P7 binary 使用已删除的 v1 request，已经从当前工具树删除，
+不能作为当前结果运行或引用。
 
 ## 1. Host 静态构建
 
@@ -12,8 +17,8 @@ cd /home/wangmingyu/repos/agentfs/fs/deltafs
 make -j"$(nproc)" bzImage modules
 make M=fs/overlayfs W=1
 make C=2 CHECK=sparse M=fs/overlayfs
-make -C tools/deltafs clean v2-phase1-tools
-make -C tools/deltafs check-v2-layout
+make -C tools/deltafs clean e0-phase1-tools
+make -C tools/deltafs check-e0-layout
 ```
 
 期望 `bzImage`、`modules`、`W=1`、sparse 和 userspace `-Werror` 均退出 0，layout
@@ -27,19 +32,19 @@ DeltaFS v2 UABI layout checks passed
 
 ```bash
 for f in tools/deltafs/*.sh; do bash -n "$f"; done
-shellcheck tools/deltafs/deltafs_v2_phase1_test.sh
+shellcheck tools/deltafs/deltafs_e0_phase1_test.sh
 for f in \
   include/uapi/linux/deltafs.h \
   fs/overlayfs/ovl_entry.h \
   fs/overlayfs/deltafs.c \
-  tools/deltafs/deltafs_v2_layout_test.c \
-  tools/deltafs/deltafs_v2_ioctl_test.c
+  tools/deltafs/deltafs_e0_layout_test.c \
+  tools/deltafs/deltafs_e0_ioctl_test.c
 do
   scripts/checkpatch.pl --no-tree --strict --file "$f"
 done
 rg -n "call_rcu|kfree_rcu|rcu_assign_pointer|synchronize_rcu" fs/overlayfs/
-make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
-make -C tools/deltafs check-v2-fast-path
+make -C tools/deltafs check-e0-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs check-e0-fast-path
 ```
 
 `super.c` 和 `params.c` 是 upstream 6.8 文件，整文件 strict checkpatch 存在与本次
@@ -68,6 +73,7 @@ qemu-system-x86_64 \
 
 若 root 分区不是 `/dev/vda1`，只调整 `root=`。debug kernel 建议启用
 `CONFIG_OVERLAY_FS=m`、`CONFIG_MODULE_UNLOAD=y`、`CONFIG_DEBUG_FS=y`、
+`CONFIG_F2FS_FS=m`（后续 E2/E3 的 F2FS backing）、
 `CONFIG_DEBUG_KMEMLEAK=y`、`CONFIG_FUNCTION_ERROR_INJECTION=y`、`CONFIG_KASAN=y`、
 `CONFIG_KFENCE=y`、`CONFIG_UBSAN=y` 和 `CONFIG_PROVE_LOCKING=y`。
 
@@ -85,17 +91,21 @@ cd /mnt/host
 第 4 节脚本会自动构建 userspace helper、安装并加载 `overlay.ko`、设置 `ulimit` 和
 执行 layout check。
 
+E0 的两个 backing root 约束不随 E2/E3 新增 F2FS 而改变；E0 仍先作为统一正确性
+门禁运行，随后 E2/E3 才分别在 `ext4`、`xfs_noreflink`、`xfs_reflink` 和 `f2fs`
+上采集结果。
+
 ## 4. 一键运行
 
 第一阶段 guest 测试已经收成一个入口。debug guest 直接执行：
 
 ```bash
 cd /mnt/host
-sudo make -C tools/deltafs test-v2-phase1 \
+sudo make -C tools/deltafs test-e0-phase1 \
   BACKING_ROOT=/mnt/deltafs-v2/disk1/phase1-run
 
 # 等价的直接入口：
-sudo tools/deltafs/deltafs_v2_phase1_test.sh \
+sudo tools/deltafs/deltafs_e0_phase1_test.sh \
   --backing-root /mnt/deltafs-v2/disk1/phase1-run
 ```
 
@@ -104,13 +114,13 @@ checkpoint/restore、source-path rename、generation probe、ownership fault inj
 unmount/module unload 和诊断日志采集。成功输出：
 
 ```text
-All DeltaFS v2 phase1 checks passed
+All DeltaFS E0 phase1 checks passed
 ```
 
 结果保留在 `--backing-root` 下的 `results-*` 目录。没有
 `CONFIG_FUNCTION_ERROR_INJECTION` 或 `fail_function` 时，脚本仍运行 smoke/ABI 测试，
 但返回 4 并明确标记 fault injection 为 `SKIP`；只需要 smoke 时可显式传
-`--no-fault-injection`。脚本自身会构建 `v2-phase1-tools`，因此第 3 节的手工 `make`
+`--no-fault-injection`。脚本自身会构建 `e0-phase1-tools`，因此第 3 节的手工 `make`
 只用于提前检查，不是运行脚本的额外要求。
 
 ## 5. Checkpoint 与 restore（手工分解）
@@ -126,7 +136,7 @@ OPTS="lowerdir=$R/base,upperdir=$R/branches/g1/upper"
 OPTS+=",workdir=$R/branches/g1/work,index=off,nfs_export=off"
 OPTS+=",metacopy=off,xino=off,uuid=off,redirect_dir=nofollow"
 mount -t overlay overlay -o "$OPTS" "$R/merged"
-tools/deltafs/deltafs_v2_ioctl_test negative \
+tools/deltafs/deltafs_e0_ioctl_test negative \
   "$R/merged" 1 "$R/branches/g2/upper" "$R/branches/g2/work"
 # 期望：DeltaFS v2 negative ioctl checks passed
 
@@ -134,21 +144,21 @@ printf 'checkpoint-one\n' > "$R/merged/checkpoint-one"
 sync -f "$R/merged"
 
 mv "$R/branches/g1/upper" "$R/layers/c1"
-tools/deltafs/deltafs_v2_ioctl_test checkpoint \
+tools/deltafs/deltafs_e0_ioctl_test checkpoint \
   "$R/merged" 1 "$R/branches/g2/upper" "$R/branches/g2/work"
 # 期望：checkpoint: generation 1 -> 2
 
 test "$(cat "$R/merged/checkpoint-one")" = checkpoint-one
 printf 'generation-two\n' > "$R/merged/generation-two"
 
-tools/deltafs/deltafs_v2_ioctl_test restore \
+tools/deltafs/deltafs_e0_ioctl_test restore \
   "$R/merged" 2 1 "$R/branches/g3/upper" "$R/branches/g3/work"
 # 期望：restore: generation 2 -> 3 (keep_bottom=1, prefix=0)
 
 test "$(cat "$R/merged/base-only")" = base
 test ! -e "$R/merged/checkpoint-one"
 test ! -e "$R/merged/generation-two"
-tools/deltafs/deltafs_v2_ioctl_test probe-generation "$R/merged" 3
+tools/deltafs/deltafs_e0_ioctl_test probe-generation "$R/merged" 3
 # 期望：generation 3 is current
 
 umount "$R/merged"
@@ -199,7 +209,7 @@ for n in $(seq 1 512); do
   printf '%s\n' "$n" > "$FAIL/space"
   printf '1\n' > "$FAIL/times"
   set +e
-  output=$(tools/deltafs/deltafs_v2_ioctl_test checkpoint \
+  output=$(tools/deltafs/deltafs_e0_ioctl_test checkpoint \
     "$FROOT/merged" 1 "$B/upper" "$B/work" 2>&1)
   status=$?
   set -e
@@ -209,11 +219,11 @@ for n in $(seq 1 512); do
     break
   fi
   grep -Fq 'Cannot allocate memory' <<<"$output"
-  tools/deltafs/deltafs_v2_ioctl_test probe-generation "$FROOT/merged" 1
+  tools/deltafs/deltafs_e0_ioctl_test probe-generation "$FROOT/merged" 1
   test "$(cat "$FROOT/merged/frozen")" = frozen
 done
 test -n "$checkpoint_success"
-tools/deltafs/deltafs_v2_ioctl_test probe-generation "$FROOT/merged" 2
+tools/deltafs/deltafs_e0_ioctl_test probe-generation "$FROOT/merged" 2
 
 restore_success=
 for n in $(seq 1 512); do
@@ -224,7 +234,7 @@ for n in $(seq 1 512); do
   printf '%s\n' "$n" > "$FAIL/space"
   printf '1\n' > "$FAIL/times"
   set +e
-  output=$(tools/deltafs/deltafs_v2_ioctl_test restore \
+  output=$(tools/deltafs/deltafs_e0_ioctl_test restore \
     "$FROOT/merged" 2 1 "$B/upper" "$B/work" 2>&1)
   status=$?
   set -e
@@ -234,13 +244,13 @@ for n in $(seq 1 512); do
     break
   fi
   grep -Fq 'Cannot allocate memory' <<<"$output"
-  tools/deltafs/deltafs_v2_ioctl_test probe-generation "$FROOT/merged" 2
+  tools/deltafs/deltafs_e0_ioctl_test probe-generation "$FROOT/merged" 2
   test "$(cat "$FROOT/merged/frozen")" = frozen
 done
 printf '0\n' > "$FAIL/times"
 printf '!%s\n' "$SYMBOL" > "$FAIL/inject"
 test -n "$restore_success"
-tools/deltafs/deltafs_v2_ioctl_test probe-generation "$FROOT/merged" 3
+tools/deltafs/deltafs_e0_ioctl_test probe-generation "$FROOT/merged" 3
 test "$(cat "$FROOT/merged/base-only")" = base
 test ! -e "$FROOT/merged/frozen"
 printf 'checkpoint_failures=%s restore_failures=%s\n' \

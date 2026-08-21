@@ -248,7 +248,7 @@ int bench_sha256_path(const char *path, char output[65])
 
 int bench_fill_bytes(uint64_t seed, void *buffer, size_t length)
 {
-	static const unsigned char prefix[] = "deltafs-e3-v3\0";
+	static const unsigned char prefix[] = "deltafs-e2-v3\0";
 	unsigned char input[sizeof(prefix) - 1 + 16];
 	unsigned char digest[32];
 	struct sha256_context context;

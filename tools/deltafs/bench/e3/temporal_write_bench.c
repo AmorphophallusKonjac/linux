@@ -97,17 +97,6 @@ static int parse_u64(const char *text, uint64_t *value)
 	return 0;
 }
 
-static int parse_fd(const char *text)
-{
-	uint64_t value;
-
-	if (parse_u64(text, &value) || value > INT_MAX) {
-		errno = EINVAL;
-		return -1;
-	}
-	return (int)value;
-}
-
 static void store_le64(unsigned char output[8], uint64_t value)
 {
 	unsigned int index;
@@ -116,9 +105,9 @@ static void store_le64(unsigned char output[8], uint64_t value)
 		output[index] = (unsigned char)(value >> (index * 8));
 }
 
-static int fill_e4_bytes(uint64_t seed, unsigned char *output, size_t length)
+static int fill_e3_bytes(uint64_t seed, unsigned char *output, size_t length)
 {
-	static const unsigned char prefix[] = "deltafs-e4-v1\0";
+	static const unsigned char prefix[] = "deltafs-e3-v1\0";
 	unsigned char input[sizeof(prefix) - 1 + 8];
 	char digest[BENCH_SHA256_HEX_SIZE];
 
@@ -138,7 +127,6 @@ static int fill_e4_bytes(uint64_t seed, unsigned char *output, size_t length)
 
 int main(int argc, char **argv)
 {
-	const char *mode;
 	const char *target;
 	const char *result_path;
 	uint64_t offset;
@@ -155,18 +143,14 @@ int main(int argc, char **argv)
 	struct timespec after;
 	bool backwards = false;
 	int fd = -1;
-	int supplied_fd = -1;
 	int saved_errno = 0;
 	ssize_t written;
 
-	if ((argc != 9 && argc != 10) ||
-	    (argc == 10 && strcmp(argv[1], "held_fd")) ||
-	    (argc == 8 && strcmp(argv[1], "reopen"))) {
-		fprintf(stderr, "Usage: %s MODE MERGED TARGET OFFSET SEED SIZE BYTES [FD] OUT\n",
+	if (argc != 9 || strcmp(argv[1], "reopen")) {
+		fprintf(stderr, "Usage: %s reopen MERGED TARGET OFFSET SEED SIZE BYTES OUT\n",
 			argv[0]);
 		return EXIT_FAILURE;
 	}
-	mode = argv[1];
 	(void)argv[2];
 	target = argv[3];
 	result_path = argv[argc - 1];
@@ -177,33 +161,24 @@ int main(int argc, char **argv)
 		fprintf(stderr, "%s: invalid write geometry\n", argv[0]);
 		return EXIT_FAILURE;
 	}
-	if (argc == 10) {
-		supplied_fd = parse_fd(argv[8]);
-		if (supplied_fd < 0)
-			return EXIT_FAILURE;
-	}
 	payload = malloc((size_t)write_bytes);
-	if (!payload || fill_e4_bytes(payload_seed, payload, (size_t)write_bytes)) {
+	if (!payload || fill_e3_bytes(payload_seed, payload, (size_t)write_bytes)) {
 		free(payload);
 		return EXIT_FAILURE;
 	}
 	if (getrusage(RUSAGE_SELF, &usage_before) ||
 	    (measurement.cpu_before = sched_getcpu()) < 0)
 		goto out;
-	if (!strcmp(mode, "held_fd")) {
-		fd = supplied_fd;
-	} else {
-		if (raw_clock(&before))
-			goto out;
-		fd = open(target, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
-		if (fd < 0) {
-			saved_errno = errno;
-			goto out;
-		}
-		if (raw_clock(&after))
-			goto out;
-		measurement.open_ns = elapsed_ns(&before, &after, &backwards);
+	if (raw_clock(&before))
+		goto out;
+	fd = open(target, O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+	if (fd < 0) {
+		saved_errno = errno;
+		goto out;
 	}
+	if (raw_clock(&after))
+		goto out;
+	measurement.open_ns = elapsed_ns(&before, &after, &backwards);
 	if (fd < 0)
 		goto out;
 	if (raw_clock(&before))
@@ -225,19 +200,17 @@ int main(int argc, char **argv)
 	if (raw_clock(&after))
 		goto out;
 	measurement.fsync_ns = elapsed_ns(&before, &after, &backwards);
-	if (!strcmp(mode, "reopen")) {
-		if (raw_clock(&before))
-			goto out;
-		if (close(fd)) {
-			saved_errno = errno;
-			fd = -1;
-			goto out;
-		}
+	if (raw_clock(&before))
+		goto out;
+	if (close(fd)) {
+		saved_errno = errno;
 		fd = -1;
-		if (raw_clock(&after))
-			goto out;
-		measurement.close_ns = elapsed_ns(&before, &after, &backwards);
+		goto out;
 	}
+	fd = -1;
+	if (raw_clock(&after))
+		goto out;
+	measurement.close_ns = elapsed_ns(&before, &after, &backwards);
 	measurement.edit_e2e_ns = measurement.open_ns + measurement.pwrite_only_ns +
 				   measurement.fsync_ns + measurement.close_ns;
 	if (getrusage(RUSAGE_SELF, &usage_after) ||
@@ -263,7 +236,7 @@ int main(int argc, char **argv)
 		measurement.status = "failed";
 		measurement.reason = "syscall_failed";
 	}
-	if (fd >= 0 && fd != supplied_fd)
+	if (fd >= 0)
 		close(fd);
 	free(payload);
 	if (write_result(result_path, &measurement))

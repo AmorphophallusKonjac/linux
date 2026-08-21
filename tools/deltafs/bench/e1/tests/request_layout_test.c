@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include "../e2_common.h"
+#include "../e1_common.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -50,20 +50,20 @@ int main(void)
 		lowers[i] = 1000 + (int)i;
 
 	errno = 0;
-	if (!e2_validate_checkpoint_source_depth(0) || errno != EINVAL)
+	if (!e1_validate_checkpoint_source_depth(0) || errno != EINVAL)
 		return 1;
-	if (e2_validate_checkpoint_source_depth(127))
+	if (e1_validate_checkpoint_source_depth(127))
 		return 1;
 	errno = 0;
-	if (!e2_validate_checkpoint_source_depth(128) || errno != E2BIG)
+	if (!e1_validate_checkpoint_source_depth(128) || errno != E2BIG)
 		return 1;
 
 	errno = 0;
-	if (!e2_build_checkpoint_request(&checkpoint, 10, 11, 0) ||
+	if (!e1_build_checkpoint_request(&checkpoint, 10, 11, 0) ||
 	    errno != EINVAL)
 		return 1;
 	memset(&checkpoint, 0xa5, sizeof(checkpoint));
-	if (e2_build_checkpoint_request(&checkpoint, 10, 11, 7) ||
+	if (e1_build_checkpoint_request(&checkpoint, 10, 11, 7) ||
 	    checkpoint.size != sizeof(checkpoint) ||
 	    checkpoint.version != DELTAFS_ABI_VERSION || checkpoint.flags ||
 	    checkpoint.expected_generation != 7 || checkpoint.upper_fd != 10 ||
@@ -72,15 +72,15 @@ int main(void)
 		return 1;
 
 	errno = 0;
-	if (!e2_build_restore_request(&restore, 10, 11, NULL, 0, 0, 1) ||
+	if (!e1_build_restore_request(&restore, 10, 11, NULL, 0, 0, 1) ||
 	    errno != EINVAL)
 		return 1;
 	errno = 0;
-	if (!e2_build_restore_request(&restore, 10, 11, lowers, 1, 0, 0) ||
+	if (!e1_build_restore_request(&restore, 10, 11, lowers, 1, 0, 0) ||
 	    errno != EINVAL)
 		return 1;
 	memset(&restore, 0xa5, sizeof(restore));
-	if (e2_build_restore_request(&restore, 10, 11, NULL, 0, 1, 7) ||
+	if (e1_build_restore_request(&restore, 10, 11, NULL, 0, 1, 7) ||
 	    restore.size != sizeof(restore) ||
 	    restore.version != DELTAFS_ABI_VERSION || restore.flags ||
 	    restore.expected_generation != 7 || restore.keep_bottom != 1 ||
@@ -93,7 +93,7 @@ int main(void)
 		return 1;
 
 	memset(&restore, 0xa5, sizeof(restore));
-	if (e2_build_restore_request(&restore, 10, 11, lowers,
+	if (e1_build_restore_request(&restore, 10, 11, lowers,
 				     DELTAFS_V2_MAX_LOWERS, 0, 9) ||
 	    restore.nr_fds != DELTAFS_V2_MAX_RESTORE_FDS ||
 	    restore.fds[DELTAFS_V2_RESTORE_LOWER_BASE] != 1000 ||
@@ -102,16 +102,16 @@ int main(void)
 	    !restore_reserved_is_zero(&restore))
 		return 1;
 	errno = 0;
-	if (!e2_build_restore_request(&restore, 10, 11, lowers,
+	if (!e1_build_restore_request(&restore, 10, 11, lowers,
 				      DELTAFS_V2_MAX_LOWERS, 1, 9) ||
 	    errno != E2BIG)
 		return 1;
 	errno = 0;
-	if (!e2_build_restore_request(&restore, 10, 11, NULL, 0,
+	if (!e1_build_restore_request(&restore, 10, 11, NULL, 0,
 				      DELTAFS_V2_MAX_LOWERS + 1, 9) ||
 	    errno != EINVAL)
 		return 1;
 
-	puts("PASS: E2 v2 request layouts and 0/1/128/129 lower boundaries");
+	puts("PASS: E1 v2 request layouts and 0/1/128/129 lower boundaries");
 	return 0;
 }

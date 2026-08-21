@@ -5,9 +5,9 @@
 
 依据：`CONFIG_OVERLAY_FS=m`，内核侧改动全部落在 overlay 模块内；启动所需驱动
 （`VIRTIO_PCI/VIRTIO_BLK/EXT4_FS/VIRTIO_NET`）全部内建；guest 里真正会用到的模块
-是 9p 三件套 + xfs + overlay，它们的模块依赖 netfs（9p/FSCACHE）和
+是 9p 三件套 + xfs + f2fs + overlay，它们的模块依赖 netfs（9p/FSCACHE）和
 libcrc32c（XFS），以及 guest 启动期会显式加载的 nls_iso8859-1（EFI/VFAT）、
-autofs4、msr 和 dm-multipath，共 11 个 `.ko`。缺少 nls_iso8859-1 会使
+autofs4、msr、dm-multipath、F2FS、CRC32 和它的 LZ4 模块，共 15 个 `.ko`。缺少 nls_iso8859-1 会使
 `/boot/efi` 以 `IO charset iso8859-1 not found` 失败并进入 emergency mode。
 
 配套脚本：`tools/deltafs/dev/`（host 侧 `host-build.sh`；guest 侧 `guest-init.sh` /
@@ -21,7 +21,7 @@ autofs4、msr 和 dm-multipath，共 11 个 `.ko`。缺少 nls_iso8859-1 会使
 # host
 ./tools/deltafs/dev/host-build.sh module
 #   = make -j$(nproc) M=fs/overlayfs modules
-#   + make -C tools/deltafs v2-tools（UAPI 头变更自动触发 headers_install）
+#   + make -C tools/deltafs e0-tools（UAPI 头变更自动触发 headers_install）
 
 # guest（root）
 bash /mnt/host/tools/deltafs/dev/guest-reload.sh
@@ -36,10 +36,10 @@ bash /mnt/host/tools/deltafs/dev/guest-reload.sh
 需要：首次对齐、改 `.config` / `CONFIG_LOCALVERSION` / 内核核心代码。
 
 ```bash
-# host：先检查依赖闭包，再构建 bzImage + 11 个最小模块 + 工具
+# host：先检查依赖闭包，再构建 bzImage + 15 个最小模块 + 工具
 # （不编全量 6258 个模块）
 ./tools/deltafs/dev/minimal-modules-test.sh
-# 期望：PASS: host/guest minimal module lists contain all 11 required modules
+# 期望：PASS: host/guest minimal module lists contain all 15 required modules
 ./tools/deltafs/dev/host-build.sh release
 
 # guest（root）：装最小模块集 + make install + 引导重启
@@ -62,6 +62,10 @@ drivers/md/dm-multipath.ko
 fs/autofs/autofs4.ko
 fs/nls/nls_iso8859-1.ko
 fs/overlayfs/overlay.ko
+fs/f2fs/f2fs.ko
+crypto/crc32_generic.ko
+lib/lz4/lz4_compress.ko
+lib/lz4/lz4hc_compress.ko
 fs/xfs/xfs.ko
 lib/libcrc32c.ko
 fs/netfs/netfs.ko
@@ -104,10 +108,12 @@ KREL=$(uname -r)
 test -f "/lib/modules/$KREL/kernel/fs/netfs/netfs.ko"
 test -f "/lib/modules/$KREL/kernel/lib/libcrc32c.ko"
 test -f "/lib/modules/$KREL/kernel/fs/nls/nls_iso8859-1.ko"
+test -f "/lib/modules/$KREL/kernel/crypto/crc32_generic.ko"
 modprobe nls_iso8859-1
 modprobe autofs4
 modprobe msr
 modprobe dm-multipath
+modprobe crc32_generic
 modprobe xfs
 modprobe 9pnet_virtio
 modprobe 9p
@@ -129,9 +135,9 @@ dmesg | tail -100
 
 ## 3. 挂载与测试
 
-对齐 + reload 之后按既有文档执行，例如 v2 phase1
-（`docs/deltafs_v2_phase1_test.md` §4 起）：数据盘、checkpoint/restore、
-`tools/deltafs/deltafs_v2_*_test`。区别只是：**改模块后重跑测试前，先在 guest 执行
+对齐 + reload 之后按既有文档执行，例如 E0 phase1 诊断子集
+（`docs/deltafs-e0-test-plan.md` §4 起）：数据盘、checkpoint/restore、
+`tools/deltafs/deltafs_e0_*_test`。区别只是：**改模块后重跑测试前，先在 guest 执行
 `guest-reload.sh`**。测试脚本自身应保证结束时清理 overlay 挂载，否则 reload 会列出
 残留挂载并中止。
 

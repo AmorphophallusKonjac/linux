@@ -106,4 +106,4 @@ grep -Fq 'new_lower_prefix' "$script_dir/deltafsctl.c" ||
 grep -Fq 'longest_common_suffix' "$script_dir/deltafsctl.c" ||
 	die 'controller does not compute the common suffix'
 
-printf 'All DeltaFS v2 controller unit tests passed\n'
+printf 'All DeltaFS E0 controller unit tests passed\n'

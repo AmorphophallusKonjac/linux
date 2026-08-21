@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-#ifndef DELTAFS_E3_BENCH_COMMON_H
-#define DELTAFS_E3_BENCH_COMMON_H
+#ifndef DELTAFS_E2_BENCH_COMMON_H
+#define DELTAFS_E2_BENCH_COMMON_H
 
 #include <linux/fiemap.h>
 #include <stdbool.h>

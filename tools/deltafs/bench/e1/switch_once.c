@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 
-#include "e2_common.h"
+#include "e1_common.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -29,16 +29,16 @@ struct measurement {
 	bool ioctl_attempted;
 };
 
-union e2_request {
+union e1_request {
 	struct deltafs_ioc_checkpoint_v2 checkpoint;
 	struct deltafs_ioc_restore_v2 restore;
 };
 
-#define E2_RESULT_HEADER \
+#define E1_RESULT_HEADER \
 	"{\"schema\":2,\"ioctl_attempted\":%s,\"ioctl_ret\":%d,"
-#define E2_RESULT_TIMING "\"errno\":%d,\"ioctl_latency_ns\":%llu,"
-#define E2_RESULT_CPU "\"cpu_before\":%d,\"cpu_after\":%d,"
-#define E2_RESULT_STATUS \
+#define E1_RESULT_TIMING "\"errno\":%d,\"ioctl_latency_ns\":%llu,"
+#define E1_RESULT_CPU "\"cpu_before\":%d,\"cpu_after\":%d,"
+#define E1_RESULT_STATUS \
 	"\"major_faults\":%ld,\"status\":\"%s\",\"invalid_reason\":%s%s%s}\n"
 
 static void close_fd(int *fd)
@@ -48,7 +48,7 @@ static void close_fd(int *fd)
 	*fd = -1;
 }
 
-static int validate_paths(const struct e2_spec *spec, const char *result_path)
+static int validate_paths(const struct e1_spec *spec, const char *result_path)
 {
 	size_t i;
 
@@ -87,7 +87,7 @@ static int pin_cpu(int cpu)
 	return ret;
 }
 
-static int open_switch_paths(const struct e2_spec *spec, int *merged_fd,
+static int open_switch_paths(const struct e1_spec *spec, int *merged_fd,
 			     int *upper_fd, int *work_fd, int *lower_fds)
 {
 	size_t i;
@@ -184,8 +184,8 @@ static int write_result(const char *path, const struct measurement *measurement,
 	int length;
 
 	length = snprintf(buffer, sizeof(buffer),
-			  E2_RESULT_HEADER E2_RESULT_TIMING E2_RESULT_CPU
-			  E2_RESULT_STATUS,
+			  E1_RESULT_HEADER E1_RESULT_TIMING E1_RESULT_CPU
+			  E1_RESULT_STATUS,
 			  measurement->ioctl_attempted ? "true" : "false",
 			  measurement->ioctl_ret, measurement->ioctl_errno,
 			  (unsigned long long)measurement->latency_ns,
@@ -197,18 +197,18 @@ static int write_result(const char *path, const struct measurement *measurement,
 		errno = EOVERFLOW;
 		return -1;
 	}
-	return e2_atomic_write(path, buffer, (size_t)length);
+	return e1_atomic_write(path, buffer, (size_t)length);
 }
 
 int main(int argc, char **argv)
 {
-	union e2_request request;
+	union e1_request request;
 	struct measurement measurement = {
 		.ioctl_ret = -1,
 		.cpu_before = -1,
 		.cpu_after = -1,
 	};
-	struct e2_spec spec;
+	struct e1_spec spec;
 	int lower_fds[DELTAFS_V2_MAX_LOWERS];
 	const char *reason = NULL;
 	const char *status;
@@ -228,7 +228,7 @@ int main(int argc, char **argv)
 			argv[0]);
 		return EXIT_FAILURE;
 	}
-	if (e2_read_spec(argv[1], &spec)) {
+	if (e1_read_spec(argv[1], &spec)) {
 		fprintf(stderr, "switch_once: read spec: %s\n", strerror(errno));
 		return EXIT_FAILURE;
 	}
@@ -239,7 +239,7 @@ int main(int argc, char **argv)
 	}
 	if (!strcmp(spec.operation, "checkpoint")) {
 		errno = 0;
-		if (e2_validate_checkpoint_source_depth(spec.source_depth)) {
+		if (e1_validate_checkpoint_source_depth(spec.source_depth)) {
 			if (errno != E2BIG) {
 				measurement.ioctl_errno = errno;
 				status = "failed";
@@ -263,7 +263,7 @@ int main(int argc, char **argv)
 		goto out;
 	}
 	if (!strcmp(spec.operation, "checkpoint")) {
-		if (e2_build_checkpoint_request(&request.checkpoint, upper_fd,
+		if (e1_build_checkpoint_request(&request.checkpoint, upper_fd,
 						work_fd,
 						spec.expected_generation)) {
 			fprintf(stderr, "switch_once: build checkpoint request: %s\n",
@@ -274,7 +274,7 @@ int main(int argc, char **argv)
 		request_ptr = &request.checkpoint;
 		request_size = sizeof(request.checkpoint);
 	} else {
-		if (e2_build_restore_request(&request.restore, upper_fd,
+		if (e1_build_restore_request(&request.restore, upper_fd,
 					     work_fd, lower_fds,
 					     (unsigned int)spec.nr_lower_prefix,
 					     spec.keep_bottom,
@@ -310,6 +310,6 @@ out:
 	close_fd(&work_fd);
 	for (i = 0; i < DELTAFS_V2_MAX_LOWERS; i++)
 		close_fd(&lower_fds[i]);
-	e2_free_spec(&spec);
+	e1_free_spec(&spec);
 	return ret;
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #define _GNU_SOURCE
 
-#include "e2_common.h"
+#include "e1_common.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -15,7 +15,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define E2_SPEC_MAX_BYTES (1024U * 1024U)
+#define E1_SPEC_MAX_BYTES (1024U * 1024U)
 
 struct json_reader {
 	const char *cursor;
@@ -47,7 +47,7 @@ static int append_char(char **value, size_t *length, size_t *capacity, char c)
 	if (*length + 1 >= *capacity) {
 		size_t new_capacity = *capacity ? *capacity * 2 : 32;
 
-		if (new_capacity > E2_SPEC_MAX_BYTES) {
+		if (new_capacity > E1_SPEC_MAX_BYTES) {
 			errno = E2BIG;
 			return -1;
 		}
@@ -158,7 +158,7 @@ static int parse_int(struct json_reader *reader, int *value)
 	return 0;
 }
 
-static int append_lower_prefix(struct e2_spec *spec, char *path)
+static int append_lower_prefix(struct e1_spec *spec, char *path)
 {
 	char **next;
 
@@ -175,7 +175,7 @@ static int append_lower_prefix(struct e2_spec *spec, char *path)
 	return 0;
 }
 
-static int parse_lower_prefix(struct json_reader *reader, struct e2_spec *spec)
+static int parse_lower_prefix(struct json_reader *reader, struct e1_spec *spec)
 {
 	bool first = true;
 
@@ -212,7 +212,7 @@ static int set_string_once(char **field, char *value)
 	return 0;
 }
 
-static int parse_field(struct json_reader *reader, struct e2_spec *spec,
+static int parse_field(struct json_reader *reader, struct e1_spec *spec,
 		       unsigned int *seen, const char *key)
 {
 	uint64_t number;
@@ -296,7 +296,7 @@ static int parse_field(struct json_reader *reader, struct e2_spec *spec,
 	return -1;
 }
 
-static int parse_spec(char *data, size_t length, struct e2_spec *spec)
+static int parse_spec(char *data, size_t length, struct e1_spec *spec)
 {
 	struct json_reader reader = { .cursor = data, .end = data + length };
 	unsigned int seen = 0;
@@ -344,7 +344,7 @@ static int parse_spec(char *data, size_t length, struct e2_spec *spec)
 	return 0;
 }
 
-int e2_validate_checkpoint_source_depth(unsigned int source_depth)
+int e1_validate_checkpoint_source_depth(unsigned int source_depth)
 {
 	if (!source_depth) {
 		errno = EINVAL;
@@ -357,7 +357,7 @@ int e2_validate_checkpoint_source_depth(unsigned int source_depth)
 	return 0;
 }
 
-int e2_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *req,
+int e1_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *req,
 				int upper_fd, int work_fd,
 				uint64_t expected_generation)
 {
@@ -374,7 +374,7 @@ int e2_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *req,
 	return 0;
 }
 
-int e2_build_restore_request(struct deltafs_ioc_restore_v2 *req,
+int e1_build_restore_request(struct deltafs_ioc_restore_v2 *req,
 			     int upper_fd, int work_fd,
 			     const int *lower_fds,
 			     unsigned int nr_lower_prefix,
@@ -412,7 +412,7 @@ int e2_build_restore_request(struct deltafs_ioc_restore_v2 *req,
 	return 0;
 }
 
-int e2_read_spec(const char *path, struct e2_spec *spec)
+int e1_read_spec(const char *path, struct e1_spec *spec)
 {
 	struct stat st;
 	char *data = NULL;
@@ -428,7 +428,7 @@ int e2_read_spec(const char *path, struct e2_spec *spec)
 	if (fstat(fd, &st))
 		goto fail;
 	if (!S_ISREG(st.st_mode) || st.st_size <= 0 ||
-	    st.st_size > E2_SPEC_MAX_BYTES) {
+	    st.st_size > E1_SPEC_MAX_BYTES) {
 		errno = EINVAL;
 		goto fail;
 	}
@@ -464,12 +464,12 @@ fail:
 	if (fd >= 0)
 		close(fd);
 	free(data);
-	e2_free_spec(spec);
+	e1_free_spec(spec);
 	errno = saved_errno;
 	return -1;
 }
 
-void e2_free_spec(struct e2_spec *spec)
+void e1_free_spec(struct e1_spec *spec)
 {
 	size_t i;
 
@@ -503,7 +503,7 @@ static int write_all(int fd, const char *data, size_t length)
 	return 0;
 }
 
-int e2_atomic_write(const char *path, const char *data, size_t length)
+int e1_atomic_write(const char *path, const char *data, size_t length)
 {
 	char *copy = NULL;
 	char *slash;

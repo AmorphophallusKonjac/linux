@@ -21,7 +21,6 @@ int e3_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *request,
 		errno = EBADF;
 		return -1;
 	}
-
 	memset(request, 0, sizeof(*request));
 	request->size = sizeof(*request);
 	request->version = DELTAFS_ABI_VERSION;
@@ -41,7 +40,7 @@ static int open_directory(const char *path, int flags)
 }
 
 int e3_checkpoint_v2(const char *merged, const char *upper, const char *work,
-		     uint64_t expected_generation)
+			     uint64_t expected_generation)
 {
 	struct deltafs_ioc_checkpoint_v2 request;
 	int root_fd = -1;

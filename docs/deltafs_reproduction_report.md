@@ -521,14 +521,15 @@ index=off,nfs_export=off,metacopy=off,xino=off,redirect_dir=nofollow \
 | `fs/overlayfs/inode.c` | inode generation 初始化；setattr/ACL/fileattr 等修改入口刷新 |
 | `fs/overlayfs/util.c` | backing path 访问器、replace-capable inode update、view identity 比较 |
 | `fs/overlayfs/copy_up.c` | stale upper 判断、同代 `EEXIST` 复用、跨代重试 |
-| `fs/overlayfs/file.c` | regular fd 修改入口 lazy refresh；mmap 研究实现 |
+| `fs/overlayfs/file.c` | regular fd 修改入口；跨切换 lazy refresh/mmap 仍是未来研究实现，不属于当前 E0-E3 支持范围 |
 | `fs/overlayfs/readdir.c` | root ioctl、目录 fd/readdir cache generation refresh |
 | `fs/overlayfs/dir.c` / `xattrs.c` | 目录和 xattr 修改路径的 current-generation 保证 |
 | `include/uapi/linux/overlayfs.h`（新） | 版本化 SWITCH ABI；名称可在实现评审时确定 |
 | `tools/deltafs/`（新） | controller/CLI、manifest、故障恢复 |
 | `tools/testing/selftests/filesystems/overlayfs/` | DeltaFS kselftests 和 mmap/open-fd 辅助程序 |
 
-为了可审查，建议把补丁拆成数据结构、closed-world switch、cache/lazy fd、mmap、controller/tests 五组，不追求复刻论文的约 565 LOC。
+为了可审查，建议把补丁拆成数据结构、closed-world switch、cache、controller/tests 五组；
+跨切换 lazy fd 和 writable mmap 只有在明确扩展支持边界后才单独设计，不属于当前 E0。
 
 ## 9. 分阶段开发步骤与验收门
 
@@ -613,26 +614,26 @@ index=off,nfs_export=off,metacopy=off,xino=off,redirect_dir=nofollow \
 make -j"$(nproc)" bzImage modules
 make M=fs/overlayfs W=1
 make C=2 CHECK=sparse M=fs/overlayfs
-make -C tools/deltafs clean v2-tools
-make -C tools/deltafs check-v2-layout
-make -C tools/deltafs test-v2-controller
-make -C tools/deltafs check-v2-checkpoints CHECKPOINT_MODE=auto
+make -C tools/deltafs clean e0-tools
+make -C tools/deltafs check-e0-layout
+make -C tools/deltafs test-e0-controller
+make -C tools/deltafs check-e0-checkpoints CHECKPOINT_MODE=auto
 ```
 
-`check-v2-checkpoints` 必须报告 `deltafs.o` 中的 ownership checkpoint relocation 与
+`check-e0-checkpoints` 必须报告 `deltafs.o` 中的 ownership checkpoint relocation 与
 源码静态调用点完整匹配，或在 production 配置下全部被优化掉。构建环境不加载模块，
 也不执行运行态功能测试。production 配置关闭 `CONFIG_FUNCTION_ERROR_INJECTION` 时可对
 对应对象显式运行：
 
 ```bash
-make -C tools/deltafs check-v2-checkpoints \
+make -C tools/deltafs check-e0-checkpoints \
     KERNEL_DELTAFS_OBJ=/absolute/production/build/fs/overlayfs/deltafs.o \
     CHECKPOINT_MODE=disabled
 # 期望：PASS: ... removes all ... source ... call sites
 ```
 
 v2 不再拆分 P1--P7 阶段 binary。旧 P5--P7 v1 helper 和 harness 已删除，运行态统一由
-`deltafs_v2_acceptance_test.sh` 覆盖 native ABI、checkpoint 派生、restore suffix/prefix、
+`deltafs_e0_acceptance_test.sh` 覆盖 native ABI、checkpoint 派生、restore suffix/prefix、
 深度边界、故障注入、retired state teardown 和 module unload。
 
 使用项目现有的 x86_64 rootfs 和两个已格式化的独立数据盘启动 debug guest；以下
@@ -667,20 +668,20 @@ install -D -m 0644 /mnt/host/fs/overlayfs/overlay.ko \
     "/lib/modules/$(uname -r)/kernel/fs/overlayfs/overlay.ko"
 depmod -a
 cd /mnt/host
-make -C tools/deltafs v2-tools
+make -C tools/deltafs e0-tools
 mkdir -p /mnt/deltafs-v2/disk1/acceptance
-tools/deltafs/deltafs_v2_acceptance_test.sh \
+tools/deltafs/deltafs_e0_acceptance_test.sh \
     --backing-root /mnt/deltafs-v2/disk1/acceptance \
     --extra-backing-root /mnt/deltafs-v2/disk2
 ```
 
-完整成功标志为 `All DeltaFS v2 acceptance checks passed`，并要求输出中的 target lower、
+完整成功标志为 `All DeltaFS E0 acceptance checks passed`，并要求输出中的 target lower、
 `keep_bottom`、checkpoint derived chain、fault injection、module unload、sanitizer、
 kmemleak 和 retired teardown 项全部为 `PASS`。缺少依赖能力时脚本以退出码 4 和 `SKIP`
 结束，不算完整验收。失败时从脚本打印的结果目录收集：
 
 ```bash
-R=/mnt/deltafs-v2/disk1/acceptance/v2-acceptance-YYYYMMDD-HHMMSS-PID
+R=/mnt/deltafs-v2/disk1/acceptance/e0-acceptance-YYYYMMDD-HHMMSS-PID
 cp -a "$R" /mnt/host/
 dmesg -T > /mnt/host/deltafs-v2-dmesg-full.log
 findmnt -J > /mnt/host/deltafs-v2-findmnt.json
@@ -773,7 +774,7 @@ findmnt -J > /mnt/host/deltafs-v2-findmnt.json
 - merged 文件数：`10^2, 10^4, 10^5, 10^6`。
 - 单文件大小：`4 KiB` 至 `1 GiB`。
 - 单次编辑：`1 KiB, 4 KiB, 16 KiB, 64 KiB, 256 KiB`。
-- backing：ext4、XFS reflink=0、XFS reflink=1。
+- backing：E2/E3 使用 ext4、XFS reflink=0、XFS reflink=1、F2FS。
 - fd 状态：closed、open current、open stale、writable mmap。
 
 核心结论应是：switch 不随文件树大小/数据量线性增长；如果随 layer depth 增长，明确给出斜率。

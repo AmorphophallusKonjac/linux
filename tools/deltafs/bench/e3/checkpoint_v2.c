@@ -33,8 +33,7 @@ int main(int argc, char **argv)
 	uint64_t generation;
 
 	if (argc != 5 || parse_generation(argv[2], &generation)) {
-		fprintf(stderr,
-			"Usage: %s MERGED EXPECTED_GENERATION UPPER WORK\n",
+		fprintf(stderr, "Usage: %s MERGED EXPECTED_GENERATION UPPER WORK\n",
 			argv[0]);
 		return EXIT_FAILURE;
 	}

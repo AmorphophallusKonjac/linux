@@ -3,7 +3,7 @@
 #
 # deltafs 开发工作流 —— guest 侧 release 对齐（每个新 release 串跑一次，含首次）。
 # 做三件事：
-#   1. 把最小模块集（9p/xfs/overlay 及模块依赖）装进
+#   1. 把最小模块集（9p/xfs/f2fs/overlay 及模块依赖）装进
 #      /lib/modules/<新release>/ 并 depmod
 #   2. make install 安装新 bzImage（grub 流程）
 #   3. 引导你重启并验证 uname -r
@@ -18,7 +18,11 @@ MINIMAL_MODULES=(
 	fs/autofs/autofs4.ko
 	fs/nls/nls_iso8859-1.ko
 	fs/overlayfs/overlay.ko
+	fs/f2fs/f2fs.ko
+	crypto/crc32_generic.ko
 	fs/xfs/xfs.ko
+	lib/lz4/lz4_compress.ko
+	lib/lz4/lz4hc_compress.ko
 	lib/libcrc32c.ko
 	fs/netfs/netfs.ko
 	fs/9p/9p.ko

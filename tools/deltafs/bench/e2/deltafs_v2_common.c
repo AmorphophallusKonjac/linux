@@ -9,7 +9,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-int e4_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *request,
+int e2_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *request,
 				int upper_fd, int work_fd,
 				uint64_t expected_generation)
 {
@@ -21,6 +21,7 @@ int e4_build_checkpoint_request(struct deltafs_ioc_checkpoint_v2 *request,
 		errno = EBADF;
 		return -1;
 	}
+
 	memset(request, 0, sizeof(*request));
 	request->size = sizeof(*request);
 	request->version = DELTAFS_ABI_VERSION;
@@ -39,8 +40,8 @@ static int open_directory(const char *path, int flags)
 	return open(path, flags | O_DIRECTORY | O_CLOEXEC);
 }
 
-int e4_checkpoint_v2(const char *merged, const char *upper, const char *work,
-			     uint64_t expected_generation)
+int e2_checkpoint_v2(const char *merged, const char *upper, const char *work,
+		     uint64_t expected_generation)
 {
 	struct deltafs_ioc_checkpoint_v2 request;
 	int root_fd = -1;
@@ -58,7 +59,7 @@ int e4_checkpoint_v2(const char *merged, const char *upper, const char *work,
 	work_fd = open_directory(work, O_PATH);
 	if (work_fd < 0)
 		goto out;
-	if (e4_build_checkpoint_request(&request, upper_fd, work_fd,
+	if (e2_build_checkpoint_request(&request, upper_fd, work_fd,
 					expected_generation))
 		goto out;
 	ret = ioctl(root_fd, DELTAFS_IOC_CHECKPOINT, &request);

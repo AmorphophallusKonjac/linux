@@ -12,7 +12,7 @@ This tree is a full Linux 6.8 checkout (~83k files). deltafs work lives in
 only three directories:
 
 - `fs/overlayfs/` — deltafs kernel module source (fork of overlayfs)
-- `tools/deltafs/` — userspace tools and tests (p1 … p7, acceptance)
+- `tools/deltafs/` — userspace tools and E0-E3 tests
 - `docs/` — design docs and test/reproduction guides
 
 Everything else is stock upstream kernel, reference only. Blind whole-tree
@@ -39,8 +39,17 @@ searches waste context on upstream noise, so:
   user can follow inside QEMU:
   - how to build the kernel and the userspace test tools (`tools/deltafs/`);
   - how to boot the QEMU VM with the built kernel and disk image;
-  - how to mount deltafs and run each test (`p1` … `p7`, acceptance, etc.),
+  - how to mount deltafs and run E0-E3,
     with exact commands and expected output;
   - how to collect logs / dmesg / failure diagnostics.
   Keep this in sync under `docs/` (e.g. the reproduction / test guide) whenever
   tests or interfaces change.
+
+## Correctness gate
+
+The correctness suite is experiment E0 and is a rolling gate, not a frozen
+versioned snapshot. Any change to DeltaFS under `fs/overlayfs/`, `tools/deltafs/`,
+or the supporting test contract must update E0 directly and keep its static and
+QEMU entry points current. Do not create a parallel `v2` correctness suite for
+later changes; retain `v2` only where it names the kernel ABI or implementation
+version.
